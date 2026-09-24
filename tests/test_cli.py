@@ -1,4 +1,7 @@
+import json
 from pathlib import Path
+
+import pytest
 
 from hermes_factory.cli import main
 from hermes_factory.errors import HermesCommandError
@@ -253,3 +256,185 @@ def test_apply_reports_malformed_board_list_as_clean_error(valid_rig: Path, caps
     assert captured.out == ""
     assert captured.err.strip() == "error: Hermes returned malformed board list JSON"
     assert "Traceback" not in captured.err
+
+
+_MISSION = """\
+version: 1
+id: demo-mission
+title: Demo mission
+intent: Ship one verified behavior without expanding scope.
+workflow: delivery
+human_acceptance: false
+acceptance:
+  - The requested behavior exists.
+slices:
+  - id: implement
+    title: Implement the requested behavior
+    goal: Make the smallest code change satisfying the mission.
+    depends_on: []
+    acceptance:
+      - A failing test was observed before implementation.
+    proof:
+      commands:
+        - uv run pytest -q
+      artifacts: []
+      changed_files_required: true
+"""
+
+
+@pytest.fixture
+def mission_file(tmp_path: Path) -> Path:
+    path = tmp_path / "mission.yaml"
+    path.write_text(_MISSION, encoding="utf-8")
+    return path
+
+
+class MissionHermesClient:
+    def __init__(
+        self,
+        profiles: set[str],
+        boards: object,
+        task_responses: list[object],
+    ) -> None:
+        self.profiles = profiles
+        self.boards = boards
+        self.task_responses = task_responses
+        self.command_calls: list[list[str]] = []
+
+    def profile_exists(self, profile: str) -> bool:
+        return profile in self.profiles
+
+    def run_json(self, args: list[str]) -> object:
+        self.command_calls.append(args)
+        if len(args) > 1 and args[1] == "boards":
+            return self.boards
+        return self.task_responses.pop(0)
+
+    def run(self, args: list[str]) -> str:
+        self.command_calls.append(args)
+        return ""
+
+
+_TASK_RESPONSES = [
+    {"id": "task-1", "status": "ready", "title": "Implement the requested behavior"},
+    {"id": "task-2", "status": "ready", "title": "Review the requested behavior"},
+    {"id": "task-3", "status": "ready", "title": "Accept Demo mission"},
+]
+
+
+def test_mission_plan_prints_json_plan_without_invoking_hermes(
+    valid_rig: Path, mission_file: Path, capsys
+):
+    def fail_if_called(executable: str):
+        raise AssertionError("mission plan must never invoke Hermes")
+
+    result = main(
+        ["mission", "plan", str(mission_file), "--rig", str(valid_rig), "--json"],
+        client_factory=fail_if_called,
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    payload = json.loads(captured.out)
+    assert payload["board_slug"] == "demo-rig"
+    assert [task["key"] for task in payload["tasks"]] == [
+        "implement:implementation",
+        "implement:review",
+        "acceptance",
+    ]
+    assert [task["profile"] for task in payload["tasks"]] == [
+        "builder",
+        "reviewer",
+        "builder",
+    ]
+    assert payload["tasks"][1]["parents"] == ["implement:implementation"]
+    assert payload["tasks"][2]["parents"] == ["implement:review"]
+    assert payload["tasks"][0]["idempotency_key"] == (
+        "factory:demo:demo-mission:implement:implementation"
+    )
+
+
+def test_mission_plan_rejects_malformed_mission_as_clean_error(
+    valid_rig: Path, mission_file: Path, capsys
+):
+    mission_file.write_text("version: 2\n", encoding="utf-8")
+
+    result = main(
+        ["mission", "plan", str(mission_file), "--rig", str(valid_rig), "--json"],
+        client_factory=lambda executable: (_ for _ in ()).throw(
+            AssertionError("Hermes must not be invoked")
+        ),
+    )
+
+    captured = capsys.readouterr()
+    assert result == 2
+    assert captured.out == ""
+    assert captured.err.startswith("error:")
+    assert "Traceback" not in captured.err
+
+
+def test_mission_apply_creates_tasks_and_prints_task_id_map(
+    valid_rig: Path, mission_file: Path, capsys
+):
+    client = MissionHermesClient({"builder", "reviewer"}, [], list(_TASK_RESPONSES))
+
+    result = main(
+        ["mission", "apply", str(mission_file), "--rig", str(valid_rig), "--json"],
+        client_factory=lambda executable: client,
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert json.loads(captured.out) == {
+        "task_ids": {
+            "implement:implementation": "task-1",
+            "implement:review": "task-2",
+            "acceptance": "task-3",
+        }
+    }
+    create_calls = [args for args in client.command_calls if args[3] == "create"]
+    assert len(create_calls) == 3
+    assert create_calls[0][:4] == ["kanban", "--board", "demo-rig", "create"]
+    for call in create_calls:
+        assert "--idempotency-key" in call
+        assert "--json" in call
+
+
+def test_mission_apply_fails_when_profiles_are_missing(
+    valid_rig: Path, mission_file: Path, capsys
+):
+    client = MissionHermesClient({"reviewer"}, [], list(_TASK_RESPONSES))
+
+    result = main(
+        ["mission", "apply", str(mission_file), "--rig", str(valid_rig)],
+        client_factory=lambda executable: client,
+    )
+
+    captured = capsys.readouterr()
+    assert result == 2
+    assert captured.out == ""
+    assert captured.err.strip() == "error: missing Hermes profiles: builder"
+    assert client.command_calls == []
+
+
+def test_mission_apply_without_json_prints_key_to_id_lines(
+    valid_rig: Path, mission_file: Path, capsys
+):
+    client = MissionHermesClient(
+        {"builder", "reviewer"},
+        [{"slug": "demo-rig", "archived": False}],
+        list(_TASK_RESPONSES),
+    )
+
+    result = main(
+        ["mission", "apply", str(mission_file), "--rig", str(valid_rig)],
+        client_factory=lambda executable: client,
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert captured.out.strip() == (
+        "implement:implementation -> task-1\n"
+        "implement:review -> task-2\n"
+        "acceptance -> task-3"
+    )

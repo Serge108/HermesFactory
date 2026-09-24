@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from hermes_factory import __version__
-from hermes_factory.board import ensure_board
+from hermes_factory.board import apply_mission, ensure_board
+from hermes_factory.compiler import compile_mission
 from hermes_factory.errors import FactoryError
 from hermes_factory.hermes_cli import HermesClient
+from hermes_factory.mission_loader import load_mission
 from hermes_factory.models import RigSpec
 from hermes_factory.rig_loader import load_rig
 
@@ -18,13 +21,30 @@ ClientFactory = Callable[[str], HermesClient]
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hermes-factory")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("version")
+    version = subparsers.add_parser("version")
+    version.set_defaults(handler_key="version")
     validate = subparsers.add_parser("validate")
     validate.add_argument("--rig", type=Path, required=True)
     validate.add_argument("--hermes", default="hermes")
+    validate.set_defaults(handler_key="validate")
     apply = subparsers.add_parser("apply")
     apply.add_argument("--rig", type=Path, required=True)
     apply.add_argument("--hermes", default="hermes")
+    apply.set_defaults(handler_key="apply")
+    mission = subparsers.add_parser("mission")
+    mission_subparsers = mission.add_subparsers(dest="mission_command", required=True)
+    plan = mission_subparsers.add_parser("plan")
+    plan.add_argument("mission", type=Path)
+    plan.add_argument("--rig", type=Path, required=True)
+    plan.add_argument("--json", action="store_true")
+    plan.add_argument("--hermes", default="hermes")
+    plan.set_defaults(handler_key="mission-plan")
+    mission_apply = mission_subparsers.add_parser("apply")
+    mission_apply.add_argument("mission", type=Path)
+    mission_apply.add_argument("--rig", type=Path, required=True)
+    mission_apply.add_argument("--json", action="store_true")
+    mission_apply.add_argument("--hermes", default="hermes")
+    mission_apply.set_defaults(handler_key="mission-apply")
     return parser
 
 
@@ -46,50 +66,104 @@ def warn_nonisolated_seats(rig: RigSpec) -> None:
             )
 
 
+def _report_missing_profiles(missing: tuple[str, ...]) -> int:
+    print(f"error: missing Hermes profiles: {', '.join(missing)}", file=sys.stderr)
+    return 2
+
+
+def handle_version(args: argparse.Namespace, client_factory: ClientFactory) -> int:
+    print(f"hermes-factory {__version__}")
+    return 0
+
+
+def handle_validate(args: argparse.Namespace, client_factory: ClientFactory) -> int:
+    rig = load_rig(args.rig)
+    missing = validate_rig_profiles(rig, client_factory(args.hermes))
+    if missing:
+        return _report_missing_profiles(missing)
+    warn_nonisolated_seats(rig)
+    print(f"valid: {rig.project.slug} ({len(rig.seats)} seats)")
+    return 0
+
+
+def handle_apply(args: argparse.Namespace, client_factory: ClientFactory) -> int:
+    rig = load_rig(args.rig)
+    client = client_factory(args.hermes)
+    missing = validate_rig_profiles(rig, client)
+    if missing:
+        return _report_missing_profiles(missing)
+    warn_nonisolated_seats(rig)
+    result = ensure_board(client, rig)
+    print(
+        f"created board {result.slug}"
+        if result.created
+        else f"board {result.slug} already exists"
+    )
+    return 0
+
+
+def handle_mission_plan(args: argparse.Namespace, client_factory: ClientFactory) -> int:
+    rig = load_rig(args.rig)
+    plan = compile_mission(rig, load_mission(args.mission, rig))
+    tasks = [
+        {
+            "key": task.key,
+            "title": task.title,
+            "profile": task.profile,
+            "parents": list(task.parents),
+            "idempotency_key": task.idempotency_key,
+        }
+        for task in plan.tasks
+    ]
+    if args.json:
+        print(json.dumps({"board_slug": plan.board_slug, "tasks": tasks}, indent=2))
+    else:
+        for task in tasks:
+            parents = ", ".join(task["parents"]) or "-"
+            assignee = task["profile"] or "(unassigned)"
+            print(f"{task['key']} -> {assignee} (parents: {parents})")
+    return 0
+
+
+def handle_mission_apply(args: argparse.Namespace, client_factory: ClientFactory) -> int:
+    rig = load_rig(args.rig)
+    client = client_factory(args.hermes)
+    missing = validate_rig_profiles(rig, client)
+    if missing:
+        return _report_missing_profiles(missing)
+    warn_nonisolated_seats(rig)
+    mission = load_mission(args.mission, rig)
+    plan = compile_mission(rig, mission)
+    ensure_board(client, rig)
+    applied = apply_mission(client, rig, plan)
+    if args.json:
+        print(json.dumps({"task_ids": applied.task_ids}, indent=2))
+    else:
+        for key, task_id in applied.task_ids.items():
+            print(f"{key} -> {task_id}")
+    return 0
+
+
+HANDLERS: dict[str, Callable[[argparse.Namespace, ClientFactory], int]] = {
+    "version": handle_version,
+    "validate": handle_validate,
+    "apply": handle_apply,
+    "mission-plan": handle_mission_plan,
+    "mission-apply": handle_mission_apply,
+}
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
     client_factory: ClientFactory = HermesClient,
 ) -> int:
     args = build_parser().parse_args(argv)
-    if args.command == "version":
-        print(f"hermes-factory {__version__}")
-        return 0
-    if args.command == "validate":
-        try:
-            rig = load_rig(args.rig)
-            missing = validate_rig_profiles(rig, client_factory(args.hermes))
-        except FactoryError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
-        if missing:
-            print(f"error: missing Hermes profiles: {', '.join(missing)}", file=sys.stderr)
-            return 2
-        warn_nonisolated_seats(rig)
-        print(f"valid: {rig.project.slug} ({len(rig.seats)} seats)")
-        return 0
-    if args.command == "apply":
-        try:
-            rig = load_rig(args.rig)
-            client = client_factory(args.hermes)
-            missing = validate_rig_profiles(rig, client)
-            if missing:
-                print(
-                    f"error: missing Hermes profiles: {', '.join(missing)}",
-                    file=sys.stderr,
-                )
-                return 2
-            warn_nonisolated_seats(rig)
-            result = ensure_board(client, rig)
-        except FactoryError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
-        if result.created:
-            print(f"created board {result.slug}")
-        else:
-            print(f"board {result.slug} already exists")
-        return 0
-    raise AssertionError(f"unhandled command: {args.command}")
+    try:
+        return HANDLERS[args.handler_key](args, client_factory)
+    except FactoryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
 
 def entrypoint() -> None:

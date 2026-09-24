@@ -4,12 +4,14 @@ import argparse
 import json
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import asdict
 from pathlib import Path
 
 from hermes_factory import __version__
 from hermes_factory.board import apply_mission, ensure_board
 from hermes_factory.compiler import compile_mission
 from hermes_factory.errors import FactoryError
+from hermes_factory.health import audit_tasks
 from hermes_factory.hermes_cli import HermesClient
 from hermes_factory.mission_loader import load_mission
 from hermes_factory.models import RigSpec
@@ -45,6 +47,11 @@ def build_parser() -> argparse.ArgumentParser:
     mission_apply.add_argument("--json", action="store_true")
     mission_apply.add_argument("--hermes", default="hermes")
     mission_apply.set_defaults(handler_key="mission-apply")
+    status = subparsers.add_parser("status")
+    status.add_argument("--rig", type=Path, required=True)
+    status.add_argument("--json", action="store_true")
+    status.add_argument("--hermes", default="hermes")
+    status.set_defaults(handler_key="status")
     return parser
 
 
@@ -144,12 +151,54 @@ def handle_mission_apply(args: argparse.Namespace, client_factory: ClientFactory
     return 0
 
 
+def handle_status(args: argparse.Namespace, client_factory: ClientFactory) -> int:
+    rig = load_rig(args.rig)
+    client = client_factory(args.hermes)
+    board = ["kanban", "--board", rig.board.slug]
+    stats = client.run_json(board + ["stats", "--json"])
+    tasks = client.run_json(board + ["list", "--json"])
+    diagnostics = client.run_json(board + ["diagnostics", "--json"])
+
+    runs_by_task: dict[str, list] = {}
+    for task in tasks:
+        task_id = task.get("id")
+        task_class = (task.get("metadata") or {}).get("task_class")
+        if task.get("status") == "done" or task_class == "review":
+            runs_by_task[task_id] = client.run_json(
+                board + ["runs", task_id, "--json"]
+            )
+
+    findings = audit_tasks(tasks, runs_by_task, diagnostics)
+    counts = {
+        "critical": sum(1 for finding in findings if finding.severity == "critical"),
+        "error": sum(1 for finding in findings if finding.severity == "error"),
+        "warning": sum(1 for finding in findings if finding.severity == "warning"),
+    }
+    if args.json:
+        print(
+            json.dumps(
+                {"stats": stats, "findings": [asdict(finding) for finding in findings]},
+                indent=2,
+            )
+        )
+    else:
+        print(
+            f"findings: {counts['critical']} critical, {counts['error']} error, "
+            f"{counts['warning']} warning"
+        )
+        for finding in findings:
+            suffix = f" ({finding.task_id})" if finding.task_id else ""
+            print(f"{finding.severity}: {finding.code}: {finding.message}{suffix}")
+    return 1 if counts["critical"] or counts["error"] else 0
+
+
 HANDLERS: dict[str, Callable[[argparse.Namespace, ClientFactory], int]] = {
     "version": handle_version,
     "validate": handle_validate,
     "apply": handle_apply,
     "mission-plan": handle_mission_plan,
     "mission-apply": handle_mission_apply,
+    "status": handle_status,
 }
 
 

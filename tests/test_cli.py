@@ -438,3 +438,165 @@ def test_mission_apply_without_json_prints_key_to_id_lines(
         "implement:review -> task-2\n"
         "acceptance -> task-3"
     )
+
+
+_STATUS_TASKS = [
+    {
+        "id": "t-1",
+        "title": "Implement demo",
+        "status": "done",
+        "result": "tests pass",
+        "metadata": {"task_class": "implementation"},
+    },
+    {
+        "id": "t-2",
+        "title": "Review demo",
+        "status": "done",
+        "result": "approved",
+        "metadata": {"task_class": "review", "reviewer_summary": "verified"},
+    },
+    {
+        "id": "t-3",
+        "title": "Accept demo",
+        "status": "blocked",
+        "result": None,
+        "metadata": {},
+    },
+]
+_STATUS_DIAGNOSTICS = [
+    {"severity": "warning", "code": "stale-claim", "message": "claim is stale", "task_id": "t-3"},
+]
+
+
+class StatusHermesClient:
+    def __init__(
+        self,
+        profiles: set[str],
+        stats: object,
+        tasks: object,
+        diagnostics: object,
+        runs: dict[str, object],
+    ) -> None:
+        self.profiles = profiles
+        self.stats = stats
+        self.tasks = tasks
+        self.diagnostics = diagnostics
+        self.runs = runs
+        self.command_calls: list[list[str]] = []
+
+    def profile_exists(self, profile: str) -> bool:
+        return profile in self.profiles
+
+    def run_json(self, args: list[str]) -> object:
+        self.command_calls.append(args)
+        subcommand = args[3] if len(args) > 3 else None
+        if subcommand == "stats":
+            return self.stats
+        if subcommand == "list":
+            return self.tasks
+        if subcommand == "diagnostics":
+            return self.diagnostics
+        if subcommand == "runs":
+            return self.runs[args[4]]
+        raise AssertionError(f"unexpected command: {args}")
+
+    def run(self, args: list[str]) -> str:
+        self.command_calls.append(args)
+        return ""
+
+
+def test_status_clean_board_exits_zero_and_prints_counts(
+    valid_rig: Path, capsys
+):
+    client = StatusHermesClient(
+        {"builder", "reviewer"},
+        {"by_status": {"done": 2, "blocked": 1}},
+        list(_STATUS_TASKS),
+        list(_STATUS_DIAGNOSTICS),
+        {"t-1": [{"status": "succeeded"}], "t-2": []},
+    )
+
+    result = main(
+        ["status", "--rig", str(valid_rig)],
+        client_factory=lambda executable: client,
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert captured.out.splitlines()[0] == "findings: 0 critical, 0 error, 1 warning"
+    assert captured.out.splitlines()[1] == (
+        "warning: stale-claim: claim is stale (t-3)"
+    )
+    assert captured.err == ""
+    assert [call[3] for call in client.command_calls] == [
+        "stats",
+        "list",
+        "diagnostics",
+        "runs",
+        "runs",
+    ]
+    assert all(call[:3] == ["kanban", "--board", "demo-rig"] for call in client.command_calls)
+
+
+def test_status_json_contains_stats_and_findings(valid_rig: Path, capsys):
+    client = StatusHermesClient(
+        {"builder", "reviewer"},
+        {"by_status": {"done": 1}, "by_assignee": {}},
+        [
+            {
+                "id": "t-1",
+                "title": "Implement demo",
+                "status": "done",
+                "result": None,
+                "metadata": {"changed_files_required": True},
+            }
+        ],
+        [],
+        {"t-1": []},
+    )
+
+    result = main(
+        ["status", "--rig", str(valid_rig), "--json"],
+        client_factory=lambda executable: client,
+    )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    payload = json.loads(captured.out)
+    assert payload["stats"]["by_status"] == {"done": 1}
+    assert payload["findings"] == [
+        {
+            "severity": "critical",
+            "code": "done-without-proof",
+            "message": "task t-1 is done without a result or successful run summary",
+            "task_id": "t-1",
+        },
+        {
+            "severity": "error",
+            "code": "missing-changed-files",
+            "message": "task t-1 requires changed files but metadata.changed_files is absent",
+            "task_id": "t-1",
+        },
+    ]
+
+
+def test_status_fetches_runs_only_for_done_or_review_tasks(
+    valid_rig: Path, capsys
+):
+    client = StatusHermesClient(
+        {"builder", "reviewer"},
+        {"by_status": {}},
+        list(_STATUS_TASKS),
+        [],
+        {"t-1": [], "t-2": [], "t-3": []},
+    )
+
+    result = main(
+        ["status", "--rig", str(valid_rig)],
+        client_factory=lambda executable: client,
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    run_calls = [call for call in client.command_calls if call[3] == "runs"]
+    assert [call[4] for call in run_calls] == ["t-1", "t-2"]

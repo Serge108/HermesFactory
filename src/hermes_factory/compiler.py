@@ -76,7 +76,6 @@ def compile_mission(rig: RigSpec, mission: MissionSpec) -> MissionPlan:
                 ),
             )
         )
-        implementation_keys.append(implementation_key)
         review_keys.append(review_key)
 
     blocked = mission.human_acceptance

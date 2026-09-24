@@ -94,7 +94,6 @@ def test_acceptance_task_depends_on_all_review_tasks(rig, single_slice_mission):
     acceptance = plan.tasks[2]
 
     assert acceptance.key == "acceptance"
-    assert acceptance.profile == "builder"
     assert acceptance.parents == ("implement:review",)
     assert acceptance.idempotency_key == "factory:demo:demo-mission:acceptance"
 

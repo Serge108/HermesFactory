@@ -1,10 +1,22 @@
 from pathlib import Path
 from subprocess import CompletedProcess, TimeoutExpired
 
+import shutil
+
 import pytest
 
 from hermes_factory.errors import HermesCommandError
 from hermes_factory.hermes_cli import HermesClient
+
+
+def test_real_hermes_executable_reports_version():
+    hermes = shutil.which("hermes")
+    if hermes is None:
+        pytest.skip("hermes executable not found on PATH")
+
+    output = HermesClient(executable=hermes, timeout_seconds=60).run(["--version"])
+
+    assert "Hermes Agent v" in output
 
 
 def test_run_json_preserves_argument_boundaries_for_windows_path():

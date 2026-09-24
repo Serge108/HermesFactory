@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from hermes_factory import __version__
+from hermes_factory.board import ensure_board
 from hermes_factory.errors import FactoryError
 from hermes_factory.hermes_cli import HermesClient
 from hermes_factory.models import RigSpec
@@ -21,6 +22,9 @@ def build_parser() -> argparse.ArgumentParser:
     validate = subparsers.add_parser("validate")
     validate.add_argument("--rig", type=Path, required=True)
     validate.add_argument("--hermes", default="hermes")
+    apply = subparsers.add_parser("apply")
+    apply.add_argument("--rig", type=Path, required=True)
+    apply.add_argument("--hermes", default="hermes")
     return parser
 
 
@@ -63,6 +67,27 @@ def main(
             return 2
         warn_nonisolated_seats(rig)
         print(f"valid: {rig.project.slug} ({len(rig.seats)} seats)")
+        return 0
+    if args.command == "apply":
+        try:
+            rig = load_rig(args.rig)
+            client = client_factory(args.hermes)
+            missing = validate_rig_profiles(rig, client)
+            if missing:
+                print(
+                    f"error: missing Hermes profiles: {', '.join(missing)}",
+                    file=sys.stderr,
+                )
+                return 2
+            warn_nonisolated_seats(rig)
+            result = ensure_board(client, rig)
+        except FactoryError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if result.created:
+            print(f"created board {result.slug}")
+        else:
+            print(f"board {result.slug} already exists")
         return 0
     raise AssertionError(f"unhandled command: {args.command}")
 

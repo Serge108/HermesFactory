@@ -13,6 +13,7 @@ from hermes_factory.compiler import compile_mission
 from hermes_factory.errors import FactoryError
 from hermes_factory.health import audit_tasks
 from hermes_factory.hermes_cli import HermesClient
+from hermes_factory.metrics import compute_metrics
 from hermes_factory.mission_loader import load_mission
 from hermes_factory.models import RigSpec
 from hermes_factory.rig_loader import load_rig
@@ -52,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--json", action="store_true")
     status.add_argument("--hermes", default="hermes")
     status.set_defaults(handler_key="status")
+    report = subparsers.add_parser("report")
+    report.add_argument("--rig", type=Path, required=True)
+    report.add_argument("--json", action="store_true")
+    report.add_argument("--hermes", default="hermes")
+    report.set_defaults(handler_key="report")
     return parser
 
 
@@ -193,6 +199,60 @@ def handle_status(args: argparse.Namespace, client_factory: ClientFactory) -> in
     return 1 if counts["critical"] or counts["error"] else 0
 
 
+def handle_report(args: argparse.Namespace, client_factory: ClientFactory) -> int:
+    rig = load_rig(args.rig)
+    client = client_factory(args.hermes)
+    board = ["kanban", "--board", rig.board.slug]
+    stats = client.run_json(board + ["stats", "--json"])
+    tasks = client.run_json(board + ["list", "--json"])
+
+    runs_by_task: dict[str, list] = {}
+    for task in tasks:
+        task_id = task.get("id")
+        if task.get("status") == "done":
+            runs_by_task[task_id] = client.run_json(
+                board + ["runs", task_id, "--json"]
+            )
+
+    metrics = compute_metrics(tasks, runs_by_task, stats)
+    if args.json:
+        print(
+            json.dumps(
+                {"report": {"board": rig.board.slug}, "metrics": asdict(metrics)},
+                indent=2,
+            )
+        )
+    else:
+        print(f"done: {metrics.done}  (totals: {metrics.totals or '-'})")
+        throughput = (
+            f"{metrics.throughput_per_day}"
+            if metrics.throughput_per_day is not None
+            else "-"
+        )
+        proof_rate = (
+            f"{metrics.proof_rate:.2f}" if metrics.proof_rate is not None else "-"
+        )
+        rework_rate = (
+            f"{metrics.rework_rate:.2f}" if metrics.rework_rate is not None else "-"
+        )
+        print(
+            f"throughput_per_day={throughput}  proof_rate={proof_rate}  "
+            f"rework_rate={rework_rate}  changes_requested={metrics.changes_requested}"
+        )
+        lead = (
+            f"{metrics.median_lead_time_minutes}"
+            if metrics.median_lead_time_minutes is not None
+            else "-"
+        )
+        print(f"median lead time: {lead} minutes")
+        open_seats = ", ".join(
+            f"{seat}: {count}"
+            for seat, count in sorted(metrics.open_work_by_seat.items())
+        ) or "-"
+        print(f"open work: {open_seats}")
+    return 0
+
+
 HANDLERS: dict[str, Callable[[argparse.Namespace, ClientFactory], int]] = {
     "version": handle_version,
     "validate": handle_validate,
@@ -200,6 +260,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace, ClientFactory], int]] = {
     "mission-plan": handle_mission_plan,
     "mission-apply": handle_mission_apply,
     "status": handle_status,
+    "report": handle_report,
 }
 
 

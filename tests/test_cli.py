@@ -5,6 +5,7 @@ import pytest
 
 from hermes_factory.cli import main
 from hermes_factory.errors import HermesCommandError
+from hermes_factory.metrics import compute_metrics
 
 
 class FakeHermesClient:
@@ -683,3 +684,106 @@ def test_status_fetches_runs_only_for_done_or_review_tasks(
     assert result == 0
     run_calls = [call for call in client.command_calls if call[3] == "runs"]
     assert [call[4] for call in run_calls] == ["t-1", "t-2"]
+
+
+_REPORT_TASKS = [
+    {
+        "id": "t-1",
+        "status": "done",
+        "assignee": "builder",
+        "created_at": 0,
+        "completed_at": 3_600,
+        "result": "tests pass",
+        "metadata": {},
+    },
+    {
+        "id": "t-2",
+        "status": "ready",
+        "assignee": "builder",
+        "created_at": 100,
+        "completed_at": None,
+        "result": None,
+        "metadata": {},
+    },
+]
+_REPORT_RUNS = {
+    "t-1": [
+        {
+            "status": "review",
+            "outcome": "review_requested",
+        },
+        {
+            "status": "done",
+            "outcome": "changes_requested",
+        },
+    ]
+}
+_REPORT_STATS = {"by_status": {"done": 1, "ready": 1}, "now": 86_400}
+
+
+class ReportHermesClient:
+    def __init__(self, stats: object, tasks: object, runs: dict[str, object]) -> None:
+        self.stats = stats
+        self.tasks = tasks
+        self.runs = runs
+        self.command_calls: list[list[str]] = []
+
+    def run_json(self, args: list[str]) -> object:
+        self.command_calls.append(args)
+        subcommand = args[3] if len(args) > 3 else None
+        if subcommand == "stats":
+            return self.stats
+        if subcommand == "list":
+            return self.tasks
+        if subcommand == "runs":
+            return self.runs.get(args[4], [])
+        raise AssertionError(f"unexpected command: {args}")
+
+
+def test_report_json_returns_metrics_and_never_fails(
+    valid_rig: Path, capsys
+):
+    client = ReportHermesClient(_REPORT_STATS, list(_REPORT_TASKS), dict(_REPORT_RUNS))
+
+    result = main(
+        ["report", "--rig", str(valid_rig), "--json"],
+        client_factory=lambda executable: client,
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    payload = json.loads(captured.out)
+    expected = compute_metrics(list(_REPORT_TASKS), dict(_REPORT_RUNS), _REPORT_STATS)
+    from dataclasses import asdict
+
+    assert payload["metrics"] == asdict(expected)
+    assert payload["metrics"]["rework_rate"] == 1.0
+    assert payload["metrics"]["changes_requested"] == 1
+    assert payload["metrics"]["open_work_by_seat"] == {"builder": 1}
+    assert payload["metrics"]["median_lead_time_minutes"] == 60.0
+
+
+def test_report_text_prints_operational_lines(valid_rig: Path, capsys):
+    client = ReportHermesClient(_REPORT_STATS, list(_REPORT_TASKS), dict(_REPORT_RUNS))
+
+    result = main(["report", "--rig", str(valid_rig)], client_factory=lambda executable: client)
+
+    captured = capsys.readouterr()
+    assert result == 0
+    lines = captured.out.splitlines()
+    assert lines[0].startswith("done: 1")
+    assert any("rework_rate=1.0" in line for line in lines)
+    assert any("open work" in line and "builder: 1" in line for line in lines)
+
+
+def test_report_fetches_runs_for_done_tasks_only(valid_rig: Path, capsys):
+    client = ReportHermesClient(_REPORT_STATS, list(_REPORT_TASKS), dict(_REPORT_RUNS))
+
+    result = main(
+        ["report", "--rig", str(valid_rig), "--json"],
+        client_factory=lambda executable: client,
+    )
+
+    assert result == 0
+    run_calls = [call for call in client.command_calls if call[3] == "runs"]
+    assert [call[4] for call in run_calls] == ["t-1"]

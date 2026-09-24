@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping
 
 
@@ -49,3 +50,7 @@ class RigSpec:
     seats: Mapping[str, SeatSpec]
     workflows: Mapping[str, WorkflowSpec]
     policies: PolicySpec
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "seats", MappingProxyType(dict(self.seats)))
+        object.__setattr__(self, "workflows", MappingProxyType(dict(self.workflows)))

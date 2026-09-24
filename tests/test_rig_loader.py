@@ -1,3 +1,4 @@
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
@@ -74,6 +75,32 @@ def test_load_rig_rejects_duplicate_keys(tmp_path: Path):
     replace_in_rig(spec, "version: 1", "version: 1\nversion: 1")
 
     with pytest.raises(SpecError, match="duplicate key 'version'"):
+        load_rig(spec)
+
+
+def test_load_rig_rejects_seat_names_that_collide_after_trimming(tmp_path: Path):
+    spec = write_rig(tmp_path, cwd=".")
+    replace_in_rig(
+        spec,
+        "  builder: {profile: builder, role: implementation, skills: []}",
+        "  builder: {profile: builder, role: implementation, skills: []}\n"
+        "  ' builder ': {profile: other, role: implementation, skills: []}",
+    )
+
+    with pytest.raises(SpecError, match="seat slug.*collision.*builder"):
+        load_rig(spec)
+
+
+def test_load_rig_rejects_workflow_names_that_collide_after_trimming(tmp_path: Path):
+    spec = write_rig(tmp_path, cwd=".")
+    workflow = "{implementation_seat: builder, review_seat: reviewer, acceptance_seat: builder}"
+    replace_in_rig(
+        spec,
+        f"  delivery: {workflow}",
+        f"  delivery: {workflow}\n  ' delivery ': {workflow}",
+    )
+
+    with pytest.raises(SpecError, match="workflow slug.*collision.*delivery"):
         load_rig(spec)
 
 
@@ -163,6 +190,27 @@ def test_load_rig_stores_skills_as_tuple(tmp_path: Path):
     rig = load_rig(spec)
 
     assert rig.seats["builder"].skills == ("python", "review")
+
+
+def test_loaded_rig_rejects_field_reassignment(tmp_path: Path):
+    rig = load_rig(write_rig(tmp_path, cwd="."))
+
+    with pytest.raises(FrozenInstanceError):
+        rig.version = 2
+
+
+def test_loaded_rig_seats_mapping_is_read_only(tmp_path: Path):
+    rig = load_rig(write_rig(tmp_path, cwd="."))
+
+    with pytest.raises(TypeError):
+        rig.seats["builder"] = rig.seats["reviewer"]
+
+
+def test_loaded_rig_workflows_mapping_is_read_only(tmp_path: Path):
+    rig = load_rig(write_rig(tmp_path, cwd="."))
+
+    with pytest.raises(TypeError):
+        rig.workflows["replacement"] = rig.workflows["delivery"]
 
 
 def test_parse_duration_rejects_invalid_value():

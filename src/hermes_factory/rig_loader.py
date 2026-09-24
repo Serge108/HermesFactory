@@ -135,6 +135,8 @@ def _load_seats(value: Any) -> dict[str, SeatSpec]:
     seats: dict[str, SeatSpec] = {}
     for raw_name, raw_seat in source.items():
         name = validate_slug(raw_name, "seat slug")
+        if name in seats:
+            raise SpecError(f"seat slug collision after trimming: {name!r}")
         seat = _mapping(raw_seat, f"seat {name!r}")
         _validate_keys(seat, _SEAT_KEYS, f"seat {name!r}")
         raw_skills = seat["skills"]
@@ -159,6 +161,8 @@ def _load_workflows(value: Any, seats: dict[str, SeatSpec]) -> dict[str, Workflo
     workflows: dict[str, WorkflowSpec] = {}
     for raw_name, raw_workflow in source.items():
         name = validate_slug(raw_name, "workflow slug")
+        if name in workflows:
+            raise SpecError(f"workflow slug collision after trimming: {name!r}")
         workflow = _mapping(raw_workflow, f"workflow {name!r}")
         _validate_keys(workflow, _WORKFLOW_KEYS, f"workflow {name!r}")
         loaded = WorkflowSpec(

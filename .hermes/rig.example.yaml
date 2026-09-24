@@ -1,0 +1,18 @@
+project: example
+cwd: C:/path/to/project
+
+seats:
+  coordinator:
+    profile: default
+    role: planning_and_acceptance
+    lifecycle: on_demand
+
+edges: []
+
+policies:
+  require_proof: true
+  restart_on_context_rollover: true
+  human_decisions:
+    - destructive_actions
+    - external_writes
+    - acceptance

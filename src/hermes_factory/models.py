@@ -43,6 +43,35 @@ class PolicySpec:
 
 
 @dataclass(frozen=True, slots=True)
+class ProofSpec:
+    commands: tuple[str, ...]
+    artifacts: tuple[str, ...]
+    changed_files_required: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SliceSpec:
+    id: str
+    title: str
+    goal: str
+    depends_on: tuple[str, ...]
+    acceptance: tuple[str, ...]
+    proof: ProofSpec | None
+
+
+@dataclass(frozen=True, slots=True)
+class MissionSpec:
+    version: int
+    id: str
+    title: str
+    intent: str
+    workflow: str
+    human_acceptance: bool
+    acceptance: tuple[str, ...]
+    slices: tuple[SliceSpec, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class RigSpec:
     version: int
     project: ProjectSpec

@@ -1,0 +1,22 @@
+version: 1
+id: first-delivery
+title: First delivery
+intent: Produce one small, verified result without expanding scope.
+workflow: delivery
+human_acceptance: true
+acceptance:
+  - The requested behavior exists.
+  - Automated tests pass.
+slices:
+  - id: implement
+    title: Implement the requested behavior
+    goal: Make the smallest code change satisfying the mission.
+    depends_on: []
+    acceptance:
+      - A failing test was observed before implementation.
+      - The focused and full test suites pass.
+    proof:
+      commands:
+        - uv run pytest -q
+      artifacts: []
+      changed_files_required: true

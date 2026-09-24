@@ -42,7 +42,12 @@ class HermesClient:
             raise HermesCommandError("failed to run Hermes") from exc
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip() or "no output"
-            raise HermesCommandError(f"Hermes exited {completed.returncode}: {detail}")
+            raise HermesCommandError(
+                f"Hermes exited {completed.returncode}: {detail}",
+                returncode=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+            )
         return completed.stdout
 
     def run_json(self, args: Sequence[str], *, cwd: Path | None = None) -> Any:
@@ -60,6 +65,12 @@ class HermesClient:
         )
         try:
             self.run(args)
-        except HermesCommandError:
-            return False
+        except HermesCommandError as exc:
+            missing_message = (
+                f"Error: Profile '{profile}' does not exist. "
+                f"Create it with: hermes profile create {profile}"
+            )
+            if exc.returncode == 1 and (exc.stderr or "").strip() == missing_message:
+                return False
+            raise
         return True

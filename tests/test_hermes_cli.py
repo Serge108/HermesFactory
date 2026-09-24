@@ -64,8 +64,12 @@ def test_run_reports_available_output_on_nonzero_exit(stdout, stderr, detail):
     def fake_run(argv, **kwargs):
         return CompletedProcess(argv, 2, stdout, stderr)
 
-    with pytest.raises(HermesCommandError, match=rf"Hermes exited 2: {detail}"):
+    with pytest.raises(HermesCommandError, match=rf"Hermes exited 2: {detail}") as exc_info:
         HermesClient(runner=fake_run).run(["kanban", "stats", "--json"])
+
+    assert exc_info.value.returncode == 2
+    assert exc_info.value.stdout == stdout
+    assert exc_info.value.stderr == stderr
 
 
 def test_run_json_wraps_malformed_json_without_echoing_output():
@@ -121,8 +125,49 @@ def test_profile_exists_uses_profile_specific_config_path(profile, expected_argv
     assert calls == [expected_argv]
 
 
-def test_profile_exists_returns_false_when_config_path_fails():
+def test_profile_exists_returns_false_for_confirmed_missing_profile():
     def fake_run(argv, **kwargs):
-        return CompletedProcess(argv, 2, "", "profile missing")
+        return CompletedProcess(
+            argv,
+            1,
+            "",
+            "Error: Profile 'missing' does not exist. "
+            "Create it with: hermes profile create missing\n",
+        )
 
     assert HermesClient(runner=fake_run).profile_exists("missing") is False
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stderr"),
+    [
+        (2, "Error: Profile 'bad name' is not a valid profile name"),
+        (1, "database unavailable"),
+    ],
+)
+def test_profile_exists_propagates_non_missing_command_errors(returncode, stderr):
+    def fake_run(argv, **kwargs):
+        return CompletedProcess(argv, returncode, "", stderr)
+
+    with pytest.raises(HermesCommandError):
+        HermesClient(runner=fake_run).profile_exists("bad name")
+
+
+def test_profile_exists_propagates_timeout_as_hermes_command_error():
+    def fake_run(argv, **kwargs):
+        raise TimeoutExpired(argv, kwargs["timeout"])
+
+    with pytest.raises(HermesCommandError, match="timed out") as exc_info:
+        HermesClient(runner=fake_run).profile_exists("builder")
+
+    assert isinstance(exc_info.value.__cause__, TimeoutExpired)
+
+
+def test_profile_exists_propagates_os_error_as_hermes_command_error():
+    def fake_run(argv, **kwargs):
+        raise OSError("executable not found")
+
+    with pytest.raises(HermesCommandError, match="failed to run Hermes") as exc_info:
+        HermesClient(runner=fake_run).profile_exists("builder")
+
+    assert isinstance(exc_info.value.__cause__, OSError)

@@ -40,7 +40,22 @@ Uses supported Hermes Kanban CLI commands to create or reuse one board per rig a
 
 ### Handoff service
 
-Uses Kanban review summaries, structured metadata, run summaries, and attachments to transfer completed work, verified evidence, failed attempts, unresolved decisions, and the recommended next action.
+Uses Kanban review summaries, structured metadata, run summaries, and attachments to transfer completed work, verified evidence, failed attempts, unresolved decisions, and the recommended next action. Handoffs travel along parent edges only: an implementation task requests review; the reviewer reads the parent result and evidence, then requests changes or completes the review; a dependent slice receives parent summaries; a blocked human acceptance task is resolved by the operator, never by another agent.
+
+Results publish this metadata contract:
+
+```json
+{
+  "changed_files": ["path/to/file.py"],
+  "commands": [{"command": "uv run pytest -q", "exit_code": 0}],
+  "artifacts": ["relative/path/to/report.txt"],
+  "limitations": []
+}
+```
+
+### Safety boundaries
+
+Hermes Factory compiles and audits work. It never keeps idle interactive agents alive and never supervises worker processes: real execution and process lifetime belong to the Hermes gateway dispatcher. The factory owns declarative state only. Operators trigger execution explicitly with `hermes kanban dispatch`; `status` reports health without starting any task. Human acceptance decisions are not delegated to agents.
 
 ### Health monitor
 

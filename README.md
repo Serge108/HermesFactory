@@ -27,6 +27,44 @@ The project adapts the useful operating ideas from OpenRig without introducing a
 6. Use Kanban summaries, metadata, reviews, and attachments for handoffs and proof.
 7. Report health from Kanban diagnostics and deterministic proof audits.
 
+## Operator workflow
+
+```bash
+uv sync --extra dev
+uv run hermes-factory validate --rig .hermes/rig.yaml
+uv run hermes-factory apply --rig .hermes/rig.yaml
+uv run hermes-factory mission plan .hermes/missions/my-mission.yaml --rig .hermes/rig.yaml --json
+uv run hermes-factory mission apply .hermes/missions/my-mission.yaml --rig .hermes/rig.yaml --json
+uv run hermes-factory status --rig .hermes/rig.yaml
+hermes kanban --board <board-slug> dispatch --dry-run --json
+```
+
+`hermes-factory` compiles and audits work; it does not keep idle interactive agents alive. Real execution is owned by the Hermes gateway dispatcher, which spawns and supervises Kanban task sessions. `status` exits non-zero when it finds critical or error findings.
+
+## Handoff rules
+
+Each task carries the full intent chain, acceptance criteria, proof contract, and scope boundaries in its body. Completed work moves along parent edges through Kanban reviews, summaries, structured metadata, and attachments:
+
+```text
+Implementation occupant
+  → request-review(summary, metadata)
+  → reviewer sees parent result and evidence
+  → reviewer requests changes or completes review
+  → dependent slice receives parent summaries
+  → blocked human acceptance task is resolved by the operator
+```
+
+Implementation and review results must publish this metadata:
+
+```json
+{
+  "changed_files": ["path/to/file.py"],
+  "commands": [{"command": "uv run pytest -q", "exit_code": 0}],
+  "artifacts": ["relative/path/to/report.txt"],
+  "limitations": []
+}
+```
+
 ## Constraints
 
 - Windows-native: no tmux, WSL, Docker, or POSIX shell dependency.

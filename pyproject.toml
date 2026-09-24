@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-factory"
+version = "0.1.0"
+description = "Declarative OpenRig-style workflows for Hermes"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6.0.2,<7"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.4,<9", "pytest-cov>=6,<8"]
+
+[project.scripts]
+hermes-factory = "hermes_factory.cli:entrypoint"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

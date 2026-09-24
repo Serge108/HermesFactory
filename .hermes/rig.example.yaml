@@ -1,18 +1,32 @@
-project: example
-cwd: C:/path/to/project
-
+version: 1
+project:
+  slug: example
+  name: Example project
+  cwd: F:/path/to/project
+board:
+  slug: example-rig
+  name: Example rig
 seats:
   coordinator:
     profile: default
     role: planning_and_acceptance
-    lifecycle: on_demand
-
-edges: []
-
+    skills: []
+  builder:
+    profile: builder
+    role: implementation
+    skills: []
+  reviewer:
+    profile: reviewer
+    role: independent_review
+    skills: []
+workflows:
+  delivery:
+    implementation_seat: builder
+    review_seat: reviewer
+    acceptance_seat: coordinator
 policies:
   require_proof: true
-  restart_on_context_rollover: true
-  human_decisions:
-    - destructive_actions
-    - external_writes
-    - acceptance
+  human_acceptance: true
+  max_retries: 2
+  max_runtime: 30m
+  completion_contract: local-only

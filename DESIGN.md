@@ -6,45 +6,45 @@ Provide OpenRig-style persistent seats, topology, handoffs, refocus, and health 
 
 ## Architectural boundary
 
-Hermes Factory does not wrap model APIs and does not emulate Hermes. It controls ordinary Hermes CLI processes and reads supported Hermes session/state surfaces.
+Hermes Factory does not wrap model APIs, emulate Hermes, supervise worker processes, or keep its own task database. It compiles declarative rig and mission files through supported Hermes CLI commands.
 
 ```text
 Operator
    |
-Hermes Factory CLI / Desktop panel
+Hermes Factory CLI
    |
-Factory service ─── SQLite state
+Rig and mission compiler
    |
-Hermes process supervisor
+Hermes Kanban CLI and dispatcher
    |
-Hermes profiles and sessions
+Hermes profiles and task sessions
 ```
 
 ## Initial components
 
 ### Rig loader
 
-Loads and validates `.hermes/rig.yaml`: project identity, cwd, seats, profile bindings, roles, communication edges, and lifecycle policy.
+Loads and validates `.hermes/rig.yaml`: project identity, cwd, board, seats, profile bindings, roles, workflows, and policies.
 
-### Seat registry
+### Seat resolver
 
-Maintains stable seat identity independently of the active Hermes session. Records the profile, role, current occupant, lifecycle state, and last verified progress.
+Maps each stable seat and declared role to an existing Hermes profile. A Kanban-dispatched task session is the replaceable occupant of that seat.
 
-### Process supervisor
+### Mission compiler
 
-Starts Hermes with native Windows subprocess APIs. It does not scrape an interactive terminal as the source of truth.
+Compiles project, mission, and slice intent into an idempotent Kanban task graph. Workflow groups and dependency edges define the topology. Each task receives its full intent chain, acceptance criteria, proof contract, scope boundaries, and handoff target.
 
-### Work queue
+### Kanban adapter
 
-Stores structured work items with goals, acceptance criteria, owner, dependencies, status, and proof artifacts.
+Uses supported Hermes Kanban CLI commands to create or reuse one board per rig and to apply tasks. Hermes Kanban owns persistence, dispatch, claims, retries, heartbeats, task history, reviews, and worker process tracking.
 
 ### Handoff service
 
-Creates a bounded transfer packet containing objective, completed work, verified evidence, failed attempts, relevant files, unresolved decisions, and the recommended next action.
+Uses Kanban review summaries, structured metadata, run summaries, and attachments to transfer completed work, verified evidence, failed attempts, unresolved decisions, and the recommended next action.
 
 ### Health monitor
 
-Detects no-progress execution, repeated failures, missing proof, context rollover requirements, and unauthorized scope expansion.
+Combines Hermes Kanban diagnostics with deterministic audits for missing proof and stalled work. It does not implement separate worker liveness or process supervision.
 
 ## Explicit non-goals for MVP
 
@@ -53,8 +53,9 @@ Detects no-progress execution, repeated failures, missing proof, context rollove
 - Arbitrary agent-to-agent terminal typing.
 - Large autonomous swarms.
 - A second memory or skills system.
+- A second task queue, state database, dispatcher, or process supervisor.
 - Automatic approval of product, security, or destructive decisions.
 
 ## First vertical slice
 
-Given a valid rig containing one seat, `factory up` starts one Hermes process, records its identity, `factory status` reports observed state, and `factory stop` terminates only that managed process. Tests must cover validation, quoting of Windows paths, state transitions, and stale-process reconciliation.
+Given a valid rig, Hermes Factory resolves declared seats to existing profiles, creates or reuses one Hermes Kanban board, and compiles a mission slice into idempotent implementation, review, and acceptance tasks. Tests cover validation, Windows paths containing spaces, dependency topology, handoff context, and proof requirements.

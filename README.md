@@ -9,30 +9,33 @@ The project adapts the useful operating ideas from OpenRig without introducing a
 | Factory concept | Hermes primitive |
 |---|---|
 | Seat | Hermes profile plus a stable role |
-| Occupant | A replaceable Hermes session |
-| Rig | A declarative team topology |
-| Queue | Durable repository-backed work records |
-| Handoff | Structured context passed to the next occupant |
-| Refocus | Periodic restoration of project intent and acceptance criteria |
-| Health | Progress, stall, context, and proof signals |
+| Occupant | A Kanban-dispatched Hermes session |
+| Rig | One declarative rig plus one Hermes Kanban board |
+| Pod | A named workflow and explicit task dependency edges |
+| Mission and slice | A mission specification compiled into a Kanban task graph |
+| Handoff | Kanban summaries, metadata, reviews, and attachments |
+| Refocus | Complete project, mission, and slice intent in task context |
+| Health | Kanban diagnostics plus deterministic proof audits |
 
 ## MVP
 
-1. Read `.hermes/rig.yaml`.
-2. Validate profiles, working directories, roles, and edges.
-3. Start and stop seats as native Windows Hermes processes.
-4. Persist seat and work state in SQLite.
-5. Support `up`, `status`, `send`, `stop`, and `handoff` commands.
-6. Require proof artifacts before work can be marked complete.
-7. Detect stalled or looping seats.
+1. Load and validate `.hermes/rig.yaml`.
+2. Map stable seats to existing Hermes profiles.
+3. Create or reuse one Hermes Kanban board per rig.
+4. Compile mission and slice YAML into an idempotent Kanban task graph.
+5. Render the complete intent chain and worker protocol into each task.
+6. Use Kanban summaries, metadata, reviews, and attachments for handoffs and proof.
+7. Report health from Kanban diagnostics and deterministic proof audits.
 
 ## Constraints
 
 - Windows-native: no tmux, WSL, Docker, or POSIX shell dependency.
 - Hermes remains the only agent runtime and source of session truth.
 - Persistent identity belongs to a seat, not to one model context.
-- Repository artifacts and SQLite are authoritative; agent chat is not.
+- Repository artifacts and Hermes Kanban records are authoritative; agent chat is not.
 - Human decisions cannot be silently delegated to another agent.
+
+Hermes Kanban owns queue persistence, worker dispatch, retries, claims, heartbeats, and task history. Hermes Factory must not duplicate those systems.
 
 ## Status
 

@@ -373,11 +373,94 @@ def test_mission_plan_rejects_malformed_mission_as_clean_error(
     assert "Traceback" not in captured.err
 
 
+_MULTI_SLICE_MISSION = """\
+version: 1
+id: demo-mission
+title: Demo mission
+intent: Ship one verified behavior without expanding scope.
+workflow: delivery
+human_acceptance: true
+acceptance:
+  - The requested behavior exists.
+slices:
+  - id: core
+    title: Implement the core behavior
+    goal: Make the smallest code change satisfying the mission.
+    depends_on: []
+    acceptance:
+      - A failing test was observed before implementation.
+    proof:
+      commands:
+        - uv run pytest -q
+      artifacts: []
+      changed_files_required: true
+  - id: polish
+    title: Polish the behavior
+    goal: Remove rough edges revealed by review.
+    depends_on:
+      - core
+    acceptance:
+      - Review findings are resolved.
+    proof:
+      commands:
+        - uv run pytest -q
+      artifacts: []
+      changed_files_required: true
+"""
+
+
+def test_mission_plan_compiles_dependent_slices_end_to_end(
+    valid_rig: Path, tmp_path: Path, capsys
+):
+    mission_path = tmp_path / "mission.yaml"
+    mission_path.write_text(_MULTI_SLICE_MISSION, encoding="utf-8")
+    hermes_calls: list[list[str]] = []
+
+    class RecordingClient:
+        def run_json(self, args: list[str]) -> object:
+            hermes_calls.append(args)
+            return {}
+
+        def run(self, args: list[str]) -> str:
+            hermes_calls.append(args)
+            return ""
+
+    def record_only(executable: str):
+        return RecordingClient()
+
+    result = main(
+        [
+            "mission",
+            "plan",
+            str(mission_path),
+            "--rig",
+            str(valid_rig),
+            "--json",
+        ],
+        client_factory=record_only,
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    payload = json.loads(captured.out)
+    assert [task["key"] for task in payload["tasks"]] == [
+        "core:implementation",
+        "core:review",
+        "polish:implementation",
+        "polish:review",
+        "acceptance",
+    ]
+    assert payload["tasks"][2]["parents"] == ["core:review"]
+    assert payload["tasks"][4]["parents"] == ["core:review", "polish:review"]
+    assert payload["tasks"][4]["initial_status"] == "blocked"
+    assert payload["tasks"][0]["initial_status"] is None
+    assert hermes_calls == []
+
+
 def test_mission_apply_creates_tasks_and_prints_task_id_map(
     valid_rig: Path, mission_file: Path, capsys
 ):
     client = MissionHermesClient({"builder", "reviewer"}, [], list(_TASK_RESPONSES))
-
     result = main(
         ["mission", "apply", str(mission_file), "--rig", str(valid_rig), "--json"],
         client_factory=lambda executable: client,

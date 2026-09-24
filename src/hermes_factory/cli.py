@@ -119,6 +119,7 @@ def handle_mission_plan(args: argparse.Namespace, client_factory: ClientFactory)
             "profile": task.profile,
             "parents": list(task.parents),
             "idempotency_key": task.idempotency_key,
+            "initial_status": task.initial_status,
         }
         for task in plan.tasks
     ]

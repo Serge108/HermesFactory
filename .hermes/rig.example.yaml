@@ -2,7 +2,7 @@ version: 1
 project:
   slug: example
   name: Example project
-  cwd: F:/path/to/project
+  cwd: ..
 board:
   slug: example-rig
   name: Example rig

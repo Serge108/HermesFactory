@@ -103,6 +103,37 @@ def test_proof_rate_uses_result_or_successful_run():
     assert metrics.proof_rate == 2 / 3
 
 
+def test_proof_rate_accepts_real_completed_run_shape():
+    tasks = [_task("t-1", result=None)]
+    runs = {"t-1": [_run(status="done", outcome="completed")]}
+
+    metrics = compute_metrics(tasks, runs, {"now": 100})
+
+    assert metrics.proof_rate == 1.0
+
+
+def test_proof_rate_rejects_contradictory_failed_completed_run():
+    tasks = [_task("t-1", result=None)]
+    runs = {"t-1": [_run(status="failed", outcome="completed")]}
+
+    metrics = compute_metrics(tasks, runs, {"now": 100})
+
+    assert metrics.proof_rate == 0.0
+
+
+def test_proof_rate_uses_authoritative_override():
+    tasks = [_task("t-1", result="claimed")]
+
+    metrics = compute_metrics(
+        tasks,
+        {},
+        {"now": 100},
+        proof_by_task={"t-1": False},
+    )
+
+    assert metrics.proof_rate == 0.0
+
+
 def test_rework_rate_counts_tasks_with_more_than_one_run():
     tasks = [
         _task("t-1", result="a"),

@@ -54,6 +54,23 @@ def _string_list(value: Any, field: str) -> tuple[str, ...]:
     return tuple(_string(item, f"{field}[{index}]") for index, item in enumerate(value))
 
 
+def _artifact_names(value: Any, field: str) -> tuple[str, ...]:
+    artifacts = _string_list(value, field)
+    for index, artifact in enumerate(artifacts):
+        if (
+            "/" in artifact
+            or "\\" in artifact
+            or artifact in {".", ".."}
+            or artifact.startswith(".")
+            or len(artifact) > 200
+        ):
+            raise SpecError(f"{field}[{index}] artifact must be a safe filename")
+    normalized = [artifact.casefold() for artifact in artifacts]
+    if len(set(normalized)) != len(normalized):
+        raise SpecError(f"{field} must not contain duplicate filenames")
+    return artifacts
+
+
 def _load_proof(value: Any, slice_id: str, rig: RigSpec) -> ProofSpec | None:
     if value is None:
         if rig.policies.require_proof:
@@ -63,7 +80,9 @@ def _load_proof(value: Any, slice_id: str, rig: RigSpec) -> ProofSpec | None:
     _validate_keys(proof, _PROOF_KEYS, f"slice {slice_id!r}.proof")
     return ProofSpec(
         commands=_string_list(proof["commands"], f"slice {slice_id!r}.proof.commands"),
-        artifacts=_string_list(proof["artifacts"], f"slice {slice_id!r}.proof.artifacts"),
+        artifacts=_artifact_names(
+            proof["artifacts"], f"slice {slice_id!r}.proof.artifacts"
+        ),
         changed_files_required=_boolean(
             proof["changed_files_required"],
             f"slice {slice_id!r}.proof.changed_files_required",

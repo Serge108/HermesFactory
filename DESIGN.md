@@ -40,18 +40,19 @@ Uses supported Hermes Kanban CLI commands to create or reuse one board per rig a
 
 ### Handoff service
 
-Uses Kanban review summaries, structured metadata, run summaries, and attachments to transfer completed work, verified evidence, failed attempts, unresolved decisions, and the recommended next action. Handoffs travel along parent edges only: an implementation task requests review; the reviewer reads the parent result and evidence, then requests changes or completes the review; a dependent slice receives parent summaries; a blocked human acceptance task is resolved by the operator, never by another agent.
+Uses Kanban completion summaries, structured metadata, run summaries, and attachments to transfer completed work, verified evidence, failed attempts, unresolved decisions, and the recommended next action. Handoffs travel along dependency edges only: an implementation task completes with evidence to release its pre-created reviewer child; the reviewer reads the parent result and evidence, then completes the review or blocks it with actionable findings; a dependent slice receives parent summaries; a blocked human acceptance task is resolved by the operator, never by another agent.
 
-Results publish this metadata contract:
+Results publish this completion metadata contract:
 
 ```json
 {
   "changed_files": ["path/to/file.py"],
   "commands": [{"command": "uv run pytest -q", "exit_code": 0}],
-  "artifacts": ["relative/path/to/report.txt"],
   "limitations": []
 }
 ```
+
+Required artifacts are persisted as Hermes Kanban attachments, not trusted from worker-reported paths.
 
 ### Safety boundaries
 
@@ -59,7 +60,11 @@ Hermes Factory compiles and audits work. It never keeps idle interactive agents 
 
 ### Health monitor
 
-Combines Hermes Kanban diagnostics with deterministic audits for missing proof and stalled work. It does not implement separate worker liveness or process supervision.
+Combines Hermes Kanban diagnostics with deterministic audits for missing proof and stalled work. Factory embeds the declared proof contract in each task body, checks commands and changed files against structured metadata on the latest successful Hermes run, and checks required artifacts against persisted Kanban attachment records. It does not implement separate worker liveness or process supervision.
+
+### Operator views
+
+`status` and `report` are deterministic read-only projections of Hermes Kanban JSON. Factory deliberately does not provide another web dashboard. Live orchestration belongs to Hermes itself: the native Kanban dashboard streams task events and exposes links, comments, runs, and handoffs; `hermes kanban --board <slug> watch` provides the terminal event stream. This keeps observation attached to the authoritative task-event history instead of presenting a polling snapshot as live execution.
 
 ## Explicit non-goals for MVP
 

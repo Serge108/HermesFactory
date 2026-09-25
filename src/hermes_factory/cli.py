@@ -6,13 +6,12 @@ import sys
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
 
 from hermes_factory import __version__
 from hermes_factory.board import apply_mission, ensure_board
 from hermes_factory.compiler import compile_mission
 from hermes_factory.errors import FactoryError
-from hermes_factory.health import audit_tasks
+from hermes_factory.health import audit_tasks, build_proof_map
 from hermes_factory.hermes_cli import HermesClient
 from hermes_factory.metrics import compute_metrics
 from hermes_factory.mission_loader import load_mission
@@ -59,14 +58,6 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--json", action="store_true")
     report.add_argument("--hermes", default="hermes")
     report.set_defaults(handler_key="report")
-    dashboard = subparsers.add_parser("dashboard")
-    dashboard.add_argument("--rig", type=Path, required=True)
-    dashboard.add_argument("--board", default=None)
-    dashboard.add_argument("--host", default="127.0.0.1")
-    dashboard.add_argument("--port", type=int, default=8400)
-    dashboard.add_argument("--refresh", type=int, default=10)
-    dashboard.add_argument("--hermes", default="hermes")
-    dashboard.set_defaults(handler_key="dashboard")
     return parser
 
 
@@ -176,6 +167,7 @@ def handle_status(args: argparse.Namespace, client_factory: ClientFactory) -> in
     diagnostics = client.run_json(board + ["diagnostics", "--json"])
 
     runs_by_task: dict[str, list] = {}
+    attachments_by_task: dict[str, list] = {}
     for task in tasks:
         task_id = task.get("id")
         task_class = (task.get("metadata") or {}).get("task_class")
@@ -183,8 +175,14 @@ def handle_status(args: argparse.Namespace, client_factory: ClientFactory) -> in
             runs_by_task[task_id] = client.run_json(
                 board + ["runs", task_id, "--json"]
             )
+        if task.get("status") == "done":
+            attachments_by_task[task_id] = client.run_json(
+                board + ["attachments", task_id, "--json"]
+            )
 
-    findings = audit_tasks(tasks, runs_by_task, diagnostics)
+    findings = audit_tasks(
+        tasks, runs_by_task, diagnostics, attachments_by_task=attachments_by_task
+    )
     counts = {
         "critical": sum(1 for finding in findings if finding.severity == "critical"),
         "error": sum(1 for finding in findings if finding.severity == "error"),
@@ -214,16 +212,32 @@ def handle_report(args: argparse.Namespace, client_factory: ClientFactory) -> in
     board = ["kanban", "--board", rig.board.slug]
     stats = client.run_json(board + ["stats", "--json"])
     tasks = client.run_json(board + ["list", "--json"])
+    diagnostics = client.run_json(board + ["diagnostics", "--json"])
 
     runs_by_task: dict[str, list] = {}
+    attachments_by_task: dict[str, list] = {}
     for task in tasks:
         task_id = task.get("id")
+        if not isinstance(task_id, str):
+            continue
+        runs_by_task[task_id] = client.run_json(
+            board + ["runs", task_id, "--json"]
+        )
         if task.get("status") == "done":
-            runs_by_task[task_id] = client.run_json(
-                board + ["runs", task_id, "--json"]
+            attachments_by_task[task_id] = client.run_json(
+                board + ["attachments", task_id, "--json"]
             )
 
-    metrics = compute_metrics(tasks, runs_by_task, stats)
+    findings = audit_tasks(
+        tasks,
+        runs_by_task,
+        diagnostics,
+        attachments_by_task=attachments_by_task,
+    )
+    proof_by_task = build_proof_map(tasks, runs_by_task, findings)
+    metrics = compute_metrics(
+        tasks, runs_by_task, stats, proof_by_task=proof_by_task
+    )
     if args.json:
         print(
             json.dumps(
@@ -262,36 +276,6 @@ def handle_report(args: argparse.Namespace, client_factory: ClientFactory) -> in
     return 0
 
 
-def handle_dashboard(args: argparse.Namespace, client_factory: ClientFactory) -> int:
-    rig = load_rig(args.rig)
-    client = client_factory(args.hermes)
-    board_slug = args.board or rig.board.slug
-    from hermes_factory.web import build_snapshot, create_server
-
-    def snapshot_builder(_slug: str) -> dict[str, Any]:
-        return build_snapshot(rig, client, board_slug=board_slug)
-
-    server = create_server(
-        snapshot_builder,
-        host=args.host,
-        port=args.port,
-        board_slug=board_slug,
-        refresh_seconds=args.refresh,
-    )
-    port = server.server_address[1]
-    print(
-        f"dashboard: board {board_slug} live at http://{args.host}:{port} "
-        f"(refresh every {args.refresh}s; Ctrl+C to stop)"
-    )
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nstopped")
-    finally:
-        server.server_close()
-    return 0
-
-
 HANDLERS: dict[str, Callable[[argparse.Namespace, ClientFactory], int]] = {
     "version": handle_version,
     "validate": handle_validate,
@@ -300,7 +284,6 @@ HANDLERS: dict[str, Callable[[argparse.Namespace, ClientFactory], int]] = {
     "mission-apply": handle_mission_apply,
     "status": handle_status,
     "report": handle_report,
-    "dashboard": handle_dashboard,
 }
 
 

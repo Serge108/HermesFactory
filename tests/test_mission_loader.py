@@ -195,6 +195,38 @@ def test_empty_acceptance_is_rejected(valid_rig: Path, tmp_path: Path):
         load_mission(path, rig)
 
 
+@pytest.mark.parametrize(
+    "artifact",
+    ["reports/report.txt", "reports\\report.txt", "../report.txt", ".hidden", ".", ".."],
+)
+def test_unsafe_artifact_filename_is_rejected(
+    valid_rig: Path, tmp_path: Path, artifact: str
+):
+    rig = load_rig(valid_rig)
+    text = _BASE.replace("artifacts: []", f"artifacts: [{artifact}]")
+
+    with pytest.raises(SpecError, match="artifact must be a safe filename"):
+        load_mission(_write(tmp_path, text), rig)
+
+
+def test_duplicate_artifact_filename_is_rejected(valid_rig: Path, tmp_path: Path):
+    rig = load_rig(valid_rig)
+    text = _BASE.replace("artifacts: []", "artifacts: [report.txt, report.txt]")
+
+    with pytest.raises(SpecError, match="duplicate filenames"):
+        load_mission(_write(tmp_path, text), rig)
+
+
+def test_case_insensitive_duplicate_artifact_filename_is_rejected(
+    valid_rig: Path, tmp_path: Path
+):
+    rig = load_rig(valid_rig)
+    text = _BASE.replace("artifacts: []", "artifacts: [report.txt, REPORT.TXT]")
+
+    with pytest.raises(SpecError, match="duplicate filenames"):
+        load_mission(_write(tmp_path, text), rig)
+
+
 def test_missing_proof_is_rejected_when_rig_requires_it(valid_rig: Path, tmp_path: Path):
     rig = load_rig(valid_rig)
     path = _write(tmp_path, _NO_PROOF_SLICE)

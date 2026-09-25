@@ -36,10 +36,13 @@ uv run hermes-factory apply --rig .hermes/rig.yaml
 uv run hermes-factory mission plan .hermes/missions/my-mission.yaml --rig .hermes/rig.yaml --json
 uv run hermes-factory mission apply .hermes/missions/my-mission.yaml --rig .hermes/rig.yaml --json
 uv run hermes-factory status --rig .hermes/rig.yaml
+uv run hermes-factory report --rig .hermes/rig.yaml
 hermes kanban --board <board-slug> dispatch --dry-run --json
+hermes kanban --board <board-slug> watch
+hermes dashboard --no-open
 ```
 
-`hermes-factory` compiles and audits work; it does not keep idle interactive agents alive. Real execution is owned by the Hermes gateway dispatcher, which spawns and supervises Kanban task sessions. `status` exits non-zero when it finds critical or error findings.
+`hermes-factory` compiles and audits work; it does not keep idle interactive agents alive. Real execution is owned by the Hermes gateway dispatcher, which spawns and supervises Kanban task sessions. `status` exits non-zero when it finds critical or error findings, while `report` is a read-only metrics projection. Factory does not ship a second web dashboard. Use the native Hermes Kanban dashboard and its live task-event stream to observe task links, worker activity, comments, and handoffs; use `hermes kanban watch` for the same orchestration activity in a terminal.
 
 ## Handoff rules
 
@@ -47,23 +50,25 @@ Each task carries the full intent chain, acceptance criteria, proof contract, an
 
 ```text
 Implementation occupant
-  → request-review(summary, metadata)
-  → reviewer sees parent result and evidence
-  → reviewer requests changes or completes review
+  → completes its implementation card with summary and metadata
+  → completion releases the pre-created reviewer child
+  → reviewer independently reads the parent result and evidence
+  → reviewer completes the review or blocks it with actionable findings
   → dependent slice receives parent summaries
   → blocked human acceptance task is resolved by the operator
 ```
 
-Implementation and review results must publish this metadata:
+Implementation and review results must publish structured completion metadata:
 
 ```json
 {
   "changed_files": ["path/to/file.py"],
   "commands": [{"command": "uv run pytest -q", "exit_code": 0}],
-  "artifacts": ["relative/path/to/report.txt"],
   "limitations": []
 }
 ```
+
+Required artifacts must be uploaded as Hermes Kanban attachments. Self-reported artifact paths in completion metadata do not satisfy the proof audit.
 
 ## Constraints
 
@@ -77,4 +82,4 @@ Hermes Kanban owns queue persistence, worker dispatch, retries, claims, heartbea
 
 ## Status
 
-Project initialized. Architecture and first vertical slice are next.
+The first Hermes-native vertical slice is implemented and operationally smoke-tested: rig and mission validation, deterministic Kanban compilation, implementation/review/acceptance topology, proof auditing, metrics, repeated idempotent apply, authoritative attachment proof, and disposable-board archival.

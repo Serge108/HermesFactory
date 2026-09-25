@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from statistics import median
 from typing import Any
 
+from hermes_factory.health import run_succeeded
+
 _OPEN_STATUSES = {"ready", "running", "blocked"}
 _FAILED_RUN_OUTCOMES = {"failed", "spawn_failed", "timed_out", "crashed"}
 _DAY_SECONDS = 86_400
@@ -34,10 +36,7 @@ def _runs_for(runs_by_task: dict[str, list[dict[str, Any]]], task: dict[str, Any
 def _has_proof(task: dict[str, Any], runs: list[dict[str, Any]]) -> bool:
     if task.get("result"):
         return True
-    for run in runs:
-        if run.get("status") == "succeeded" or run.get("outcome") == "success":
-            return True
-    return False
+    return any(run_succeeded(run) for run in runs)
 
 
 def _lead_minutes(task: dict[str, Any]) -> float | None:
@@ -54,6 +53,8 @@ def compute_metrics(
     tasks: list[dict[str, Any]],
     runs_by_task: dict[str, list[dict[str, Any]]],
     stats: dict[str, Any],
+    *,
+    proof_by_task: dict[str, bool] | None = None,
 ) -> BoardMetrics:
     tasks = [task for task in tasks if isinstance(task, dict)]
     now = stats.get("now")
@@ -89,7 +90,12 @@ def compute_metrics(
         runs = _runs_for(runs_by_task, task)
         if status == "done":
             done_tasks.append(task)
-            if _has_proof(task, runs):
+            default_proof = _has_proof(task, runs)
+            if (
+                proof_by_task.get(task.get("id"), default_proof)
+                if proof_by_task is not None
+                else default_proof
+            ):
                 proofed += 1
             if len(runs) > 1:
                 reworked += 1

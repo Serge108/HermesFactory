@@ -111,6 +111,15 @@ def test_dependent_slice_implementation_depends_on_previous_review(rig, mission)
     keys = {task.key: task for task in plan.tasks}
 
     assert keys["polish:implementation"].parents == ("implement:review",)
+    assert "implementation task for slice 'polish'" in keys["implement:review"].body
+    assert "acceptance task for mission" not in keys["implement:review"].body
+
+
+def test_task_bodies_include_declared_seat_roles(rig, single_slice_mission):
+    plan = compile_mission(rig, single_slice_mission)
+
+    assert "Assigned seat: builder; role: implementation." in plan.tasks[0].body
+    assert "Assigned seat: reviewer; role: independent_review." in plan.tasks[1].body
 
 
 def test_task_bodies_come_from_rendered_templates(rig, single_slice_mission):
@@ -119,7 +128,8 @@ def test_task_bodies_come_from_rendered_templates(rig, single_slice_mission):
 
     assert "# Project" in implementation.body
     assert "# Proof required" in implementation.body
-    assert "request-review" in implementation.body
+    assert "kanban_complete" in implementation.body
+    assert "kanban_request_review" not in implementation.body
 
 
 def test_no_human_acceptance_yields_unblocked_acceptance_task(

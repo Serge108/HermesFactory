@@ -548,7 +548,21 @@ _STATUS_TASKS = [
     },
 ]
 _STATUS_DIAGNOSTICS = [
-    {"severity": "warning", "code": "stale-claim", "message": "claim is stale", "task_id": "t-3"},
+    {
+        "task_id": "t-3",
+        "title": "Accept demo",
+        "status": "blocked",
+        "assignee": None,
+        "diagnostics": [
+            {
+                "severity": "warning",
+                "kind": "stale-claim",
+                "title": "Claim is stale",
+                "detail": "claim is stale",
+            }
+        ],
+    },
+    {"task_id": None, "dispatch_profiles": "any", "diagnostics": []},
 ]
 
 
@@ -560,12 +574,14 @@ class StatusHermesClient:
         tasks: object,
         diagnostics: object,
         runs: dict[str, object],
+        attachments: dict[str, object] | None = None,
     ) -> None:
         self.profiles = profiles
         self.stats = stats
         self.tasks = tasks
         self.diagnostics = diagnostics
         self.runs = runs
+        self.attachments = attachments or {}
         self.command_calls: list[list[str]] = []
 
     def profile_exists(self, profile: str) -> bool:
@@ -582,6 +598,8 @@ class StatusHermesClient:
             return self.diagnostics
         if subcommand == "runs":
             return self.runs[args[4]]
+        if subcommand == "attachments":
+            return self.attachments.get(args[4], [])
         raise AssertionError(f"unexpected command: {args}")
 
     def run(self, args: list[str]) -> str:
@@ -617,7 +635,9 @@ def test_status_clean_board_exits_zero_and_prints_counts(
         "list",
         "diagnostics",
         "runs",
+        "attachments",
         "runs",
+        "attachments",
     ]
     assert all(call[:3] == ["kanban", "--board", "demo-rig"] for call in client.command_calls)
 
@@ -683,7 +703,11 @@ def test_status_fetches_runs_only_for_done_or_review_tasks(
     captured = capsys.readouterr()
     assert result == 0
     run_calls = [call for call in client.command_calls if call[3] == "runs"]
+    attachment_calls = [
+        call for call in client.command_calls if call[3] == "attachments"
+    ]
     assert [call[4] for call in run_calls] == ["t-1", "t-2"]
+    assert [call[4] for call in attachment_calls] == ["t-1", "t-2"]
 
 
 _REPORT_TASKS = [
@@ -722,10 +746,19 @@ _REPORT_STATS = {"by_status": {"done": 1, "ready": 1}, "now": 86_400}
 
 
 class ReportHermesClient:
-    def __init__(self, stats: object, tasks: object, runs: dict[str, object]) -> None:
+    def __init__(
+        self,
+        stats: object,
+        tasks: object,
+        runs: dict[str, object],
+        attachments: dict[str, object] | None = None,
+        diagnostics: object | None = None,
+    ) -> None:
         self.stats = stats
         self.tasks = tasks
         self.runs = runs
+        self.attachments = attachments or {}
+        self.diagnostics = diagnostics if diagnostics is not None else []
         self.command_calls: list[list[str]] = []
 
     def run_json(self, args: list[str]) -> object:
@@ -735,8 +768,12 @@ class ReportHermesClient:
             return self.stats
         if subcommand == "list":
             return self.tasks
+        if subcommand == "diagnostics":
+            return self.diagnostics
         if subcommand == "runs":
             return self.runs.get(args[4], [])
+        if subcommand == "attachments":
+            return self.attachments.get(args[4], [])
         raise AssertionError(f"unexpected command: {args}")
 
 
@@ -761,6 +798,87 @@ def test_report_json_returns_metrics_and_never_fails(
     assert payload["metrics"]["changes_requested"] == 1
     assert payload["metrics"]["open_work_by_seat"] == {"builder": 1}
     assert payload["metrics"]["median_lead_time_minutes"] == 60.0
+    attachment_calls = [
+        call for call in client.command_calls if call[3] == "attachments"
+    ]
+    assert [call[4] for call in attachment_calls] == ["t-1"]
+
+
+def test_report_proof_rate_requires_authoritative_artifact(valid_rig: Path, capsys):
+    body = (
+        "<!-- hermes-factory:audit-contract -->\n"
+        'Factory audit contract: {"task_class":"implementation",'
+        '"required_commands":[],"required_artifacts":["report.txt"],'
+        '"changed_files_required":false}\n'
+        "<!-- /hermes-factory:audit-contract -->"
+    )
+    tasks = [
+        {
+            "id": "t-1",
+            "status": "done",
+            "result": None,
+            "created_by": "hermes-factory",
+            "body": body,
+            "metadata": {},
+        }
+    ]
+    runs = {"t-1": [{"status": "done", "outcome": "completed"}]}
+    client = ReportHermesClient(
+        {"by_status": {"done": 1}, "now": 100},
+        tasks,
+        runs,
+        attachments={"t-1": []},
+    )
+
+    result = main(
+        ["report", "--rig", str(valid_rig), "--json"],
+        client_factory=lambda executable: client,
+    )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out)["metrics"]["proof_rate"] == 0.0
+
+
+def test_report_proof_rate_includes_hermes_diagnostics(valid_rig: Path, capsys):
+    tasks = [
+        {
+            "id": "t-1",
+            "status": "done",
+            "result": "tests pass",
+            "metadata": {},
+        }
+    ]
+    client = ReportHermesClient(
+        {"by_status": {"done": 1}, "now": 100},
+        tasks,
+        {"t-1": []},
+        diagnostics=[
+            {
+                "task_id": "t-1",
+                "title": "Implement demo",
+                "status": "done",
+                "assignee": "builder",
+                "diagnostics": [
+                    {
+                        "severity": "error",
+                        "kind": "broken-dependency",
+                        "title": "Dependency is inconsistent",
+                        "detail": "dependency state is inconsistent",
+                    }
+                ],
+            },
+            {"task_id": None, "dispatch_profiles": "any", "diagnostics": []},
+        ],
+    )
+
+    result = main(
+        ["report", "--rig", str(valid_rig), "--json"],
+        client_factory=lambda executable: client,
+    )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out)["metrics"]["proof_rate"] == 0.0
+    assert any(call[3] == "diagnostics" for call in client.command_calls)
 
 
 def test_report_text_prints_operational_lines(valid_rig: Path, capsys):
@@ -776,8 +894,19 @@ def test_report_text_prints_operational_lines(valid_rig: Path, capsys):
     assert any("open work" in line and "builder: 1" in line for line in lines)
 
 
-def test_report_fetches_runs_for_done_tasks_only(valid_rig: Path, capsys):
-    client = ReportHermesClient(_REPORT_STATS, list(_REPORT_TASKS), dict(_REPORT_RUNS))
+def test_custom_dashboard_command_is_not_part_of_factory_cli():
+    from hermes_factory.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            ["dashboard", "--rig", str(Path("rig.yaml")), "--port", "8400"]
+        )
+
+
+def test_report_fetches_runs_for_all_tasks(valid_rig: Path, capsys):
+    runs = dict(_REPORT_RUNS)
+    runs["t-2"] = [{"status": "failed", "outcome": "crashed"}]
+    client = ReportHermesClient(_REPORT_STATS, list(_REPORT_TASKS), runs)
 
     result = main(
         ["report", "--rig", str(valid_rig), "--json"],
@@ -785,5 +914,8 @@ def test_report_fetches_runs_for_done_tasks_only(valid_rig: Path, capsys):
     )
 
     assert result == 0
+    payload = json.loads(capsys.readouterr().out)
     run_calls = [call for call in client.command_calls if call[3] == "runs"]
-    assert [call[4] for call in run_calls] == ["t-1"]
+    assert [call[4] for call in run_calls] == ["t-1", "t-2"]
+    assert payload["metrics"]["total_runs"] == 3
+    assert payload["metrics"]["failed_runs"] == 1

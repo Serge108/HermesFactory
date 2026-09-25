@@ -37,8 +37,17 @@ def compile_mission(rig: RigSpec, mission: MissionSpec) -> MissionPlan:
 
     review_keys: list[str] = []
     tasks: list[PlannedTask] = []
+    ordered_slices = topological_slices(mission)
+    dependent_slices = {
+        slice_spec.id: tuple(
+            candidate.id
+            for candidate in ordered_slices
+            if slice_spec.id in candidate.depends_on
+        )
+        for slice_spec in ordered_slices
+    }
 
-    for slice_spec in topological_slices(mission):
+    for slice_spec in ordered_slices:
         implementation_key = f"{slice_spec.id}:implementation"
         review_key = f"{slice_spec.id}:review"
         implementation_parents = tuple(
@@ -62,11 +71,25 @@ def compile_mission(rig: RigSpec, mission: MissionSpec) -> MissionPlan:
                 ),
             )
         )
+        next_slices = dependent_slices[slice_spec.id]
+        if next_slices:
+            handoff_target = ", ".join(
+                f"implementation task for slice {next_slice!r} "
+                f"(profile {implementation_seat.profile!r})"
+                for next_slice in next_slices
+            )
+        else:
+            handoff_target = (
+                f"acceptance task for mission {mission.id!r} "
+                f"(profile {acceptance_seat.profile!r})"
+            )
         tasks.append(
             PlannedTask(
                 key=review_key,
                 title=f"Review {slice_spec.title}",
-                body=render_review_body(rig, mission, slice_spec),
+                body=render_review_body(
+                    rig, mission, slice_spec, handoff_target=handoff_target
+                ),
                 profile=review_seat.profile,
                 parents=(implementation_key,),
                 skills=review_seat.skills,

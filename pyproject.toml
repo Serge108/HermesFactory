@@ -17,4 +17,4 @@ hermes-factory = "hermes_factory.cli:entrypoint"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q --basetemp=.pytest-tmp"

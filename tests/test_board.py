@@ -133,10 +133,15 @@ class FakeTaskClient:
     def __init__(self, responses: list[object]) -> None:
         self.responses = responses
         self.json_calls: list[list[str]] = []
+        self.run_calls: list[list[str]] = []
 
     def run_json(self, args: list[str]) -> object:
         self.json_calls.append(args)
         return self.responses.pop(0)
+
+    def run(self, args: list[str]) -> str:
+        self.run_calls.append(args)
+        return ""
 
 
 def _flag_values(args: list[str], flag: str) -> list[str]:
@@ -261,6 +266,50 @@ def test_applying_same_plan_twice_returns_same_ids_and_keeps_keys(plan):
     assert _flag_values(client.json_calls[5], "--idempotency-key") == _flag_values(
         client.json_calls[2], "--idempotency-key"
     )
+
+
+def test_apply_subscribes_every_created_or_reused_task_from_rig(
+    valid_rig: Path, tmp_path: Path
+):
+    rig_text = valid_rig.read_text(encoding="utf-8").replace(
+        "policies:",
+        "notifications:\n"
+        "  task_subscriptions:\n"
+        "    - platform: telegram\n"
+        "      chat_id: '1234567890'\n"
+        "      user_id: '1234567890'\n"
+        "      chat_type: dm\n"
+        "      notifier_profile: default\n"
+        "      delivery_mode: notify\n"
+        "policies:",
+    )
+    valid_rig.write_text(rig_text, encoding="utf-8")
+    rig = load_rig(valid_rig)
+    mission_path = tmp_path / "mission.yaml"
+    mission_path.write_text(_MISSION, encoding="utf-8")
+    mission_plan = compile_mission(rig, load_mission(mission_path, rig))
+    client = FakeTaskClient(
+        [
+            {"id": "task-1", "status": "ready", "title": "Implement the requested behavior"},
+            {"id": "task-2", "status": "ready", "title": "Review the requested behavior"},
+            {"id": "task-3", "status": "ready", "title": "Accept Demo mission"},
+        ]
+    )
+
+    apply_mission(client, rig, mission_plan)
+
+    assert client.run_calls == [
+        [
+            "kanban", "--board", "demo-rig", "notify-subscribe", task_id,
+            "--platform", "telegram",
+            "--chat-id", "1234567890",
+            "--user-id", "1234567890",
+            "--chat-type", "dm",
+            "--notifier-profile", "default",
+            "--delivery-mode", "notify",
+        ]
+        for task_id in ("task-1", "task-2", "task-3")
+    ]
 
 
 def test_malformed_task_response_fails_with_clear_error(plan):

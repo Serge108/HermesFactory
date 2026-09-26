@@ -9,16 +9,35 @@ from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode
 
 from hermes_factory.errors import SpecError
-from hermes_factory.models import BoardSpec, PolicySpec, ProjectSpec, RigSpec, SeatSpec, WorkflowSpec
+from hermes_factory.models import (
+    BoardSpec,
+    NotificationSpec,
+    PolicySpec,
+    ProjectSpec,
+    RigSpec,
+    SeatSpec,
+    TaskSubscriptionSpec,
+    WorkflowSpec,
+)
 
 _SLUG = re.compile(r"^(?:[a-z0-9]|[a-z0-9][a-z0-9-]{0,62}[a-z0-9])$")
 _DURATION = re.compile(r"^[1-9][0-9]*(?:s|m|h|d)$")
 
-_ROOT_KEYS = {"version", "project", "board", "seats", "workflows", "policies"}
+_ROOT_REQUIRED_KEYS = {"version", "project", "board", "seats", "workflows", "policies"}
+_ROOT_KEYS = _ROOT_REQUIRED_KEYS | {"notifications"}
 _PROJECT_KEYS = {"slug", "name", "cwd"}
 _BOARD_KEYS = {"slug", "name"}
 _SEAT_KEYS = {"profile", "role", "skills"}
 _WORKFLOW_KEYS = {"implementation_seat", "review_seat", "acceptance_seat"}
+_NOTIFICATION_KEYS = {"task_subscriptions"}
+_TASK_SUBSCRIPTION_KEYS = {
+    "platform",
+    "chat_id",
+    "user_id",
+    "chat_type",
+    "notifier_profile",
+    "delivery_mode",
+}
 _POLICY_KEYS = {
     "require_proof",
     "human_acceptance",
@@ -90,11 +109,17 @@ def _mapping(value: Any, field: str) -> dict[str, Any]:
     return value
 
 
-def _validate_keys(data: dict[str, Any], allowed: set[str], field: str) -> None:
+def _validate_keys(
+    data: dict[str, Any],
+    allowed: set[str],
+    field: str,
+    *,
+    required: set[str] | None = None,
+) -> None:
     unknown = sorted(set(data) - allowed)
     if unknown:
         raise SpecError(f"{field} has unknown key {unknown[0]!r}")
-    missing = sorted(allowed - set(data))
+    missing = sorted((allowed if required is None else required) - set(data))
     if missing:
         raise SpecError(f"{field} is missing required key {missing[0]!r}")
 
@@ -189,10 +214,54 @@ def _load_workflows(value: Any, seats: dict[str, SeatSpec]) -> dict[str, Workflo
     return workflows
 
 
+def _choice(value: Any, field: str, allowed: set[str]) -> str:
+    loaded = _string(value, field)
+    if loaded not in allowed:
+        expected = ", ".join(sorted(allowed))
+        raise SpecError(f"{field} must be one of: {expected}")
+    return loaded
+
+
+def _load_notifications(value: Any) -> NotificationSpec:
+    if value is None:
+        return NotificationSpec(task_subscriptions=())
+    source = _mapping(value, "notifications")
+    _validate_keys(source, _NOTIFICATION_KEYS, "notifications")
+    raw_subscriptions = source["task_subscriptions"]
+    if not isinstance(raw_subscriptions, list):
+        raise SpecError("notifications.task_subscriptions must be a list")
+    subscriptions: list[TaskSubscriptionSpec] = []
+    for index, raw_subscription in enumerate(raw_subscriptions):
+        field = f"notifications.task_subscriptions[{index}]"
+        subscription = _mapping(raw_subscription, field)
+        _validate_keys(subscription, _TASK_SUBSCRIPTION_KEYS, field)
+        subscriptions.append(
+            TaskSubscriptionSpec(
+                platform=_string(subscription["platform"], f"{field}.platform"),
+                chat_id=_string(subscription["chat_id"], f"{field}.chat_id"),
+                user_id=_string(subscription["user_id"], f"{field}.user_id"),
+                chat_type=_choice(
+                    subscription["chat_type"],
+                    f"{field}.chat_type",
+                    {"dm", "group", "channel", "thread"},
+                ),
+                notifier_profile=_string(
+                    subscription["notifier_profile"], f"{field}.notifier_profile"
+                ),
+                delivery_mode=_choice(
+                    subscription["delivery_mode"],
+                    f"{field}.delivery_mode",
+                    {"notify", "notify+wake", "wake"},
+                ),
+            )
+        )
+    return NotificationSpec(task_subscriptions=tuple(subscriptions))
+
+
 def load_rig(path: Path) -> RigSpec:
     path = Path(path).resolve()
     data = _load_yaml(path)
-    _validate_keys(data, _ROOT_KEYS, "rig")
+    _validate_keys(data, _ROOT_KEYS, "rig", required=_ROOT_REQUIRED_KEYS)
 
     version = data["version"]
     if type(version) is not int or version != 1:
@@ -231,6 +300,7 @@ def load_rig(path: Path) -> RigSpec:
         ),
         seats=dict(seats),
         workflows=dict(workflows),
+        notifications=_load_notifications(data.get("notifications")),
         policies=PolicySpec(
             require_proof=_boolean(policies["require_proof"], "policies.require_proof"),
             human_acceptance=_boolean(

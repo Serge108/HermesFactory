@@ -43,6 +43,21 @@ class PolicySpec:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskSubscriptionSpec:
+    platform: str
+    chat_id: str
+    user_id: str
+    chat_type: str
+    notifier_profile: str
+    delivery_mode: str
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationSpec:
+    task_subscriptions: tuple[TaskSubscriptionSpec, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ProofSpec:
     commands: tuple[str, ...]
     artifacts: tuple[str, ...]
@@ -78,6 +93,7 @@ class RigSpec:
     board: BoardSpec
     seats: Mapping[str, SeatSpec]
     workflows: Mapping[str, WorkflowSpec]
+    notifications: NotificationSpec
     policies: PolicySpec
 
     def __post_init__(self) -> None:

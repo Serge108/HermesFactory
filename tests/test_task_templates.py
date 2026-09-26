@@ -192,6 +192,31 @@ def test_implementation_body_completes_parent_to_release_review_child(
     assert "terminal message" in body
 
 
+@pytest.mark.parametrize("renderer", [render_implementation_body, render_review_body])
+def test_worker_body_routes_failure_limit_to_coordinator_decomposition(
+    renderer, rig, mission, implement
+):
+    body = renderer(rig, mission, implement)
+
+    assert "Failure limit: 2 consecutive non-successful runs" in body
+    assert "the coordinator must decompose it into smaller sequential tasks" in body
+    assert "remove the superseded card" in body
+
+
+@pytest.mark.parametrize("renderer", [render_implementation_body, render_review_body])
+def test_worker_body_renders_exact_completion_metadata_schema(
+    renderer, rig, mission, implement
+):
+    body = renderer(rig, mission, implement)
+
+    assert '"changed_files": [\n    "path/to/file"\n  ]' in body
+    assert '"commands": [' in body
+    assert '"command": "uv run pytest -q"' in body
+    assert '"exit_code": 0' in body
+    assert '"limitations": []' in body
+    assert 'Do not use `cmd`, `exit`, nested changed-file groups, or prose-only command records.' in body
+
+
 def test_implementation_body_rejects_overflow(rig, tmp_path):
     path = tmp_path / "mission.yaml"
     path.write_text(

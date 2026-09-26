@@ -213,6 +213,54 @@ def test_loaded_rig_workflows_mapping_is_read_only(tmp_path: Path):
         rig.workflows["replacement"] = rig.workflows["delivery"]
 
 
+def test_load_rig_accepts_task_notification_subscriptions(tmp_path: Path):
+    spec = write_rig(tmp_path, cwd=".")
+    replace_in_rig(
+        spec,
+        "policies:",
+        "notifications:\n"
+        "  task_subscriptions:\n"
+        "    - platform: telegram\n"
+        "      chat_id: '1234567890'\n"
+        "      user_id: '1234567890'\n"
+        "      chat_type: dm\n"
+        "      notifier_profile: default\n"
+        "      delivery_mode: notify\n"
+        "policies:",
+    )
+
+    rig = load_rig(spec)
+
+    assert len(rig.notifications.task_subscriptions) == 1
+    subscription = rig.notifications.task_subscriptions[0]
+    assert subscription.platform == "telegram"
+    assert subscription.chat_id == "1234567890"
+    assert subscription.user_id == "1234567890"
+    assert subscription.chat_type == "dm"
+    assert subscription.notifier_profile == "default"
+    assert subscription.delivery_mode == "notify"
+
+
+def test_load_rig_rejects_invalid_notification_delivery_mode(tmp_path: Path):
+    spec = write_rig(tmp_path, cwd=".")
+    replace_in_rig(
+        spec,
+        "policies:",
+        "notifications:\n"
+        "  task_subscriptions:\n"
+        "    - platform: telegram\n"
+        "      chat_id: '1234567890'\n"
+        "      user_id: '1234567890'\n"
+        "      chat_type: dm\n"
+        "      notifier_profile: default\n"
+        "      delivery_mode: loud\n"
+        "policies:",
+    )
+
+    with pytest.raises(SpecError, match="delivery_mode.*notify"):
+        load_rig(spec)
+
+
 def test_parse_duration_rejects_invalid_value():
     with pytest.raises(SpecError, match="duration"):
         parse_duration("soon")

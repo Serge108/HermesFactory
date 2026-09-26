@@ -16,6 +16,7 @@ from hermes_factory.hermes_cli import HermesClient
 from hermes_factory.metrics import compute_metrics
 from hermes_factory.mission_loader import load_mission
 from hermes_factory.models import RigSpec
+from hermes_factory.reconcile import reconcile_board
 from hermes_factory.rig_loader import load_rig
 
 ClientFactory = Callable[[str], HermesClient]
@@ -58,6 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--json", action="store_true")
     report.add_argument("--hermes", default="hermes")
     report.set_defaults(handler_key="report")
+    reconcile = subparsers.add_parser("reconcile")
+    reconcile.add_argument("--rig", type=Path, required=True)
+    reconcile.add_argument("--json", action="store_true")
+    reconcile.add_argument("--dispatch", action="store_true")
+    reconcile.add_argument("--hermes", default="hermes")
+    reconcile.set_defaults(handler_key="reconcile")
     return parser
 
 
@@ -276,6 +283,30 @@ def handle_report(args: argparse.Namespace, client_factory: ClientFactory) -> in
     return 0
 
 
+def handle_reconcile(args: argparse.Namespace, client_factory: ClientFactory) -> int:
+    rig = load_rig(args.rig)
+    result = reconcile_board(
+        client_factory(args.hermes), rig, dispatch=args.dispatch
+    )
+    payload = {
+        "scanned": result.scanned,
+        "eligible": result.eligible,
+        "recovery_task_ids": result.recovery_task_ids,
+        "dispatched": result.dispatched,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(
+            f"scanned {result.scanned} blocked tasks; "
+            f"created or reused {len(result.recovery_task_ids)} recovery tasks; "
+            f"dispatched {result.dispatched}"
+        )
+        for task_id, recovery_id in result.recovery_task_ids.items():
+            print(f"{task_id} -> {recovery_id}")
+    return 0
+
+
 HANDLERS: dict[str, Callable[[argparse.Namespace, ClientFactory], int]] = {
     "version": handle_version,
     "validate": handle_validate,
@@ -284,6 +315,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace, ClientFactory], int]] = {
     "mission-apply": handle_mission_apply,
     "status": handle_status,
     "report": handle_report,
+    "reconcile": handle_reconcile,
 }
 
 

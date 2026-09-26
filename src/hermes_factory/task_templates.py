@@ -30,6 +30,25 @@ KANBAN_HANDBOOK = """\
 Report results in the Kanban task summary with structured metadata and attach required artifacts as Kanban attachments instead of terminal messages."""
 
 
+def _completion_metadata_section(proof: ProofSpec | None) -> str:
+    metadata = {
+        "changed_files": ["path/to/file"],
+        "commands": [
+            {"command": command, "exit_code": 0}
+            for command in (proof.commands if proof else ())
+        ],
+        "limitations": [],
+    }
+    return (
+        "Completion metadata schema (exact keys and nested field names):\n"
+        f"```json\n{json.dumps(metadata, indent=2)}\n```\n"
+        "`changed_files` must be a flat list of path strings, `commands` must be a list of "
+        "objects with string `command` and integer `exit_code`, and `limitations` must be a flat "
+        "list of strings. Keep every required command text exactly as rendered above. "
+        "Do not use `cmd`, `exit`, nested changed-file groups, or prose-only command records."
+    )
+
+
 def _limit(body: str) -> str:
     if len(body) > BODY_CHARACTER_LIMIT:
         raise SpecError(
@@ -177,7 +196,11 @@ def _scope_section(
         "# Scope boundaries\n"
         f"Project {rig.project.slug}; mission {mission.id}; workflow {mission.workflow}.\n"
         f"Assigned seat: {seat_name}; role: {role}.\n"
-        f"Retries allowed per task: {rig.policies.max_retries}; bounded runtime per task: {rig.policies.max_runtime}.\n"
+        f"Failure limit: {rig.policies.max_retries} consecutive non-successful runs; "
+        f"bounded runtime per task: {rig.policies.max_runtime}.\n"
+        "When a task reaches the failure limit, do not retry the same scope: the coordinator "
+        "must decompose it into smaller sequential tasks, rewire dependencies, and remove the "
+        "superseded card.\n"
         f"Completion contract: {rig.policies.completion_contract}.\n"
         "Anything beyond the slice goal and acceptance lists requires a blocked decision, not a code change."
     )
@@ -198,6 +221,7 @@ def render_implementation_body(
         _intent_sections(rig, mission, slice_spec),
         _proof_section(rig, slice_spec),
         _audit_contract("implementation", slice_spec.proof),
+        _completion_metadata_section(slice_spec.proof),
         WORKER_PROTOCOL,
         _scope_section(
             rig, mission, implementation_seat_name, implementation_seat.role
@@ -230,6 +254,7 @@ def render_review_body(
         _intent_sections(rig, mission, slice_spec),
         _proof_section(rig, slice_spec),
         _audit_contract("review", slice_spec.proof),
+        _completion_metadata_section(slice_spec.proof),
         WORKER_PROTOCOL,
         _scope_section(rig, mission, review_seat_name, review_seat.role),
         (

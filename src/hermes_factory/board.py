@@ -98,11 +98,38 @@ def _create_task(
     return _parse_task_creation(client.run_json(argv))
 
 
+def _subscribe_task(client: HermesClient, rig: RigSpec, task_id: str) -> None:
+    for subscription in rig.notifications.task_subscriptions:
+        client.run(
+            [
+                "kanban",
+                "--board",
+                rig.board.slug,
+                "notify-subscribe",
+                task_id,
+                "--platform",
+                subscription.platform,
+                "--chat-id",
+                subscription.chat_id,
+                "--user-id",
+                subscription.user_id,
+                "--chat-type",
+                subscription.chat_type,
+                "--notifier-profile",
+                subscription.notifier_profile,
+                "--delivery-mode",
+                subscription.delivery_mode,
+            ]
+        )
+
+
 def apply_mission(
     client: HermesClient, rig: RigSpec, plan: MissionPlan
 ) -> AppliedMission:
     task_ids: dict[str, str] = {}
     for task in plan.tasks:
         resolved_parents = tuple(task_ids[parent] for parent in task.parents)
-        task_ids[task.key] = _create_task(client, rig, task, resolved_parents)
+        task_id = _create_task(client, rig, task, resolved_parents)
+        _subscribe_task(client, rig, task_id)
+        task_ids[task.key] = task_id
     return AppliedMission(task_ids=task_ids)

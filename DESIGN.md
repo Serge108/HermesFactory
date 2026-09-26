@@ -24,7 +24,7 @@ Hermes profiles and task sessions
 
 ### Rig loader
 
-Loads and validates `.hermes/rig.yaml`: project identity, cwd, board, seats, profile bindings, roles, workflows, and policies.
+Loads and validates `.hermes/rig.yaml`: project identity, cwd, board, seats, profile bindings, roles, workflows, task-notification subscriptions, and policies.
 
 ### Seat resolver
 
@@ -62,6 +62,14 @@ Hermes Factory compiles and audits work. It never keeps idle interactive agents 
 
 Combines Hermes Kanban diagnostics with deterministic audits for missing proof and stalled work. Factory embeds the declared proof contract in each task body, checks commands and changed files against structured metadata on the latest successful Hermes run, and checks required artifacts against persisted Kanban attachment records. It does not implement separate worker liveness or process supervision.
 
+### Recovery reconciler
+
+`hermes-factory reconcile` is a short, deterministic policy reaction over authoritative Kanban state. It lists blocked cards, considers only cards created by `hermes-factory`, reads each card's event history, and reacts only to a terminal `gave_up` event whose trigger is `timed_out`. Manual/product blocks and reconciler-created cards are ignored.
+
+For each eligible timeout, Factory creates or reuses one high-priority coordinator card. Its idempotency key includes the project, blocked task id, and `gave_up` event timestamp, so repeated cron ticks do not create duplicates. The recovery card has no dependency on the blocked task, because that edge would prevent it from running. It instructs the coordinator to inspect the task log and live diff, preserve valid partial work, create smaller sequential TDD implementation/review pairs, reconnect downstream dependencies, verify the replacement graph, and only then delete superseded cards.
+
+The optional `--dispatch` flag calls the native Kanban dispatcher after confirming that a recovery card is `ready`. Factory still does not own claims, worker processes, retries, heartbeats, or run history. A durable Hermes no-agent cron job invokes the short reconciliation command; the long-running decomposition remains an ordinary Kanban-dispatched coordinator session.
+
 ### Operator views
 
 `status` and `report` are deterministic read-only projections of Hermes Kanban JSON. Factory deliberately does not provide another web dashboard. Live orchestration belongs to Hermes itself: the native Kanban dashboard streams task events and exposes links, comments, runs, and handoffs; `hermes kanban --board <slug> watch` provides the terminal event stream. This keeps observation attached to the authoritative task-event history instead of presenting a polling snapshot as live execution.
@@ -73,7 +81,7 @@ Combines Hermes Kanban diagnostics with deterministic audits for missing proof a
 - Arbitrary agent-to-agent terminal typing.
 - Large autonomous swarms.
 - A second memory or skills system.
-- A second task queue, state database, dispatcher, or process supervisor.
+- A second task queue, state database, dispatcher, or worker process supervisor.
 - Automatic approval of product, security, or destructive decisions.
 
 ## First vertical slice

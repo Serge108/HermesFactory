@@ -919,3 +919,57 @@ def test_report_fetches_runs_for_all_tasks(valid_rig: Path, capsys):
     assert [call[4] for call in run_calls] == ["t-1", "t-2"]
     assert payload["metrics"]["total_runs"] == 3
     assert payload["metrics"]["failed_runs"] == 1
+
+
+def test_reconcile_json_reports_created_recovery_task(valid_rig: Path, capsys):
+    blocked = {
+        "id": "task-1",
+        "title": "Implement large behavior",
+        "status": "blocked",
+        "created_by": "hermes-factory",
+        "last_failure_error": "elapsed 11s > limit 10s",
+    }
+    responses = [
+        [blocked],
+        {
+            "task": blocked,
+            "parents": [],
+            "children": ["review-1"],
+            "events": [
+                {
+                    "kind": "gave_up",
+                    "created_at": 102,
+                    "payload": {
+                        "trigger_outcome": "timed_out",
+                        "error": "elapsed 11s > limit 10s",
+                    },
+                }
+            ],
+            "runs": [],
+        },
+        {
+            "id": "recovery-1",
+            "status": "ready",
+            "title": "Decompose blocked task task-1",
+        },
+    ]
+
+    class ReconcileClient:
+        def run_json(self, args: list[str]) -> object:
+            return responses.pop(0)
+
+        def run(self, args: list[str]) -> str:
+            return ""
+
+    result = main(
+        ["reconcile", "--rig", str(valid_rig), "--json"],
+        client_factory=lambda executable: ReconcileClient(),
+    )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "scanned": 1,
+        "eligible": 1,
+        "recovery_task_ids": {"task-1": "recovery-1"},
+        "dispatched": 0,
+    }

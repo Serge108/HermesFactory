@@ -16,6 +16,7 @@ The project adapts the useful operating ideas from OpenRig without introducing a
 | Handoff | Kanban summaries, metadata, reviews, and attachments |
 | Refocus | Complete project, mission, and slice intent in task context |
 | Health | Kanban diagnostics plus deterministic proof audits |
+| Recovery watchdog | Idempotent reconciliation of timed-out Factory tasks into coordinator work |
 
 ## MVP
 
@@ -27,6 +28,10 @@ The project adapts the useful operating ideas from OpenRig without introducing a
 6. Use Kanban summaries, metadata, reviews, and attachments for handoffs and proof.
 7. Report health from Kanban diagnostics and deterministic proof audits.
 
+## Руководство по эксплуатации
+
+Пошаговая инструкция с примерами находится в [OPERATIONS.md](OPERATIONS.md).
+
 ## Operator workflow
 
 ```bash
@@ -37,12 +42,13 @@ uv run hermes-factory mission plan .hermes/missions/my-mission.yaml --rig .herme
 uv run hermes-factory mission apply .hermes/missions/my-mission.yaml --rig .hermes/rig.yaml --json
 uv run hermes-factory status --rig .hermes/rig.yaml
 uv run hermes-factory report --rig .hermes/rig.yaml
+uv run hermes-factory reconcile --rig .hermes/rig.yaml --dispatch --json
 hermes kanban --board <board-slug> dispatch --dry-run --json
 hermes kanban --board <board-slug> watch
 hermes dashboard --no-open
 ```
 
-`hermes-factory` compiles and audits work; it does not keep idle interactive agents alive. Real execution is owned by the Hermes gateway dispatcher, which spawns and supervises Kanban task sessions. `status` exits non-zero when it finds critical or error findings, while `report` is a read-only metrics projection. Factory does not ship a second web dashboard. Use the native Hermes Kanban dashboard and its live task-event stream to observe task links, worker activity, comments, and handoffs; use `hermes kanban watch` for the same orchestration activity in a terminal.
+`hermes-factory` compiles, reconciles, and audits work; it does not keep idle interactive agents alive. Real execution is owned by the Hermes gateway dispatcher, which spawns and supervises Kanban task sessions. `reconcile` scans blocked Factory tasks for an authoritative `gave_up` event triggered by `timed_out`, then creates or reuses a high-priority coordinator recovery card with a stable idempotency key. `--dispatch` asks the native Kanban dispatcher to start ready recovery cards; it does not spawn workers itself. Run the command from a durable Hermes no-agent cron job for automatic recovery. `status` exits non-zero when it finds critical or error findings, while `report` is a read-only metrics projection. Factory does not ship a second web dashboard. Use the native Hermes Kanban dashboard and its live task-event stream to observe task links, worker activity, comments, and handoffs; use `hermes kanban watch` for the same orchestration activity in a terminal.
 
 ## Handoff rules
 
@@ -79,6 +85,8 @@ Required artifacts must be uploaded as Hermes Kanban attachments. Self-reported 
 - Human decisions cannot be silently delegated to another agent.
 
 Hermes Kanban owns queue persistence, worker dispatch, retries, claims, heartbeats, and task history. Hermes Factory must not duplicate those systems.
+
+The reconciler owns only policy reaction: timeout event detection and idempotent creation of a coordinator task. The coordinator inspects the failed card and repository, creates a smaller replacement graph, rewires dependencies, verifies it, and only then removes superseded implementation and review cards.
 
 ## Status
 

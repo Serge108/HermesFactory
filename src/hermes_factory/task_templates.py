@@ -17,7 +17,18 @@ AUDIT_CONTRACT_KEYS = {
     "required_metadata",
 }
 LEGACY_AUDIT_CONTRACT_KEYS = AUDIT_CONTRACT_KEYS - {"required_metadata"}
-_COMPLETION_METADATA_FIELDS = ["changed_files", "commands", "limitations"]
+_COMPLETION_METADATA_FIELDS = {
+    "implementation": ["changed_files", "commands", "limitations"],
+    "review": ["changed_files", "commands", "limitations"],
+    "commit": ["commit", "decision_log", "limitations"],
+    "recovery": [
+        "replacement_task_ids",
+        "rewires",
+        "superseded_task_ids",
+        "limitations",
+    ],
+    "acceptance": [],
+}
 
 WORKER_PROTOCOL = """\
 Work only on the assigned slice. Re-read this intent chain before changing scope.
@@ -26,26 +37,68 @@ Include a concise summary and structured metadata in the task's terminal lifecyc
 Block the task when a product, security, destructive, external-write, or acceptance decision is required.
 Do not treat another agent's approval as human approval."""
 
+COORDINATOR_ACCEPTANCE_PROTOCOL = """\
+Work only inside the accepted mission scope. Re-read this intent chain before changing scope.
+Record commands actually run and their real exit status. Attach required artifacts.
+Include a concise summary and structured metadata in the task's terminal lifecycle transition.
+Independently verify the evidence and exercise delegated acceptance authority for in-scope decisions.
+Block the task when a security, destructive, irreversible external-write, or out-of-scope decision is required.
+Record the decision as coordinator acceptance; do not represent it as human approval."""
+
 KANBAN_HANDBOOK = """\
 Report results in the Kanban task summary with structured metadata and attach required artifacts as Kanban attachments instead of terminal messages."""
 
 
-def _completion_metadata_section(proof: ProofSpec | None) -> str:
-    metadata = {
-        "changed_files": ["path/to/file"],
-        "commands": [
-            {"command": command, "exit_code": 0}
-            for command in (proof.commands if proof else ())
-        ],
-        "limitations": [],
-    }
+def _completion_metadata_section(task_class: str, proof: ProofSpec | None) -> str:
+    if task_class in {"implementation", "review"}:
+        metadata = {
+            "changed_files": ["path/to/file"],
+            "commands": [
+                {"command": command, "exit_code": 0}
+                for command in (proof.commands if proof else ())
+            ],
+            "limitations": [],
+        }
+        explanation = (
+            "`changed_files` must be a flat list of path strings, `commands` must be a list of "
+            "objects with string `command` and integer `exit_code`, and `limitations` must be a flat "
+            "list of strings. Keep every required command text exactly as rendered above. "
+            "Do not use `cmd`, `exit`, nested changed-file groups, or prose-only command records."
+        )
+    elif task_class == "commit":
+        metadata = {
+            "commit": "<full-length lowercase Git commit object id>",
+            "decision_log": [],
+            "limitations": [],
+        }
+        explanation = (
+            "`commit` must be the exact full-length lowercase Git commit object id created by "
+            "this task; `decision_log` and `limitations` must be flat lists of strings."
+        )
+    elif task_class == "recovery":
+        metadata = {
+            "replacement_task_ids": ["replacement-task-id"],
+            "rewires": [
+                {
+                    "old_parent": "superseded-review-id",
+                    "new_parent": "replacement-review-id",
+                    "child": "downstream-task-id",
+                }
+            ],
+            "superseded_task_ids": ["superseded-task-id"],
+            "limitations": [],
+        }
+        explanation = (
+            "Every id must be an exact Kanban task id. `rewires` must contain only objects with "
+            "the exact keys `old_parent`, `new_parent`, and `child`."
+        )
+    else:
+        metadata = {}
+        explanation = "No structured completion metadata is required."
     return (
         "Completion metadata schema (exact keys and nested field names):\n"
         f"```json\n{json.dumps(metadata, indent=2)}\n```\n"
-        "`changed_files` must be a flat list of path strings, `commands` must be a list of "
-        "objects with string `command` and integer `exit_code`, and `limitations` must be a flat "
-        "list of strings. Keep every required command text exactly as rendered above. "
-        "Do not use `cmd`, `exit`, nested changed-file groups, or prose-only command records."
+        f"{explanation}"
     )
 
 
@@ -73,11 +126,7 @@ def _audit_contract(task_class: str, proof: ProofSpec | None) -> str:
             if proof and task_class == "implementation"
             else False
         ),
-        "required_metadata": (
-            list(_COMPLETION_METADATA_FIELDS)
-            if task_class in {"implementation", "review"}
-            else []
-        ),
+        "required_metadata": list(_COMPLETION_METADATA_FIELDS[task_class]),
     }
     payload = AUDIT_CONTRACT_PREFIX + json.dumps(contract, separators=(",", ":"))
     return f"{AUDIT_CONTRACT_START}\n{payload}\n{AUDIT_CONTRACT_END}"
@@ -91,13 +140,9 @@ def _valid_audit_contract(value: object) -> bool:
     ):
         return False
     task_class = value.get("task_class")
-    expected_metadata = (
-        _COMPLETION_METADATA_FIELDS
-        if task_class in {"implementation", "review"}
-        else []
-    )
+    expected_metadata = _COMPLETION_METADATA_FIELDS.get(task_class)
     return (
-        task_class in {"implementation", "review", "acceptance"}
+        expected_metadata is not None
         and isinstance(value["required_commands"], list)
         and all(
             isinstance(command, str) and bool(command)
@@ -166,7 +211,12 @@ def _intent_sections(rig: RigSpec, mission: MissionSpec, slice_spec: SliceSpec |
         ("# Mission", f"{mission.title}: {mission.intent}"),
     ]
     if slice_spec is not None:
-        sections.append(("# Slice", f"{slice_spec.title}: {slice_spec.goal}"))
+        sections.append(
+            (
+                "# Slice",
+                f"Slice id: {slice_spec.id}\n{slice_spec.title}: {slice_spec.goal}",
+            )
+        )
     sections.append(
         (
             "# Acceptance",
@@ -192,6 +242,13 @@ def _proof_section(rig: RigSpec, slice_spec: SliceSpec | None) -> str:
 def _scope_section(
     rig: RigSpec, mission: MissionSpec, seat_name: str, role: str
 ) -> str:
+    authority = (
+        "The coordinator has delegated decision authority inside the accepted mission. Product "
+        "ambiguities must be routed to that coordinator, who selects the recommended option and "
+        "records the decision without waiting for the operator.\n"
+        if rig.policies.decision_authority == "coordinator"
+        else "Product and acceptance decisions remain with the human operator.\n"
+    )
     return (
         "# Scope boundaries\n"
         f"Project {rig.project.slug}; mission {mission.id}; workflow {mission.workflow}.\n"
@@ -202,6 +259,7 @@ def _scope_section(
         "must decompose it into smaller sequential tasks, rewire dependencies, and remove the "
         "superseded card.\n"
         f"Completion contract: {rig.policies.completion_contract}.\n"
+        f"{authority}"
         "Anything beyond the slice goal and acceptance lists requires a blocked decision, not a code change."
     )
 
@@ -221,7 +279,7 @@ def render_implementation_body(
         _intent_sections(rig, mission, slice_spec),
         _proof_section(rig, slice_spec),
         _audit_contract("implementation", slice_spec.proof),
-        _completion_metadata_section(slice_spec.proof),
+        _completion_metadata_section("implementation", slice_spec.proof),
         WORKER_PROTOCOL,
         _scope_section(
             rig, mission, implementation_seat_name, implementation_seat.role
@@ -254,7 +312,7 @@ def render_review_body(
         _intent_sections(rig, mission, slice_spec),
         _proof_section(rig, slice_spec),
         _audit_contract("review", slice_spec.proof),
-        _completion_metadata_section(slice_spec.proof),
+        _completion_metadata_section("review", slice_spec.proof),
         WORKER_PROTOCOL,
         _scope_section(rig, mission, review_seat_name, review_seat.role),
         (
@@ -272,19 +330,64 @@ def render_acceptance_body(rig: RigSpec, mission: MissionSpec) -> str:
     workflow = rig.workflows[mission.workflow]
     acceptance_seat_name = workflow.acceptance_seat
     acceptance_seat = rig.seats[acceptance_seat_name]
+    coordinator_authority = rig.policies.decision_authority == "coordinator"
+    protocol = (
+        COORDINATOR_ACCEPTANCE_PROTOCOL if coordinator_authority else WORKER_PROTOCOL
+    )
     parts = [
         _intent_sections(rig, mission, None),
         _proof_section(rig, None),
         _audit_contract("acceptance", None),
-        WORKER_PROTOCOL,
+        protocol,
         _scope_section(
             rig, mission, acceptance_seat_name, acceptance_seat.role
         ),
     ]
-    if mission.human_acceptance:
+    if coordinator_authority:
+        parts.append(
+            "# Delegated authority\nThe coordinator has delegated decision authority for this mission. "
+            "Choose the recommended option for any remaining in-scope product ambiguity, record the "
+            "decision and evidence, and complete acceptance without waiting for the operator. Do not "
+            "push commits or perform irreversible external actions."
+        )
+    elif mission.human_acceptance:
         parts.append(
             "# Human gate\nThis mission requires human acceptance: a blocked task stays blocked until a human operator completes it. "
             "Agent review results are context for that decision, never acceptance."
         )
-    parts.append(_handoff_section(rig, mission, "the operator for mission completion"))
+    target = "mission completion" if coordinator_authority else "the operator for mission completion"
+    parts.append(_handoff_section(rig, mission, target))
     return _limit("\n\n".join(parts))
+
+
+def render_commit_body(
+    rig: RigSpec, mission: MissionSpec, slice_spec: SliceSpec
+) -> str:
+    workflow = rig.workflows[mission.workflow]
+    coordinator_name = workflow.acceptance_seat
+    coordinator = rig.seats[coordinator_name]
+    parts = [
+        _intent_sections(rig, mission, slice_spec),
+        "# Proof required\nThe parent review must be complete and approved with its required proof.",
+        _audit_contract("commit", None),
+        _completion_metadata_section("commit", None),
+        _scope_section(rig, mission, coordinator_name, coordinator.role),
+        (
+            "# Commit policy\nInspect the parent implementation metadata and the live repository diff. "
+            "Create one local Git commit containing only the reviewed slice. Preserve unrelated dirty-tree "
+            "changes. If the reviewed content is already committed, verify and report the existing commit. "
+            "Use a mission- and slice-specific message. Never push, reset, rebase, amend unrelated history, "
+            "or include secrets. Complete with the exact commit hash, decision log, and limitations."
+        ),
+        _handoff_section(rig, mission, "the next dependent implementation or mission acceptance"),
+    ]
+    return _limit("\n\n".join(parts))
+
+
+def render_recovery_contract() -> str:
+    return "\n\n".join(
+        [
+            _audit_contract("recovery", None),
+            _completion_metadata_section("recovery", None),
+        ]
+    )

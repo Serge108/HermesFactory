@@ -264,3 +264,41 @@ def test_load_rig_rejects_invalid_notification_delivery_mode(tmp_path: Path):
 def test_parse_duration_rejects_invalid_value():
     with pytest.raises(SpecError, match="duration"):
         parse_duration("soon")
+
+
+def test_load_rig_accepts_coordinator_authority_and_reviewed_slice_commits(
+    tmp_path: Path,
+):
+    spec = write_rig(tmp_path, cwd=".")
+    replace_in_rig(
+        spec,
+        "completion_contract: local-only}",
+        "completion_contract: local-only, decision_authority: coordinator, "
+        "git_commit_policy: reviewed-slices}",
+    )
+
+    rig = load_rig(spec)
+
+    assert rig.policies.decision_authority == "coordinator"
+    assert rig.policies.git_commit_policy == "reviewed-slices"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("decision_authority", "committee", "decision_authority.*coordinator"),
+        ("git_commit_policy", "always", "git_commit_policy.*reviewed-slices"),
+    ],
+)
+def test_load_rig_rejects_invalid_autonomy_policy(
+    tmp_path: Path, field: str, value: str, expected: str
+):
+    spec = write_rig(tmp_path, cwd=".")
+    replace_in_rig(
+        spec,
+        "completion_contract: local-only}",
+        f"completion_contract: local-only, {field}: {value}}}",
+    )
+
+    with pytest.raises(SpecError, match=expected):
+        load_rig(spec)

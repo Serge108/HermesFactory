@@ -1,6 +1,8 @@
+import subprocess
+
 import pytest
 
-from hermes_factory.health import HealthFinding, audit_tasks
+from hermes_factory.health import HealthFinding, audit_tasks, verify_git_commit
 
 
 def _done_task(task_id: str, result: object = None, metadata: dict | None = None) -> dict:
@@ -190,6 +192,103 @@ def test_factory_completion_metadata_requires_limitations_field():
             task_id="t-1",
         ),
     )
+
+
+def test_commit_contract_requires_git_hash_and_decision_log():
+    task = _done_task("t-commit", result="committed")
+    task["created_by"] = "hermes-factory"
+    task["body"] = _contract_body(
+        '{"task_class":"commit","required_commands":[],'
+        '"required_artifacts":[],"changed_files_required":false,'
+        '"required_metadata":["commit","decision_log","limitations"]}'
+    )
+    run = {
+        "status": "done",
+        "outcome": "completed",
+        "summary": "local commit created",
+        "metadata": {
+            "commit": "0123456789abcdef0123456789abcdef01234567",
+            "decision_log": [],
+            "limitations": [],
+        },
+    }
+
+    assert audit_tasks(
+        tasks=[task],
+        runs_by_task={"t-commit": [run]},
+        diagnostics=[],
+        commit_verifier=lambda object_id: object_id == run["metadata"]["commit"],
+    ) == ()
+
+
+def test_commit_contract_rejects_unverified_hex_object_id():
+    task = _done_task("t-commit", result="committed")
+    task["created_by"] = "hermes-factory"
+    task["body"] = _contract_body(
+        '{"task_class":"commit","required_commands":[],'
+        '"required_artifacts":[],"changed_files_required":false,'
+        '"required_metadata":["commit","decision_log","limitations"]}'
+    )
+    run = {
+        "status": "done",
+        "outcome": "completed",
+        "summary": "local commit created",
+        "metadata": {
+            "commit": "0123456789abcdef0123456789abcdef01234567",
+            "decision_log": [],
+            "limitations": [],
+        },
+    }
+
+    findings = audit_tasks(
+        tasks=[task],
+        runs_by_task={"t-commit": [run]},
+        diagnostics=[],
+        commit_verifier=lambda object_id: False,
+    )
+
+    assert findings == (
+        HealthFinding(
+            severity="error",
+            code="invalid-completion-metadata",
+            message="task t-commit has missing or malformed completion metadata: commit",
+            task_id="t-commit",
+        ),
+    )
+
+
+def test_git_commit_verifier_accepts_commit_and_rejects_blob_and_unknown(tmp_path):
+    subprocess.run(["git", "init", "--quiet"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "factory@example.invalid"],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Factory Test"], cwd=tmp_path, check=True
+    )
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("proof\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "proof"], cwd=tmp_path, check=True)
+    commit_id = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    blob_id = subprocess.run(
+        ["git", "hash-object", "tracked.txt"],
+        cwd=tmp_path,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+
+    assert verify_git_commit(tmp_path, commit_id)
+    assert not verify_git_commit(tmp_path, blob_id)
+    assert not verify_git_commit(tmp_path, "0" * len(commit_id))
 
 
 def test_factory_contract_reports_missing_artifact():

@@ -8,6 +8,7 @@ from hermes_factory.rig_loader import load_rig
 from hermes_factory.task_templates import (
     parse_audit_contract,
     render_acceptance_body,
+    render_commit_body,
     render_implementation_body,
     render_review_body,
 )
@@ -101,6 +102,12 @@ def test_implementation_body_orders_intent_chain(rig, mission, implement):
     slice_index = body.find(implement.goal)
 
     assert 0 <= project_index < mission_index < slice_index
+
+
+def test_implementation_body_renders_authoritative_slice_id(rig, mission, implement):
+    body = render_implementation_body(rig, mission, implement)
+
+    assert "# Slice\nSlice id: implement\n" in body
 
 
 def test_implementation_body_renders_command_and_artifact_proof(rig, mission, implement):
@@ -277,3 +284,54 @@ def test_acceptance_body_without_human_gate_omits_blocked_task(rig, tmp_path):
 
     assert "The requested behavior exists." in body
     assert "human gate" not in body.lower()
+
+
+def test_commit_body_requires_local_commit_metadata_and_forbids_push(
+    valid_rig: Path, mission, implement
+):
+    valid_rig.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "completion_contract: local-only}",
+            "completion_contract: local-only, decision_authority: coordinator, "
+            "git_commit_policy: reviewed-slices}",
+        ),
+        encoding="utf-8",
+    )
+    rig = load_rig(valid_rig)
+
+    body = render_commit_body(rig, mission, implement)
+
+    assert parse_audit_contract(body) == {
+        "task_class": "commit",
+        "required_commands": [],
+        "required_artifacts": [],
+        "changed_files_required": False,
+        "required_metadata": ["commit", "decision_log", "limitations"],
+    }
+    assert "create one local git commit" in body.lower()
+    assert "never push" in body.lower()
+    assert '"commit": "<full-length lowercase Git commit object id>"' in body
+    assert "40-character" not in body
+
+
+def test_coordinator_acceptance_records_decisions_without_human_wait(
+    valid_rig: Path, mission
+):
+    valid_rig.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "completion_contract: local-only}",
+            "completion_contract: local-only, decision_authority: coordinator, "
+            "git_commit_policy: 'off'}",
+        ),
+        encoding="utf-8",
+    )
+    rig = load_rig(valid_rig)
+
+    body = render_acceptance_body(rig, mission)
+
+    assert "delegated decision authority" in body.lower()
+    assert "without waiting for the operator" in body.lower()
+    assert "human gate" not in body.lower()
+    assert "acceptance decision is required" not in body.lower()
+    assert "do not treat another agent's approval as human approval" not in body.lower()
+    assert "independently verify" in body.lower()

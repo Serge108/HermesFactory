@@ -14,7 +14,8 @@ Hermes Factory не запускает модели самостоятельно
 - Hermes dashboard и `kanban watch` показывают работу.
 - `hermes-factory status` проверяет здоровье и доказательства выполнения.
 - `hermes-factory report` рассчитывает статистику.
-- `hermes-factory reconcile` превращает тайм-аут Factory-карточки в отдельную задачу координатору.
+- `hermes-factory reconcile` создаёт recovery-задачу для тайм-аута и применяет проверенный план замены вне capability fence исполнителя.
+- `hermes-factory stall-taxonomy` показывает стабильные классы остановок и контракты восстановления.
 
 Короткая схема:
 
@@ -28,7 +29,7 @@ hermes-factory mission apply
 Hermes Kanban board
         |
         v
-implementation -> review -> human acceptance
+implementation -> review -> local commit -> coordinator acceptance
 ```
 
 ## 2. Подготовить Factory
@@ -143,6 +144,8 @@ policies:
   max_retries: 2
   max_runtime: 30m
   completion_contract: local-only
+  decision_authority: coordinator
+  git_commit_policy: reviewed-slices
 ```
 
 Что обычно нужно менять:
@@ -154,6 +157,8 @@ policies:
 - `seats.*.profile`: реальные имена профилей Hermes.
 - `max_retries`: число автоматических повторов.
 - `max_runtime`: максимальная длительность одного запуска.
+- `decision_authority: coordinator`: координатор принимает решения внутри уже принятой миссии и не ждёт человека. Значение `human` сохраняет настоящий операторский gate.
+- `git_commit_policy: reviewed-slices`: после независимого review создаётся отдельная задача локального commit. `push`, `reset`, `rebase` и публикация секретов запрещены.
 
 Чтобы каждая карточка текущих и будущих миссий автоматически подписывалась на Telegram, добавьте в rig:
 
@@ -328,7 +333,10 @@ implementation task
 review task
         |
         v
-blocked human acceptance task
+local commit task
+        |
+        v
+coordinator acceptance task
 ```
 
 Повторный `mission apply` не должен создавать дубликаты. Factory использует стабильные idempotency keys.
@@ -430,11 +438,45 @@ uv run hermes-factory reconcile `
 2. подтверждает в журнале событие `gave_up` с причиной `timed_out`;
 3. создаёт или повторно находит одну high-priority карточку координатора;
 4. использует стабильный idempotency key, поэтому повторный запуск не создаёт дубликат;
-5. при `--dispatch` запускает готовую recovery-карточку через штатный Hermes dispatcher.
+5. читает завершённые recovery-карточки со структурированным планом;
+6. проверяет replacement-граф, снимает только заявленные stale edges, архивирует и удаляет superseded-карточки, затем перечитывает граф;
+7. при `--dispatch` запускает готовую recovery-карточку или освобождённую downstream-работу через штатный Hermes dispatcher.
 
-Координатор должен изучить журнал и незавершённый diff, декомпозировать только оставшийся объём, создать последовательные пары implementation/review, перенести зависимости и проверить граф. Исходная implementation-карточка и устаревшая review-карточка удаляются только после проверки замены.
+Координатор должен изучить журнал и незавершённый diff, декомпозировать только оставшийся объём, создать последовательные пары implementation/review, добавить replacement edges и завершить recovery-карточку с точными `replacement_task_ids`, `rewires`, `superseded_task_ids` и пустым `limitations`. Он не вызывает `unlink`, `archive` или `purge`: эти команды запрещены delegated child context и выполняются доверенным no-agent reconciler после полной проверки плана.
 
 Ручные продуктовые блокировки, acceptance-карточки и карточки самого reconciler команда не декомпозирует.
+
+### Что reconciler проверяет перед первой разрушительной операцией
+
+Каждый запуск заново читает авторитетные `show --json` и `list --archived --json` записи и отклоняет план, если:
+
+- replacement-задача создана не координаторским профилем, не имеет ровно одного события `created` с `creator_task_id` этой recovery-карточки или отсутствует в её завершающем манифесте `verified_cards`;
+- replacement-задача уже архивна;
+- цепочка implementation/review, дочерние задачи финального review или набор объявленных `rewires` не совпадают точно;
+- метаданные плана и `verified_cards` относятся к разным запускам: метаданные берутся из последнего успешного run, а `verified_cards` — из единственного события `completed` с тем же `run_id`;
+- уже снятая внешняя связь не подтверждена собственным событием Hermes `unlinked` для этого ребра со временем не раньше завершения recovery — независимо от того, существует ли старый родитель ещё;
+- отсутствующий в доске superseded id не отключает проверку связности: каждый оставшийся superseded-узел обязан через свои живые parent-связи восходить к recovery-target, иначе план отклоняется до первой мутации.
+- сама recovery-карточка или живой recovery-target не имеют ровно одного события `created` с пустым `creator_task_id`, то есть были созданы внутри worker-сессии;
+- живой recovery-target не несёт собственного события Hermes `gave_up` с `trigger_outcome: timed_out`: право на разрушение заново выводится из таймаута, а не из тела карточки;
+- recovery-target отсутствует в доске, а какие-то superseded-карточки ещё живы: без живой цели precondition перепроверить нельзя, поэтому план отклоняется.
+
+`created_by` сам по себе не является границей доверия: `hermes kanban create --created-by` — свободный флаг CLI. Доверие даёт связка авторитетного `created`-события (`creator_task_id` заполняется Hermes только для dispatcher-owned worker context) с id этой recovery-карточки и её манифестом `verified_cards`, а не имя профиля в поле. По той же причине recovery-карточка и её цель проверяются на авторство: карточка, созданная внутри worker-сессии, не может запускать разрушение, а цель обязана быть Factory-карточкой с записью таймаута.
+
+Та же проверка авторства применяется ко всем superseded-карточкам: разрушаемый набор не может выбираться по свободному полю `created_by`. Rewire-дети проверяются как живые зависимости (связность, идентичность, подтверждение `unlinked`), но не как авторство: они перелинковываются, а не уничтожаются.
+
+**Границы этой гарантии.** Пустой `creator_task_id` доказывает, что в создавшем процессе не был выставлен `HERMES_KANBAN_TASK`; Hermes заполняет его только для dispatcher-owned worker context, а сама изоляция worker-сессий кооперативная (маркер `HERMES_DELEGATED_CHILD_CONTEXT`, и документация Hermes прямо называет её не средством удержания кода с прямым доступом к SQLite). Worker, который сам снимает эти переменные, и любой процесс с прямым доступом к базе доски — вне модели угроз. Для более сильной гарантии нужен отдельный Factory-артефакт, привязанный к recovery-карточке, а не к окружению создателя.
+
+Проверка тел карточек структурно тотальна: пустая обязательная секция сгенерированного тела (`# Project`, `# Mission`, `# Slice`, `# Acceptance`, `# Proof required`, `# Scope boundaries`, `# Handoff`) отклоняется как доменная ошибка, поэтому тело, написанное worker'ом, не может вызвать `IndexError`. Дополнительно каждый отказ изолирован на уровне карточки: проход ловит любое исключение при разборе одной recovery-карточки, продолжает остальные и сообщает обо всех отказах.
+
+Остаточное ограничение: связь, видимую только со стороны ребёнка (ребёнок перечисляет родителя, а список `children` родителя его не содержит), reconciler видит лишь у уже прочитанных карточек — `show --json` родителя остаётся единственной поверхностью со списком детей. Hermes выводит оба направления из одной строки `task_links`, поэтому такая связь означает повреждение таблицы связей, а не действие worker'а; это ограничение принято осознанно.
+
+Комментарии `recovery-validated` и `recovery-finalized` — только аудит. Любой профиль может опубликовать комментарий с любым автором, поэтому ни один запуск не пропускает проверку и не выполняет разрушительные операции по комментарию. Повторный запуск перепроверяет живой граф перед каждой фазой (`unlink`, `archive`, `archive --rm`) и завершается без изменений, если всё уже применено.
+
+Hermes удаляет вместе с задачей её строки связей, поэтому superseded-карточки удаляются от потомков к предкам: падение между двумя удалениями оставляет выжившую цепочку проверяемой, и следующий проход завершает работу. Если цель отсутствует, а superseded-карточки ещё живы, порядок вывести не из чего, и проход отказывается удалять что-либо.
+
+Отклонённый план одной recovery-карточки не блокирует остальные: проход финализирует независимые карточки, затем выполняет фазу dispatch для уже освобождённой работы и только после этого завершается ненулевым кодом со списком отклонённых. Отказ разбора не должен удерживать готовую работу.
+
+Каждый класс остановки в `stall_taxonomy` называет существующий тест в поле `regression_test`; тест `test_every_stall_class_names_an_existing_regression_test` проверяет это машинно, поэтому новый класс без реального regression-теста не проходит CI.
 
 ### Автоматический watchdog через Hermes cron
 
@@ -456,7 +498,7 @@ completed = subprocess.run(command, text=True, capture_output=True, check=False)
 if completed.returncode:
     raise SystemExit(completed.stderr or completed.stdout or completed.returncode)
 payload = json.loads(completed.stdout)
-if payload["recovery_task_ids"] or payload["dispatched"]:
+if payload["recovery_task_ids"] or payload["finalized_recovery_task_ids"] or payload["dispatched"]:
     print(json.dumps(payload, ensure_ascii=False))
 ```
 
@@ -478,7 +520,18 @@ hermes cron list
 hermes cron run <job-id>
 ```
 
-Cron только обнаруживает событие и создаёт recovery-карточку. Декомпозицию выполняет обычная координаторская Hermes-сессия с лимитом из `rig.yaml`.
+Cron обнаруживает timeout, создаёт recovery-карточку и применяет завершённые планы. Декомпозицию выполняет обычная координаторская Hermes-сессия с лимитом из `rig.yaml`; привилегированную очистку графа выполняет только no-agent reconciler.
+
+### Типизация остановок
+
+Покажите реестр в текстовом или JSON-виде:
+
+```powershell
+uv run hermes-factory stall-taxonomy
+uv run hermes-factory stall-taxonomy --json
+```
+
+Основные `reason_code`: `normal_dependency_wait`, `awaiting_dispatch`, `stale_runner`, `worker_timeout`, `stale_dependency_edge`, `review_rejected`, `human_gate`, `corrupt_state`, `recovery_coordinator_insufficient_kanban_authority`, `unknown_operational_stall`. Для каждого класса фиксируются detection, cause, recovery, authority, verification, fallback и regression test. Новая остановка не закрывается единичным ручным ремонтом: сначала добавляется воспроизводимый тест, затем detector и безопасная процедура восстановления.
 
 ### Implementation
 
@@ -517,9 +570,9 @@ Reviewer должен независимо:
 
 Review без summary считается ошибкой proof-аудита.
 
-### Human acceptance
+### Acceptance authority
 
-Финальная acceptance-карточка остаётся заблокированной до решения человека.
+При `decision_authority: coordinator` финальная acceptance-карточка назначается координатору. Он фиксирует решение и завершает миссию без ожидания человека. При `decision_authority: human` карточка остаётся заблокированной до решения оператора.
 
 Посмотрите карточку:
 
@@ -527,7 +580,7 @@ Review без summary считается ошибкой proof-аудита.
 hermes kanban --board hermes-factory show <acceptance-task-id>
 ```
 
-Если результат принят:
+Для human-gate, если результат принят:
 
 ```powershell
 hermes kanban --board hermes-factory complete <acceptance-task-id> `

@@ -6,6 +6,7 @@ from hermes_factory.mission_loader import topological_slices
 from hermes_factory.models import MissionSpec, RigSpec
 from hermes_factory.task_templates import (
     render_acceptance_body,
+    render_commit_body,
     render_implementation_body,
     render_review_body,
 )
@@ -35,9 +36,15 @@ def compile_mission(rig: RigSpec, mission: MissionSpec) -> MissionPlan:
     review_seat = rig.seats[workflow.review_seat]
     acceptance_seat = rig.seats[workflow.acceptance_seat]
 
-    review_keys: list[str] = []
+    terminal_keys: list[str] = []
     tasks: list[PlannedTask] = []
     ordered_slices = topological_slices(mission)
+    commit_reviewed_slices = rig.policies.git_commit_policy == "reviewed-slices"
+
+    def terminal_key(slice_id: str) -> str:
+        suffix = "commit" if commit_reviewed_slices else "review"
+        return f"{slice_id}:{suffix}"
+
     dependent_slices = {
         slice_spec.id: tuple(
             candidate.id
@@ -51,11 +58,7 @@ def compile_mission(rig: RigSpec, mission: MissionSpec) -> MissionPlan:
         implementation_key = f"{slice_spec.id}:implementation"
         review_key = f"{slice_spec.id}:review"
         implementation_parents = tuple(
-            key
-            for key in (
-                f"{dependency}:review"
-                for dependency in slice_spec.depends_on
-            )
+            terminal_key(dependency) for dependency in slice_spec.depends_on
         )
         tasks.append(
             PlannedTask(
@@ -72,7 +75,12 @@ def compile_mission(rig: RigSpec, mission: MissionSpec) -> MissionPlan:
             )
         )
         next_slices = dependent_slices[slice_spec.id]
-        if next_slices:
+        if commit_reviewed_slices:
+            handoff_target = (
+                f"local commit task for slice {slice_spec.id!r} "
+                f"(profile {acceptance_seat.profile!r})"
+            )
+        elif next_slices:
             handoff_target = ", ".join(
                 f"implementation task for slice {next_slice!r} "
                 f"(profile {implementation_seat.profile!r})"
@@ -99,16 +107,35 @@ def compile_mission(rig: RigSpec, mission: MissionSpec) -> MissionPlan:
                 ),
             )
         )
-        review_keys.append(review_key)
+        if commit_reviewed_slices:
+            commit_key = f"{slice_spec.id}:commit"
+            tasks.append(
+                PlannedTask(
+                    key=commit_key,
+                    title=f"Commit {slice_spec.title}",
+                    body=render_commit_body(rig, mission, slice_spec),
+                    profile=acceptance_seat.profile,
+                    parents=(review_key,),
+                    skills=acceptance_seat.skills,
+                    initial_status=None,
+                    idempotency_key=(
+                        f"factory:{rig.project.slug}:{mission.id}:{slice_spec.id}:commit"
+                    ),
+                )
+            )
+        terminal_keys.append(terminal_key(slice_spec.id))
 
-    blocked = mission.human_acceptance
+    blocked = (
+        mission.human_acceptance
+        and rig.policies.decision_authority == "human"
+    )
     tasks.append(
         PlannedTask(
             key="acceptance",
             title=f"Accept {mission.title}",
             body=render_acceptance_body(rig, mission),
             profile=None if blocked else acceptance_seat.profile,
-            parents=tuple(review_keys),
+            parents=tuple(terminal_keys),
             skills=acceptance_seat.skills,
             initial_status="blocked" if blocked else None,
             idempotency_key=f"factory:{rig.project.slug}:{mission.id}:acceptance",

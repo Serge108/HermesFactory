@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -710,6 +711,69 @@ def test_status_fetches_runs_only_for_done_or_review_tasks(
     assert [call[4] for call in attachment_calls] == ["t-1", "t-2"]
 
 
+def test_status_accepts_commit_only_when_git_confirms_project_commit(
+    valid_rig: Path, capsys
+):
+    project = valid_rig.parent / "project"
+    subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "factory@example.invalid"],
+        cwd=project,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Factory Test"], cwd=project, check=True
+    )
+    tracked = project / "tracked.txt"
+    tracked.write_text("verified\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=project, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "verified"], cwd=project, check=True)
+    commit_id = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    task = {
+        "id": "t-commit",
+        "title": "Commit demo",
+        "status": "done",
+        "result": "committed",
+        "created_by": "hermes-factory",
+        "body": (
+            "<!-- hermes-factory:audit-contract -->\n"
+            'Factory audit contract: {"task_class":"commit",'
+            '"required_commands":[],"required_artifacts":[],'
+            '"changed_files_required":false,'
+            '"required_metadata":["commit","decision_log","limitations"]}\n'
+            "<!-- /hermes-factory:audit-contract -->"
+        ),
+        "metadata": {},
+    }
+    run = {
+        "status": "done",
+        "outcome": "completed",
+        "summary": "commit verified",
+        "metadata": {"commit": commit_id, "decision_log": [], "limitations": []},
+    }
+    client = StatusHermesClient(
+        {"builder", "reviewer"},
+        {"by_status": {"done": 1}},
+        [task],
+        [],
+        {"t-commit": [run]},
+    )
+
+    result = main(
+        ["status", "--rig", str(valid_rig), "--json"],
+        client_factory=lambda executable: client,
+    )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out)["findings"] == []
+
+
 _REPORT_TASKS = [
     {
         "id": "t-1",
@@ -903,6 +967,23 @@ def test_custom_dashboard_command_is_not_part_of_factory_cli():
         )
 
 
+def test_stall_taxonomy_json_exposes_stable_reason_codes(capsys):
+    result = main(["stall-taxonomy", "--json"])
+
+    assert result == 0
+    payload = json.loads(capsys.readouterr().out)
+    classes = {item["reason_code"]: item for item in payload["stall_classes"]}
+    assert "normal_dependency_wait" in classes
+    assert "awaiting_dispatch" in classes
+    assert "stale_runner" in classes
+    assert "stale_dependency_edge" in classes
+    assert "human_gate" in classes
+    assert "corrupt_state" in classes
+    assert classes[
+        "recovery_coordinator_insufficient_kanban_authority"
+    ]["recovery_owner"] == "factory"
+
+
 def test_report_fetches_runs_for_all_tasks(valid_rig: Path, capsys):
     runs = dict(_REPORT_RUNS)
     runs["t-2"] = [{"status": "failed", "outcome": "crashed"}]
@@ -922,11 +1003,40 @@ def test_report_fetches_runs_for_all_tasks(valid_rig: Path, capsys):
 
 
 def test_reconcile_json_reports_created_recovery_task(valid_rig: Path, capsys):
+    workspace_path = (valid_rig.parent / "project").as_posix()
     blocked = {
         "id": "task-1",
         "title": "Implement large behavior",
+        "body": (
+            "# Project\n"
+            f"Demo (slug: demo)\nWorking directory: {workspace_path}\n\n"
+            "# Mission\nDemo mission.\n\n"
+            "# Slice\nSlice id: implement\nImplement large behavior.\n\n"
+            "# Acceptance\n- behavior works\n\n"
+            "# Proof required\nCommands that must be recorded:\n- uv run pytest\n\n"
+            "# Scope boundaries\n"
+            "Project demo; mission demo-mission; workflow delivery.\n"
+            "Assigned seat: builder; role: implementation.\n"
+            "Failure limit: 2 consecutive non-successful runs; bounded runtime per task: 30m.\n"
+            "Completion contract: local-only.\n"
+            "<!-- hermes-factory:audit-contract -->\n"
+            'Factory audit contract: {"task_class":"implementation",'
+            '"required_commands":[],"required_artifacts":[],'
+            '"changed_files_required":false,'
+            '"required_metadata":["changed_files","commands","limitations"]}\n'
+            "<!-- /hermes-factory:audit-contract -->\n\n"
+            "# Handoff\nNext target: review."
+        ),
         "status": "blocked",
+        "assignee": "builder",
         "created_by": "hermes-factory",
+        "idempotency_key": "factory:demo:demo-mission:implement:implementation",
+        "workspace_kind": "dir",
+        "workspace_path": workspace_path,
+        "max_retries": 2,
+        "max_runtime_seconds": 1800,
+        "completion_contract": "local-only",
+        "skills": [],
         "last_failure_error": "elapsed 11s > limit 10s",
     }
     responses = [
@@ -952,6 +1062,7 @@ def test_reconcile_json_reports_created_recovery_task(valid_rig: Path, capsys):
             "status": "ready",
             "title": "Decompose blocked task task-1",
         },
+        [],
     ]
 
     class ReconcileClient:
@@ -971,5 +1082,6 @@ def test_reconcile_json_reports_created_recovery_task(valid_rig: Path, capsys):
         "scanned": 1,
         "eligible": 1,
         "recovery_task_ids": {"task-1": "recovery-1"},
+        "finalized_recovery_task_ids": [],
         "dispatched": 0,
     }

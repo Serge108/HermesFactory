@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import re
+import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from hermes_factory.task_templates import (
@@ -11,6 +14,26 @@ from hermes_factory.task_templates import (
 )
 
 _SEVERITY_RANK = {"critical": 0, "error": 1, "warning": 2}
+_GIT_OBJECT_ID = re.compile(r"^[0-9a-f]{40,64}$")
+CommitVerifier = Callable[[str], bool]
+
+
+def verify_git_commit(project_dir: Path, object_id: str) -> bool:
+    if not _GIT_OBJECT_ID.fullmatch(object_id):
+        return False
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(project_dir), "rev-parse", "--verify", f"{object_id}^{{commit}}"],
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=10,
+            shell=False,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0 and completed.stdout.strip() == object_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +121,39 @@ def _is_string_list(value: object) -> bool:
     )
 
 
+def _is_rewire_list(value: object) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(item, dict)
+        and set(item) == {"old_parent", "new_parent", "child"}
+        and all(isinstance(item[key], str) and bool(item[key]) for key in item)
+        for item in value
+    )
+
+
+def _valid_required_metadata_field(
+    field: str, value: object, commit_verifier: CommitVerifier | None
+) -> bool:
+    if field == "commands":
+        return _is_command_record_list(value)
+    if field in {
+        "changed_files",
+        "decision_log",
+        "limitations",
+        "replacement_task_ids",
+        "superseded_task_ids",
+    }:
+        return _is_string_list(value)
+    if field == "commit":
+        return (
+            isinstance(value, str)
+            and commit_verifier is not None
+            and commit_verifier(value)
+        )
+    if field == "rewires":
+        return _is_rewire_list(value)
+    return False
+
+
 def _valid_attachment_record(attachment: object) -> bool:
     if not isinstance(attachment, dict):
         return False
@@ -183,6 +239,7 @@ def _task_findings(
     task: dict[str, Any],
     runs: list[dict[str, Any]],
     attachments: list[dict[str, Any]],
+    commit_verifier: CommitVerifier | None,
 ) -> list[HealthFinding]:
     if task.get("status") != "done":
         return []
@@ -279,13 +336,8 @@ def _task_findings(
         invalid_metadata = [
             field
             for field in required_metadata
-            if (
-                field == "commands"
-                and not _is_command_record_list(evidence.get(field))
-            )
-            or (
-                field in {"changed_files", "limitations"}
-                and not _is_string_list(evidence.get(field))
+            if not _valid_required_metadata_field(
+                field, evidence.get(field), commit_verifier
             )
         ]
         if invalid_metadata:
@@ -427,6 +479,7 @@ def audit_tasks(
     runs_by_task: dict[str, list[dict[str, Any]]],
     diagnostics: list[dict[str, Any]],
     attachments_by_task: dict[str, list[dict[str, Any]]] | None = None,
+    commit_verifier: CommitVerifier | None = None,
 ) -> tuple[HealthFinding, ...]:
     findings: list[HealthFinding] = []
     attachments_by_task = attachments_by_task or {}
@@ -439,6 +492,7 @@ def audit_tasks(
                 task,
                 runs_by_task.get(task_id, []),
                 attachments_by_task.get(task_id, []),
+                commit_verifier,
             )
         )
     findings.extend(_diagnostic_findings(diagnostics))

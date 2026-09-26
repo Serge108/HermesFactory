@@ -32,7 +32,7 @@ Maps each stable seat and declared role to an existing Hermes profile. A Kanban-
 
 ### Mission compiler
 
-Compiles project, mission, and slice intent into an idempotent Kanban task graph. Workflow groups and dependency edges define the topology. Each task receives its full intent chain, acceptance criteria, proof contract, scope boundaries, and handoff target.
+Compiles project, mission, and slice intent into an idempotent Kanban task graph. Workflow groups and dependency edges define the topology. Each task receives its full intent chain, acceptance criteria, proof contract, scope boundaries, and handoff target. With `git_commit_policy: reviewed-slices`, every independent review releases a coordinator-owned local commit task; downstream slices depend on that commit rather than directly on the review.
 
 ### Kanban adapter
 
@@ -40,7 +40,7 @@ Uses supported Hermes Kanban CLI commands to create or reuse one board per rig a
 
 ### Handoff service
 
-Uses Kanban completion summaries, structured metadata, run summaries, and attachments to transfer completed work, verified evidence, failed attempts, unresolved decisions, and the recommended next action. Handoffs travel along dependency edges only: an implementation task completes with evidence to release its pre-created reviewer child; the reviewer reads the parent result and evidence, then completes the review or blocks it with actionable findings; a dependent slice receives parent summaries; a blocked human acceptance task is resolved by the operator, never by another agent.
+Uses Kanban completion summaries, structured metadata, run summaries, and attachments to transfer completed work, verified evidence, failed attempts, unresolved decisions, and the recommended next action. Handoffs travel along dependency edges only: an implementation task releases its pre-created reviewer child; the reviewer completes or blocks; an optional local commit task records the reviewed slice; then dependent work or acceptance starts. `decision_authority: human` preserves a real operator gate. `decision_authority: coordinator` explicitly delegates in-scope decisions and acceptance to the coordinator without authorizing push or irreversible external writes.
 
 Results publish this completion metadata contract:
 
@@ -56,7 +56,7 @@ Required artifacts are persisted as Hermes Kanban attachments, not trusted from 
 
 ### Safety boundaries
 
-Hermes Factory compiles and audits work. It never keeps idle interactive agents alive and never supervises worker processes: real execution and process lifetime belong to the Hermes gateway dispatcher. The factory owns declarative state only. Operators trigger execution explicitly with `hermes kanban dispatch`; `status` reports health without starting any task. Human acceptance decisions are not delegated to agents.
+Hermes Factory compiles and audits work. It never keeps idle interactive agents alive and never supervises worker processes: real execution and process lifetime belong to the Hermes gateway dispatcher. The factory owns declarative policy and deterministic recovery reactions. Decision authority is explicit in the rig. Coordinator authority covers only accepted mission scope; it does not authorize push, secret publication, history rewriting, or irreversible external actions.
 
 ### Health monitor
 
@@ -66,9 +66,13 @@ Combines Hermes Kanban diagnostics with deterministic audits for missing proof a
 
 `hermes-factory reconcile` is a short, deterministic policy reaction over authoritative Kanban state. It lists blocked cards, considers only cards created by `hermes-factory`, reads each card's event history, and reacts only to a terminal `gave_up` event whose trigger is `timed_out`. Manual/product blocks and reconciler-created cards are ignored.
 
-For each eligible timeout, Factory creates or reuses one high-priority coordinator card. Its idempotency key includes the project, blocked task id, and `gave_up` event timestamp, so repeated cron ticks do not create duplicates. The recovery card has no dependency on the blocked task, because that edge would prevent it from running. It instructs the coordinator to inspect the task log and live diff, preserve valid partial work, create smaller sequential TDD implementation/review pairs, reconnect downstream dependencies, verify the replacement graph, and only then delete superseded cards.
+For each eligible timeout, Factory creates or reuses one high-priority coordinator card. Its idempotency key includes the project, blocked task id, and `gave_up` event timestamp, so repeated cron ticks do not create duplicates. The recovery card has no dependency on the blocked task. It instructs the coordinator to inspect the log and live diff, preserve valid partial work, create smaller sequential TDD implementation/review pairs, reconnect downstream dependencies, verify the replacement graph, and complete with exact `replacement_task_ids`, `rewires`, `superseded_task_ids`, and `limitations` metadata.
 
-The optional `--dispatch` flag calls the native Kanban dispatcher after confirming that a recovery card is `ready`. Factory still does not own claims, worker processes, retries, heartbeats, or run history. A durable Hermes no-agent cron job invokes the short reconciliation command; the long-running decomposition remains an ordinary Kanban-dispatched coordinator session.
+Delegated workers are intentionally fenced from `unlink`, archive, purge, comment, and dispatch. A completed recovery plan is therefore finalized by the trusted no-agent reconciler: it validates the original target and replacement boundary, verifies replacement edges before mutation, unlinks only declared stale edges, reads each child back, archives and purges superseded cards, and records a finalization marker. Repeated passes are idempotent. The optional `--dispatch` flag then asks the native dispatcher to start recovery or newly released work. Factory still does not own claims, worker processes, retries, heartbeats, or run history.
+
+### Stall taxonomy
+
+`hermes-factory stall-taxonomy --json` exposes the stable operational contract. Every class records `reason_code`, detection, cause, recovery owner, recovery, authority, verification, fallback, regression test, and whether recovery is automatic. New operational incidents are not accepted as one-off fixes: they must add or refine a class, detector, recovery procedure, and regression test.
 
 ### Operator views
 

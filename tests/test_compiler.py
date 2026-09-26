@@ -146,3 +146,40 @@ def test_no_human_acceptance_yields_unblocked_acceptance_task(
 
     assert acceptance.initial_status is None
     assert acceptance.profile == "builder"
+
+
+def test_coordinator_authority_adds_reviewed_commit_gate_and_removes_human_stop(
+    valid_rig: Path, tmp_path: Path
+):
+    valid_rig.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "completion_contract: local-only}",
+            "completion_contract: local-only, decision_authority: coordinator, "
+            "git_commit_policy: reviewed-slices}",
+        ),
+        encoding="utf-8",
+    )
+    rig = load_rig(valid_rig)
+    path = tmp_path / "mission.yaml"
+    path.write_text(_TWO_SLICES, encoding="utf-8")
+
+    plan = compile_mission(rig, load_mission(path, rig))
+    keys = {task.key: task for task in plan.tasks}
+
+    assert [task.key for task in plan.tasks] == [
+        "implement:implementation",
+        "implement:review",
+        "implement:commit",
+        "polish:implementation",
+        "polish:review",
+        "polish:commit",
+        "acceptance",
+    ]
+    assert keys["implement:commit"].parents == ("implement:review",)
+    assert keys["polish:implementation"].parents == ("implement:commit",)
+    assert keys["acceptance"].parents == ("implement:commit", "polish:commit")
+    assert keys["acceptance"].profile == "builder"
+    assert keys["acceptance"].initial_status is None
+    assert "local git commit" in keys["implement:commit"].body.lower()
+    assert "never push" in keys["implement:commit"].body.lower()
+    assert "without waiting for the operator" in keys["acceptance"].body.lower()

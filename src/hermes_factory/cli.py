@@ -11,13 +11,14 @@ from hermes_factory import __version__
 from hermes_factory.board import apply_mission, ensure_board
 from hermes_factory.compiler import compile_mission
 from hermes_factory.errors import FactoryError
-from hermes_factory.health import audit_tasks, build_proof_map
+from hermes_factory.health import audit_tasks, build_proof_map, verify_git_commit
 from hermes_factory.hermes_cli import HermesClient
 from hermes_factory.metrics import compute_metrics
 from hermes_factory.mission_loader import load_mission
 from hermes_factory.models import RigSpec
 from hermes_factory.reconcile import reconcile_board
 from hermes_factory.rig_loader import load_rig
+from hermes_factory.stall_taxonomy import stall_taxonomy
 
 ClientFactory = Callable[[str], HermesClient]
 
@@ -65,6 +66,9 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--dispatch", action="store_true")
     reconcile.add_argument("--hermes", default="hermes")
     reconcile.set_defaults(handler_key="reconcile")
+    taxonomy = subparsers.add_parser("stall-taxonomy")
+    taxonomy.add_argument("--json", action="store_true")
+    taxonomy.set_defaults(handler_key="stall-taxonomy")
     return parser
 
 
@@ -188,7 +192,13 @@ def handle_status(args: argparse.Namespace, client_factory: ClientFactory) -> in
             )
 
     findings = audit_tasks(
-        tasks, runs_by_task, diagnostics, attachments_by_task=attachments_by_task
+        tasks,
+        runs_by_task,
+        diagnostics,
+        attachments_by_task=attachments_by_task,
+        commit_verifier=lambda object_id: verify_git_commit(
+            rig.project.cwd, object_id
+        ),
     )
     counts = {
         "critical": sum(1 for finding in findings if finding.severity == "critical"),
@@ -240,6 +250,9 @@ def handle_report(args: argparse.Namespace, client_factory: ClientFactory) -> in
         runs_by_task,
         diagnostics,
         attachments_by_task=attachments_by_task,
+        commit_verifier=lambda object_id: verify_git_commit(
+            rig.project.cwd, object_id
+        ),
     )
     proof_by_task = build_proof_map(tasks, runs_by_task, findings)
     metrics = compute_metrics(
@@ -292,6 +305,7 @@ def handle_reconcile(args: argparse.Namespace, client_factory: ClientFactory) ->
         "scanned": result.scanned,
         "eligible": result.eligible,
         "recovery_task_ids": result.recovery_task_ids,
+        "finalized_recovery_task_ids": result.finalized_recovery_task_ids,
         "dispatched": result.dispatched,
     }
     if args.json:
@@ -300,10 +314,31 @@ def handle_reconcile(args: argparse.Namespace, client_factory: ClientFactory) ->
         print(
             f"scanned {result.scanned} blocked tasks; "
             f"created or reused {len(result.recovery_task_ids)} recovery tasks; "
+            f"finalized {len(result.finalized_recovery_task_ids)} recovery plans; "
             f"dispatched {result.dispatched}"
         )
         for task_id, recovery_id in result.recovery_task_ids.items():
             print(f"{task_id} -> {recovery_id}")
+    return 0
+
+
+def handle_stall_taxonomy(
+    args: argparse.Namespace, client_factory: ClientFactory
+) -> int:
+    classes = []
+    for item in stall_taxonomy():
+        payload = asdict(item)
+        payload["reason_code"] = payload.pop("code")
+        classes.append(payload)
+    if args.json:
+        print(json.dumps({"stall_classes": classes}, indent=2))
+    else:
+        for item in classes:
+            automatic = "automatic" if item["automatic"] else "manual"
+            print(
+                f"{item['reason_code']}: {automatic}; owner={item['recovery_owner']}; "
+                f"detection={item['detection']}"
+            )
     return 0
 
 
@@ -316,6 +351,7 @@ HANDLERS: dict[str, Callable[[argparse.Namespace, ClientFactory], int]] = {
     "status": handle_status,
     "report": handle_report,
     "reconcile": handle_reconcile,
+    "stall-taxonomy": handle_stall_taxonomy,
 }
 
 

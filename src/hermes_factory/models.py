@@ -40,6 +40,8 @@ class PolicySpec:
     max_retries: int
     max_runtime: str
     completion_contract: str
+    decision_authority: str
+    git_commit_policy: str
 
 
 @dataclass(frozen=True, slots=True)

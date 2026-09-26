@@ -30,3 +30,5 @@ policies:
   max_retries: 2
   max_runtime: 30m
   completion_contract: local-only
+  decision_authority: coordinator
+  git_commit_policy: reviewed-slices

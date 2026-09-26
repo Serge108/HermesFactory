@@ -44,7 +44,10 @@ _POLICY_KEYS = {
     "max_retries",
     "max_runtime",
     "completion_contract",
+    "decision_authority",
+    "git_commit_policy",
 }
+_POLICY_REQUIRED_KEYS = _POLICY_KEYS - {"decision_authority", "git_commit_policy"}
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -285,7 +288,9 @@ def load_rig(path: Path) -> RigSpec:
     workflows = _load_workflows(data["workflows"], seats)
 
     policies = _mapping(data["policies"], "policies")
-    _validate_keys(policies, _POLICY_KEYS, "policies")
+    _validate_keys(
+        policies, _POLICY_KEYS, "policies", required=_POLICY_REQUIRED_KEYS
+    )
 
     return RigSpec(
         version=version,
@@ -312,6 +317,16 @@ def load_rig(path: Path) -> RigSpec:
             max_runtime=parse_duration(policies["max_runtime"]),
             completion_contract=_string(
                 policies["completion_contract"], "policies.completion_contract"
+            ),
+            decision_authority=_choice(
+                policies.get("decision_authority", "human"),
+                "policies.decision_authority",
+                {"coordinator", "human"},
+            ),
+            git_commit_policy=_choice(
+                policies.get("git_commit_policy", "off"),
+                "policies.git_commit_policy",
+                {"off", "reviewed-slices"},
             ),
         ),
     )

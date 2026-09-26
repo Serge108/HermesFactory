@@ -16,7 +16,7 @@ The project adapts the useful operating ideas from OpenRig without introducing a
 | Handoff | Kanban summaries, metadata, reviews, and attachments |
 | Refocus | Complete project, mission, and slice intent in task context |
 | Health | Kanban diagnostics plus deterministic proof audits |
-| Recovery watchdog | Idempotent reconciliation of timed-out Factory tasks into coordinator work |
+| Recovery watchdog | Idempotent timeout recovery plus trusted graph finalization outside delegated-worker fences |
 
 ## MVP
 
@@ -42,13 +42,14 @@ uv run hermes-factory mission plan .hermes/missions/my-mission.yaml --rig .herme
 uv run hermes-factory mission apply .hermes/missions/my-mission.yaml --rig .hermes/rig.yaml --json
 uv run hermes-factory status --rig .hermes/rig.yaml
 uv run hermes-factory report --rig .hermes/rig.yaml
+uv run hermes-factory stall-taxonomy --json
 uv run hermes-factory reconcile --rig .hermes/rig.yaml --dispatch --json
 hermes kanban --board <board-slug> dispatch --dry-run --json
 hermes kanban --board <board-slug> watch
 hermes dashboard --no-open
 ```
 
-`hermes-factory` compiles, reconciles, and audits work; it does not keep idle interactive agents alive. Real execution is owned by the Hermes gateway dispatcher, which spawns and supervises Kanban task sessions. `reconcile` scans blocked Factory tasks for an authoritative `gave_up` event triggered by `timed_out`, then creates or reuses a high-priority coordinator recovery card with a stable idempotency key. `--dispatch` asks the native Kanban dispatcher to start ready recovery cards; it does not spawn workers itself. Run the command from a durable Hermes no-agent cron job for automatic recovery. `status` exits non-zero when it finds critical or error findings, while `report` is a read-only metrics projection. Factory does not ship a second web dashboard. Use the native Hermes Kanban dashboard and its live task-event stream to observe task links, worker activity, comments, and handoffs; use `hermes kanban watch` for the same orchestration activity in a terminal.
+`hermes-factory` compiles, reconciles, and audits work; it does not keep idle interactive agents alive. Real execution is owned by the Hermes gateway dispatcher, which spawns and supervises Kanban task sessions. `reconcile` scans blocked Factory tasks for an authoritative timeout `gave_up` event, creates or reuses a high-priority coordinator recovery card, then consumes completed structured recovery plans. Privileged `unlink`, archive, purge, verification, and follow-up dispatch run in the trusted no-agent reconciler rather than inside the delegated coordinator context. Run the command from a durable Hermes no-agent cron job for automatic recovery. `stall-taxonomy` exposes stable reason codes and their detection, authority, recovery, verification, fallback, and regression-test contracts. `status` exits non-zero when it finds critical or error findings, while `report` is a read-only metrics projection.
 
 ## Handoff rules
 
@@ -60,8 +61,9 @@ Implementation occupant
   → completion releases the pre-created reviewer child
   → reviewer independently reads the parent result and evidence
   → reviewer completes the review or blocks it with actionable findings
+  → optional commit task creates a verified local commit without push
   → dependent slice receives parent summaries
-  → blocked human acceptance task is resolved by the operator
+  → coordinator or operator completes acceptance according to rig authority
 ```
 
 Implementation and review results must publish structured completion metadata:
@@ -82,11 +84,12 @@ Required artifacts must be uploaded as Hermes Kanban attachments. Self-reported 
 - Hermes remains the only agent runtime and source of session truth.
 - Persistent identity belongs to a seat, not to one model context.
 - Repository artifacts and Hermes Kanban records are authoritative; agent chat is not.
-- Human decisions cannot be silently delegated to another agent.
+- Decision authority is explicit: `human` keeps a real operator gate; `coordinator` resolves in-scope ambiguity without waiting for a person.
+- Automatic Git policy is local-only. Factory never pushes; rollback remains an explicit `git revert` operation.
 
 Hermes Kanban owns queue persistence, worker dispatch, retries, claims, heartbeats, and task history. Hermes Factory must not duplicate those systems.
 
-The reconciler owns only policy reaction: timeout event detection and idempotent creation of a coordinator task. The coordinator inspects the failed card and repository, creates a smaller replacement graph, rewires dependencies, verifies it, and only then removes superseded implementation and review cards.
+The coordinator inspects a failed card and repository, creates a smaller replacement graph, and returns an exact recovery plan. The reconciler validates that plan, removes only declared stale edges, verifies the resulting graph, archives and purges superseded cards, records an idempotent finalization marker, and asks native Hermes dispatch to continue released work. Delegated workers never receive unrestricted Kanban mutation authority.
 
 ## Status
 

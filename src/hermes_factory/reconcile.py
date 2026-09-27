@@ -1090,7 +1090,11 @@ def _recovery_run_cards(
     nothing about the cards that name it as their creator.
     """
     board = ["kanban", "--board", rig.board.slug]
-    detail = _task_show(client.run_json(board + ["show", recovery_task_id, "--json"]))
+    detail = _authoritative_task_identity(
+        client,
+        rig.board.slug,
+        _task_show(client.run_json(board + ["show", recovery_task_id, "--json"])),
+    )
     task = detail["task"]
     body = task.get("body")
     if (

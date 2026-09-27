@@ -5129,3 +5129,56 @@ def test_reconcile_supersedes_a_card_left_by_an_interrupted_run_of_its_creator(
     assert result.finalized_recovery_task_ids == ("recovery-1",)
     assert "old-impl" not in client.details
     assert "old-review" not in client.details
+
+
+class _KeyOmittedShowClient(RecoveryCreatedBoardClient):
+    """A board whose ``show --json`` omits ``idempotency_key`` for every card.
+
+    The installed Hermes CLI renders an explicit field tuple that leaves
+    ``idempotency_key`` out, while the value sits correctly in the board database, so
+    every read that feeds a provenance decision must hydrate it from there.
+    """
+
+    def __init__(
+        self, blocked: list[dict[str, object]], details: list[dict[str, object]]
+    ) -> None:
+        super().__init__(blocked, details)
+        self.task_record_calls: list[tuple[str, str]] = []
+
+    def run_json(self, args: list[str]) -> object:
+        payload = super().run_json(args)
+        if args[3:4] == ["show"] and isinstance(payload, dict):
+            task = payload.get("task")
+            if isinstance(task, dict):
+                stripped = dict(task)
+                stripped.pop("idempotency_key", None)
+                payload = {**payload, "task": stripped}
+        return payload
+
+    def task_record(self, board_slug: str, task_id: str) -> dict[str, object]:
+        self.task_record_calls.append((board_slug, task_id))
+        task = self.details[task_id]["task"]
+        return {
+            "id": task_id,
+            "idempotency_key": task.get("idempotency_key"),
+            "created_by": task.get("created_by"),
+        }
+
+
+def test_reconcile_classifies_blocked_recovery_created_card_without_creator_key_in_show(
+    valid_rig: Path,
+) -> None:
+    detail = _blocked_recovery_created_card(terminal="rejected", task_class="review")
+    detail["task"]["id"] = "new-review"
+    _, creator_detail = _creator_recovery(created_cards=["new-impl", "new-review"])
+    client = _KeyOmittedShowClient(
+        [{"id": "new-review", "created_by": "builder", "status": "blocked"}],
+        [detail, creator_detail],
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.scanned == 1
+    assert result.eligible == 1
+    assert result.recovery_task_ids == {"new-review": "recovery-2"}
+    assert ("demo-rig", "seed-recovery") in client.task_record_calls

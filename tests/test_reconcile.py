@@ -1584,7 +1584,9 @@ def test_reconcile_finalizes_completed_recovery_plan_outside_worker_fence(
         for call in client.json_calls
         if call[3:] == ["list", "--archived", "--json"]
     ]
-    assert len(archived_list_calls) == 4
+    # One terminality probe before the plan starts applying, plus one live re-read
+    # after each phase: the rewire, the archive, the purge, and the purge check.
+    assert len(archived_list_calls) == 5
     assert any(call[3] == "comment" and call[4] == "recovery-1" for call in client.run_calls)
 
 
@@ -2207,9 +2209,7 @@ def test_reconcile_retry_revalidates_boundary_instead_of_trusting_marker(
     assert client.run_calls == []
 
 
-def test_reconcile_retry_after_applied_purge_revalidates_surviving_tasks(
-    valid_rig: Path,
-):
+def test_reconcile_retry_after_a_full_application_is_terminal(valid_rig: Path):
     recovery, recovery_detail = _completed_recovery(
         replacements=["new-impl", "new-review"],
         rewires=[
@@ -2285,14 +2285,311 @@ def test_reconcile_retry_after_applied_purge_revalidates_surviving_tasks(
 
     result = reconcile_board(client, load_rig(valid_rig))
 
+    # Every declared mutation is already on the board: nothing is left to archive,
+    # purge, or rewire, so the plan is terminal and this pass reads the graph back
+    # only to prove that. It must not revalidate the declared snapshot and it must
+    # not touch the board beyond its own finalized marker.
     assert result.finalized_recovery_task_ids == ("recovery-1",)
+    assert [call[3] for call in client.run_calls] == ["comment"]
+    assert client.run_calls[0][4] == "recovery-1"
+    assert not any(
+        call[3:] == ["show", "new-impl", "--json"] for call in client.json_calls
+    )
     assert not any(call[3] in {"unlink", "archive"} for call in client.run_calls)
-    replacement_reads = [
-        call
-        for call in client.json_calls
-        if call[3:] == ["show", "new-impl", "--json"]
+
+
+def test_reconcile_retry_after_a_partial_purge_still_revalidates(valid_rig: Path):
+    recovery, recovery_detail = _completed_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[
+            {
+                "old_parent": "old-review",
+                "new_parent": "new-review",
+                "child": "downstream",
+            }
+        ],
+        superseded=["old-impl", "old-review"],
+    )
+    client = StatefulRecoveryClient(
+        recovery,
+        recovery_detail,
+        [
+            _factory_detail(
+                "new-impl",
+                "implementation",
+                "replacement-a",
+                "builder",
+                parents=["parent"],
+                children=["new-review"],
+                created_by="builder",
+                creator_task_id="recovery-1",
+            ),
+            _factory_detail(
+                "new-review",
+                "review",
+                "replacement-a",
+                "reviewer",
+                parents=["new-impl"],
+                children=["downstream"],
+                created_by="builder",
+                creator_task_id="recovery-1",
+            ),
+            _factory_detail(
+                "old-impl",
+                "implementation",
+                "original",
+                "builder",
+                parents=["parent"],
+                children=["old-review"],
+                gave_up=True,
+            ),
+            _factory_detail(
+                "old-review",
+                "review",
+                "original",
+                "reviewer",
+                parents=["old-impl"],
+                children=["downstream"],
+            ),
+            _downstream_detail(["old-review", "new-review"]),
+        ],
+        fail_after_first_purge=True,
+    )
+
+    with pytest.raises(HermesCommandError, match="simulated interruption"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert "old-review" not in client.details
+    assert "old-impl" in client.details
+    client.fail_after_first_purge = False
+    client.json_calls.clear()
+    client.run_calls.clear()
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    # One superseded card still had to be destroyed, so the destructive boundary stays
+    # fail-closed: the retry revalidates the live graph before it purges.
+    assert result.finalized_recovery_task_ids == ("recovery-1",)
+    assert "old-impl" not in client.details
+    assert [
+        call for call in client.json_calls if call[3:] == ["show", "new-impl", "--json"]
     ]
-    assert len(replacement_reads) == 4
+    assert [
+        "kanban", "--board", "demo-rig", "archive", "--rm", "old-impl"
+    ] in client.run_calls
+
+
+def test_reconcile_treats_a_fully_applied_plan_as_terminal_when_the_board_moved_on(
+    valid_rig: Path,
+):
+    """The live defect: every declared mutation is already applied, while the declared
+    replacement snapshot no longer matches a graph that legitimately gained children."""
+    recovery, recovery_detail = _completed_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[
+            {
+                "old_parent": "old-review",
+                "new_parent": "new-review",
+                "child": "downstream",
+            }
+        ],
+        superseded=["old-impl", "old-review"],
+    )
+    recovery_detail["comments"] = [
+        {
+            "body": "<!-- hermes-factory:recovery-finalized -->",
+            "author": "hermes-factory-reconciler",
+        }
+    ]
+    client = StatefulRecoveryClient(
+        recovery,
+        recovery_detail,
+        [
+            _factory_detail(
+                "new-impl",
+                "implementation",
+                "replacement-a",
+                "builder",
+                parents=["parent"],
+                children=["new-review", "moved-on-child"],
+                created_by="builder",
+                creator_task_id="recovery-1",
+            ),
+            _factory_detail(
+                "new-review",
+                "review",
+                "replacement-a",
+                "reviewer",
+                parents=["new-impl"],
+                children=["downstream"],
+                created_by="builder",
+                creator_task_id="recovery-1",
+            ),
+            _downstream_detail(
+                ["new-review"],
+                [
+                    {
+                        "kind": "unlinked",
+                        "created_at": 250,
+                        "payload": {"parent": "old-review", "child": "downstream"},
+                    }
+                ],
+            ),
+        ],
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ("recovery-1",)
+    # Nothing left to archive, purge, or rewire: the pass mutates nothing at all.
+    assert client.run_calls == []
+
+
+def test_reconcile_keeps_failing_when_a_superseded_card_still_exists(valid_rig: Path):
+    """A plan that still has a card to destroy keeps the fail-closed path, and the
+    recovery-finalized comment cannot make it terminal."""
+    recovery, recovery_detail = _completed_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[
+            {
+                "old_parent": "old-review",
+                "new_parent": "new-review",
+                "child": "downstream",
+            }
+        ],
+        superseded=["old-impl", "old-review"],
+    )
+    recovery_detail["comments"] = [
+        {
+            "body": "<!-- hermes-factory:recovery-finalized -->",
+            "author": "hermes-factory-reconciler",
+        }
+    ]
+    surviving = _factory_detail(
+        "old-impl",
+        "implementation",
+        "original",
+        "builder",
+        parents=["parent"],
+        gave_up=True,
+    )
+    surviving["task"]["status"] = "archived"
+    client = StatefulRecoveryClient(
+        recovery,
+        recovery_detail,
+        [
+            _factory_detail(
+                "new-impl",
+                "implementation",
+                "replacement-a",
+                "builder",
+                parents=["parent"],
+                children=["new-review", "moved-on-child"],
+                created_by="builder",
+                creator_task_id="recovery-1",
+            ),
+            _factory_detail(
+                "new-review",
+                "review",
+                "replacement-a",
+                "reviewer",
+                parents=["new-impl"],
+                children=["downstream"],
+                created_by="builder",
+                creator_task_id="recovery-1",
+            ),
+            surviving,
+            _downstream_detail(
+                ["new-review"],
+                [
+                    {
+                        "kind": "unlinked",
+                        "created_at": 250,
+                        "payload": {"parent": "old-review", "child": "downstream"},
+                    }
+                ],
+            ),
+        ],
+    )
+
+    with pytest.raises(
+        HermesCommandError, match="replacement implementation chain is invalid"
+    ):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert client.run_calls == []
+
+
+def test_reconcile_keeps_failing_when_a_declared_rewire_is_not_applied(
+    valid_rig: Path,
+):
+    """An edge that this plan had to move is still there, so the plan is not terminal
+    and the recovery-finalized comment cannot make it so."""
+    recovery, recovery_detail = _completed_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[
+            {
+                "old_parent": "old-review",
+                "new_parent": "new-review",
+                "child": "downstream",
+            }
+        ],
+        superseded=["old-impl", "old-review"],
+    )
+    recovery_detail["comments"] = [
+        {
+            "body": "<!-- hermes-factory:recovery-finalized -->",
+            "author": "hermes-factory-reconciler",
+        }
+    ]
+    client = StatefulRecoveryClient(
+        recovery,
+        recovery_detail,
+        [
+            *_replacement_pair(review_children=["downstream"]),
+            _downstream_detail(["old-review", "new-review"]),
+        ],
+    )
+
+    with pytest.raises(HermesCommandError, match="is inconsistent"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert client.run_calls == []
+
+
+def test_reconcile_keeps_failing_without_hermes_unlink_record(valid_rig: Path):
+    """A missing old edge proves nothing on its own: without Hermes's own ``unlinked``
+    record the plan is not terminal and the boundary stays fail-closed."""
+    recovery, recovery_detail = _completed_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[
+            {
+                "old_parent": "old-review",
+                "new_parent": "new-review",
+                "child": "downstream",
+            }
+        ],
+        superseded=["old-impl", "old-review"],
+    )
+    recovery_detail["comments"] = [
+        {
+            "body": "<!-- hermes-factory:recovery-finalized -->",
+            "author": "hermes-factory-reconciler",
+        }
+    ]
+    client = StatefulRecoveryClient(
+        recovery,
+        recovery_detail,
+        [
+            *_replacement_pair(review_children=["downstream"]),
+            _downstream_detail(["new-review"]),
+        ],
+    )
+
+    with pytest.raises(HermesCommandError, match="no authoritative unlink record"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert client.run_calls == []
 
 
 def _replacement_pair(

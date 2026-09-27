@@ -2219,6 +2219,54 @@ def _purge_order(
     )
 
 
+def _recovery_plan_fully_applied(
+    client: HermesClient, rig: RigSpec, plan: RecoveryPlan
+) -> bool:
+    """Whether a plan has already applied every mutation it declares.
+
+    A plan in that state is terminal: the archive phase, the purge phase and the rewire
+    phase would all select nothing, so revalidating its declared snapshot against a
+    graph that has legitimately moved on can only invent a failure for work that is
+    already done. Terminality is also a refusal to mutate, never an authorisation, so
+    it cannot widen the destructive boundary: this returns True only when no archive,
+    purge, or rewire is left to perform, and every other plan keeps the full
+    fail-closed revalidation unchanged.
+
+    The proof is read from Hermes's own records only:
+
+    * no declared superseded card is on the board, archived included, so nothing is
+      left to archive or purge; and
+    * every declared rewire is already persisted - the child still carries the new
+      parent, no longer carries the old one, and Hermes wrote its own ``unlinked``
+      record for that exact edge. A missing edge alone proves nothing, since purging
+      the old parent drops link rows silently.
+
+    The recovery-finalized comment is deliberately not consulted: a worker can post
+    any body under any author, so a comment can never make a plan terminal.
+
+    Read failures propagate: a graph that cannot be read is not evidence of finished
+    work, and the caller reports it as a failure exactly as before.
+    """
+    board = ["kanban", "--board", rig.board.slug]
+    statuses = _task_statuses(client, board)
+    if any(task_id in statuses for task_id in plan.superseded_task_ids):
+        return False
+    for rewire in plan.rewires:
+        child = _task_show(
+            client.run_json(board + ["show", rewire.child, "--json"])
+        )
+        if child["task"].get("id") != rewire.child:
+            return False
+        parents = set(child["parents"])
+        if (
+            rewire.new_parent not in parents
+            or rewire.old_parent in parents
+            or not _unlink_recorded(child, rewire)
+        ):
+            return False
+    return True
+
+
 def _finalize_recovery_plan(
     client: HermesClient, rig: RigSpec, recovery_id: str, plan: RecoveryPlan
 ) -> None:
@@ -2229,6 +2277,9 @@ def _finalize_recovery_plan(
     verdict from that point on is reported as a failure instead.
     """
     board = ["kanban", "--board", rig.board.slug]
+    if _recovery_plan_fully_applied(client, rig, plan):
+        _mark_recovery_finalized(client, rig, recovery_id, plan.finalized_marked)
+        return
     mutated = False
 
     def revalidate() -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
@@ -2281,17 +2332,7 @@ def _finalize_recovery_plan(
             "superseded tasks remain after purge: "
             + ", ".join(remaining_superseded)
         )
-    if not plan.finalized_marked:
-        client.run(
-            board
-            + [
-                "comment",
-                recovery_id,
-                _FINALIZED_MARKER,
-                "--author",
-                _RECOVERY_CREATOR,
-            ]
-        )
+    _mark_recovery_finalized(client, rig, recovery_id, plan.finalized_marked)
 
 
 def _unknown_target_detail(

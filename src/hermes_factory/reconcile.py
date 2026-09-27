@@ -369,6 +369,27 @@ def _no_agent_incident_failure(incident: dict[str, Any]) -> str | None:
     return None
 
 
+def _replacement_changed_files_required(
+    task_class: str, source_contract: dict[str, Any]
+) -> bool:
+    """Whether a replacement card must prove that it changed files.
+
+    ``changed_files_required`` belongs to the replacement's own class, not to the card it
+    replaces. Factory renders every review contract with the flag unset whatever the
+    slice's proof declares, so cloning a rejected review's contract onto its correction
+    implementation would demand an implementation card that proves no file changed - a
+    card no renderer can produce, which rejects the plan forever. A same-class
+    implementation clone preserves the slice's own declaration (a timeout continuation
+    keeps the mission's proof flag); a cross-class replacement takes its class's
+    obligation, which is the limited thing a review's contract cannot speak for.
+    """
+    if task_class != "implementation":
+        return False
+    if source_contract.get("task_class") == "implementation":
+        return bool(source_contract["changed_files_required"])
+    return True
+
+
 def _fixture_replacement_body(
     rig: RigSpec,
     detail: dict[str, Any],
@@ -383,7 +404,9 @@ def _fixture_replacement_body(
     proof = ProofSpec(
         commands=tuple(source_contract["required_commands"]),
         artifacts=tuple(source_contract["required_artifacts"]),
-        changed_files_required=bool(source_contract["changed_files_required"]),
+        changed_files_required=_replacement_changed_files_required(
+            task_class, source_contract
+        ),
     )
     proof_lines = sections["Proof required"].splitlines()
     if AUDIT_CONTRACT_START in proof_lines:
@@ -708,7 +731,7 @@ The independent review rejected its implementation parent with the recorded find
 
 1. Read the target with `hermes kanban --board {rig.board.slug} show {task_id} --json` and `log {task_id}`, and read the rejected implementation parent recorded above.
 2. Inspect the live repository diff. Preserve valid partial work; do not reset or overwrite unrelated changes.
-3. Create one narrow correction implementation task that fixes exactly the recorded findings, followed by a fresh independent review task that independently re-runs the required proof.
+3. Create one narrow correction implementation task that fixes exactly the recorded findings, followed by a fresh independent review task that independently re-runs the required proof. Render the correction card's audit contract with `"changed_files_required": true` and the fresh review's with `false`: that flag belongs to the replacement's own class, and the rejected review's cloned contract - which carries no changed-files obligation by construction - cannot speak for an implementation card.
 4. Chain the correction to the recorded incoming prerequisites, reconnect downstream children to the final replacement review, and keep the acceptance lists unchanged.
 5. Verify the replacement task bodies, assignees, runtime/retry limits, and dependency graph from authoritative Kanban records.
 6. Do not run unlink, archive, or purge from this worker. Those privileged mutations are fenced by design and belong to the deterministic Factory reconciler.
@@ -1787,10 +1810,8 @@ def _validate_replacement_contract(
         "task_class": role,
         "required_commands": source_contract["required_commands"],
         "required_artifacts": source_contract["required_artifacts"],
-        "changed_files_required": (
-            source_contract["changed_files_required"]
-            if role == "implementation"
-            else False
+        "changed_files_required": _replacement_changed_files_required(
+            role, source_contract
         ),
         "required_metadata": ["changed_files", "commands", "limitations"],
     }

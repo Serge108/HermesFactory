@@ -12,16 +12,19 @@ from hermes_factory.reconcile import (
     reconcile_board,
 )
 from hermes_factory.rig_loader import load_rig
-from hermes_factory.task_templates import REVIEW_REJECTION_PREFIX
+from hermes_factory.task_templates import REVIEW_REJECTION_PREFIX, parse_audit_contract
 
 
-def _audit_body(task_class: str, slice_id: str = "original") -> str:
+def _audit_body(
+    task_class: str, slice_id: str = "original", *, changed_files_required: bool = False
+) -> str:
     required_metadata = {
         "implementation": '["changed_files","commands","limitations"]',
         "review": '["changed_files","commands","limitations"]',
     }[task_class]
     seat = "builder" if task_class == "implementation" else "reviewer"
     role = "implementation" if task_class == "implementation" else "independent_review"
+    changed_files_flag = "true" if changed_files_required else "false"
     return (
         "# Project\nDemo (slug: demo)\nWorking directory: F:/Project With Space\n\n"
         "# Mission\nDemo mission: preserve the mission intent.\n\n"
@@ -37,7 +40,9 @@ def _audit_body(task_class: str, slice_id: str = "original") -> str:
         'Factory audit contract: {"task_class":"'
         + task_class
         + '","required_commands":[],"required_artifacts":[],'
-        '"changed_files_required":false,"required_metadata":'
+        '"changed_files_required":'
+        + changed_files_flag
+        + ',"required_metadata":'
         + required_metadata
         + "}\n"
         "<!-- /hermes-factory:audit-contract -->\n\n"
@@ -102,6 +107,7 @@ def _factory_detail(
     creator_task_id: str | None = None,
     gave_up: bool = False,
     status: str = "todo",
+    changed_files_required: bool = False,
 ) -> dict[str, object]:
     events: list[dict[str, object]] = [
         {
@@ -121,7 +127,9 @@ def _factory_detail(
         "task": {
             "id": task_id,
             "title": f"{task_class.title()} demo",
-            "body": _audit_body(task_class, slice_id),
+            "body": _audit_body(
+                task_class, slice_id, changed_files_required=changed_files_required
+            ),
             # Hermes parks a card the failure breaker gave up on as blocked; a plain
             # backlog card stays todo.
             "status": "blocked" if gave_up else status,
@@ -3341,6 +3349,7 @@ def _rejected_review_recovery_details() -> list[dict[str, object]]:
             children=["new-review"],
             created_by="builder",
             creator_task_id="recovery-1",
+            changed_files_required=True,
         ),
         _factory_detail(
             "new-review",
@@ -3360,6 +3369,7 @@ def _rejected_review_recovery_details() -> list[dict[str, object]]:
             "builder",
             parents=["parent"],
             children=["old-review"],
+            changed_files_required=True,
         ),
         {
             "task": {"id": "downstream", "status": "todo"},
@@ -3435,6 +3445,114 @@ def test_reconcile_rejects_review_recovery_without_rejection_evidence(valid_rig:
 
     assert [call for call in client.run_calls if call[3] in {"unlink", "archive"}] == []
     assert "old-review" in client.details
+
+
+def test_reconcile_finalizes_review_correction_claiming_the_implementation_obligation(
+    valid_rig: Path,
+):
+    """A correction implementation owes its own class proof, not the review's clone.
+
+    Factory renders every review contract with ``changed_files_required`` unset, so a
+    real correction implementation card - rendered the way an implementation card always
+    is - declares the obligation. Cloning the rejected review's value would make the
+    correction card fail its own validator forever.
+    """
+    recovery, detail = _completed_rejected_review_recovery()
+    details = _rejected_review_recovery_details()
+    implementation = next(item for item in details if item["task"]["id"] == "new-impl")
+    implementation["task"]["body"] = _audit_body(
+        "implementation", "original-recovery-300", changed_files_required=True
+    )
+    client = StatefulRecoveryClient(recovery, detail, details)
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ("recovery-1",)
+    assert ["kanban", "--board", "demo-rig", "archive", "old-review"] in client.run_calls
+    assert "old-review" not in client.details
+
+
+def test_reconcile_rejects_review_correction_that_drops_the_implementation_obligation(
+    valid_rig: Path,
+):
+    recovery, detail = _completed_rejected_review_recovery()
+    details = _rejected_review_recovery_details()
+    implementation = next(item for item in details if item["task"]["id"] == "new-impl")
+    implementation["task"]["body"] = _audit_body("implementation", "original-recovery-300")
+    client = StatefulRecoveryClient(recovery, detail, details)
+
+    with pytest.raises(HermesCommandError, match="invalid cloned audit contract"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert [call for call in client.run_calls if call[3] in {"unlink", "archive"}] == []
+    assert "old-review" in client.details
+
+
+def test_reconcile_rejects_review_replacement_that_claims_a_changed_files_obligation(
+    valid_rig: Path,
+):
+    recovery, detail = _completed_rejected_review_recovery()
+    details = _rejected_review_recovery_details()
+    review = next(item for item in details if item["task"]["id"] == "new-review")
+    review["task"]["body"] = _audit_body(
+        "review", "original-recovery-300", changed_files_required=True
+    )
+    client = StatefulRecoveryClient(recovery, detail, details)
+
+    with pytest.raises(HermesCommandError, match="invalid cloned audit contract"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert [call for call in client.run_calls if call[3] in {"unlink", "archive"}] == []
+
+
+def test_fixture_recovery_package_renders_the_correction_obligation(valid_rig: Path):
+    valid_rig.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "completion_contract: local-only}",
+            "completion_contract: local-only, fixture_recovery: true}",
+        ),
+        encoding="utf-8",
+    )
+    review = _rejected_review_detail()
+    implementation = _factory_detail(
+        "old-impl",
+        "implementation",
+        "original",
+        "builder",
+        parents=["parent-1"],
+        children=["old-review"],
+    )
+    implementation["task"]["body"] = _audit_body(
+        "implementation", "original", changed_files_required=True
+    )
+    client = FakeReconcileClient(
+        [
+            [_rejected_review_detail()["task"]],
+            review,
+            implementation,
+            {
+                "id": "recovery-2",
+                "status": "ready",
+                "title": "Correct rejected review old-review",
+            },
+            [],
+        ]
+    )
+
+    reconcile_board(
+        client, load_rig(valid_rig), fixture_recovery=True, recovery_runtime="60s"
+    )
+
+    create = next(call for call in client.json_calls if call[3] == "create")
+    body = _flag_value(create, "--body")
+    prefix = "Factory fixture recovery package: "
+    package = json.loads(
+        next(line for line in body.splitlines() if line.startswith(prefix))[len(prefix) :]
+    )
+    implementation_contract = parse_audit_contract(package["implementation"]["body"])
+    review_contract = parse_audit_contract(package["review"]["body"])
+    assert implementation_contract["changed_files_required"] is True
+    assert review_contract["changed_files_required"] is False
 
 
 def _completed_unknown_recovery(

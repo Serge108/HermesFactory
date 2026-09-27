@@ -3975,3 +3975,719 @@ def test_recovery_finalizes_on_top_of_an_earlier_interrupted_application(
         for call in client.run_calls
         if call[3] == "comment"
     )
+
+
+# ---------------------------------------------------------------------------
+# Cards a coordinator worker created inside a Factory recovery run.
+# ---------------------------------------------------------------------------
+
+
+def _creator_recovery(
+    *,
+    card_id: str = "seed-recovery",
+    target: str = "seed-target",
+    created_cards: list[str],
+    status: str = "archived",
+) -> tuple[dict[str, object], dict[str, object]]:
+    """A finished Factory recovery run plus Hermes's record of the cards it created."""
+    recovery, detail = _completed_recovery(
+        replacements=created_cards,
+        rewires=[],
+        superseded=[],
+        target=target,
+    )
+    recovery["id"] = card_id
+    recovery["status"] = status
+    recovery["body"] = (
+        "<!-- hermes-factory:recovery -->\n"
+        f"# Recovery target\nReason code: worker_timeout\nSuperseded task: {target}"
+    )
+    return recovery, detail
+
+
+def _interrupted_creator_recovery(
+    *, card_id: str = "seed-recovery", target: str = "seed-target"
+) -> tuple[dict[str, object], dict[str, object]]:
+    """A Factory recovery run Hermes' failure breaker killed before it completed.
+
+    Its runtime budget expired after it had already created cards, so Hermes records no
+    completion event and therefore no ``verified_cards`` manifest for the run.
+    """
+    recovery, detail = _creator_recovery(
+        card_id=card_id, target=target, created_cards=[], status="blocked"
+    )
+    detail["events"] = [
+        {"kind": "created", "created_at": 100, "payload": {"creator_task_id": None}},
+        {
+            "kind": "gave_up",
+            "created_at": 150,
+            "run_id": None,
+            "payload": {
+                "trigger_outcome": "timed_out",
+                "error": "elapsed 1209s > limit 1200s",
+            },
+        },
+    ]
+    detail["runs"] = [
+        {
+            "id": 200,
+            "status": "timed_out",
+            "outcome": "timed_out",
+            "error": "elapsed 1209s > limit 1200s",
+        }
+    ]
+    return recovery, detail
+
+
+class _CompletedOnlyDoneClient(StatefulRecoveryClient):
+    """``list --status done`` answers with done cards only, exactly as Hermes does."""
+
+    def run_json(self, args: list[str]) -> object:
+        if args[3:] == ["list", "--status", "done", "--json"]:
+            return [
+                detail["task"]
+                for detail in self.recoveries.values()
+                if detail["task"]["status"] == "done"
+            ]
+        return super().run_json(args)
+
+
+def _recovery_created_pair(
+    *,
+    creator_task_id: str | None = "seed-recovery",
+    names: tuple[str, str] = ("old-impl", "old-review"),
+    slice_id: str = "original",
+    gave_up: bool = False,
+) -> list[dict[str, object]]:
+    """An implementation/review pair exactly as a coordinator recovery run created it."""
+    implementation_id, review_id = names
+    return [
+        _factory_detail(
+            implementation_id,
+            "implementation",
+            slice_id,
+            "builder",
+            parents=["parent"],
+            children=[review_id],
+            created_by="builder",
+            creator_task_id=creator_task_id,
+            gave_up=gave_up,
+        ),
+        _factory_detail(
+            review_id,
+            "review",
+            slice_id,
+            "reviewer",
+            parents=[implementation_id],
+            created_by="builder",
+            creator_task_id=creator_task_id,
+        ),
+    ]
+
+
+def _blocked_recovery_created_card(
+    *,
+    task_id: str = "new-impl",
+    task_class: str = "implementation",
+    slice_id: str = "replacement-a",
+    creator_task_id: str | None = "seed-recovery",
+    terminal: str = "timeout",
+) -> dict[str, object]:
+    """A blocked card a recovery run created, parked the way ``terminal`` says."""
+    detail = _factory_detail(
+        task_id,
+        task_class,
+        slice_id,
+        "builder" if task_class == "implementation" else "reviewer",
+        created_by="builder",
+        creator_task_id=creator_task_id,
+    )
+    detail["task"]["status"] = "blocked"
+    if terminal == "timeout":
+        detail["events"].append(
+            {
+                "kind": "gave_up",
+                "created_at": 200,
+                "run_id": None,
+                "payload": {
+                    "trigger_outcome": "timed_out",
+                    "error": "elapsed 1209s > limit 1200s",
+                },
+            }
+        )
+    elif terminal == "rejected":
+        detail["events"].append(
+            {
+                "kind": "blocked",
+                "created_at": 200,
+                "run_id": 9,
+                "payload": {
+                    "reason": f"{REVIEW_REJECTION_PREFIX}the proof command was not re-run"
+                },
+            }
+        )
+    else:
+        detail["events"].append(
+            {
+                "kind": "blocked",
+                "created_at": 200,
+                "run_id": 9,
+                "payload": {"reason": "Need somebody to run a script"},
+            }
+        )
+    return detail
+
+
+class RecoveryCreatedBoardClient:
+    """A board that answers every read from its records instead of a queue."""
+
+    def __init__(
+        self, blocked: list[dict[str, object]], details: list[dict[str, object]]
+    ) -> None:
+        self.blocked = blocked
+        self.details = {detail["task"]["id"]: detail for detail in details}
+        self.json_calls: list[list[str]] = []
+        self.run_calls: list[list[str]] = []
+
+    def run_json(self, args: list[str]) -> object:
+        self.json_calls.append(args)
+        tail = args[3:]
+        if tail == ["list", "--status", "blocked", "--json"]:
+            return self.blocked
+        if tail == ["list", "--status", "done", "--json"]:
+            return []
+        if tail == ["list", "--archived", "--json"]:
+            return [detail["task"] for detail in self.details.values()]
+        if tail[:1] == ["show"] and tail[1] in self.details:
+            return self.details[tail[1]]
+        if tail[:1] == ["create"]:
+            return {"id": "recovery-2", "status": "ready", "title": tail[1]}
+        raise AssertionError(args)
+
+    def run(self, args: list[str]) -> str:
+        self.run_calls.append(args)
+        return ""
+
+
+@pytest.mark.parametrize(
+    ("terminal", "task_class", "key_token", "title_prefix"),
+    [
+        ("timeout", "implementation", "gave-up", "Decompose blocked task"),
+        ("rejected", "review", "review-rejected", "Correct rejected review"),
+        ("unknown", "implementation", "unknown-stall", "Resolve unknown blocked task"),
+    ],
+)
+def test_reconcile_classifies_blocked_recovery_created_card(
+    valid_rig: Path, terminal: str, task_class: str, key_token: str, title_prefix: str
+) -> None:
+    task_id = "new-impl" if task_class == "implementation" else "new-review"
+    detail = _blocked_recovery_created_card(
+        task_id=task_id, task_class=task_class, terminal=terminal
+    )
+    _, creator_detail = _creator_recovery(created_cards=["new-impl", "new-review"])
+    client = RecoveryCreatedBoardClient(
+        [{"id": task_id, "created_by": "builder", "status": "blocked"}],
+        [detail, creator_detail],
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.scanned == 1
+    assert result.eligible == 1
+    assert result.recovery_task_ids == {task_id: "recovery-2"}
+    create = next(call for call in client.json_calls if call[3] == "create")
+    assert create[:5] == [
+        "kanban",
+        "--board",
+        "demo-rig",
+        "create",
+        f"{title_prefix} {task_id}",
+    ]
+    assert _flag_value(create, "--idempotency-key") == (
+        f"factory:demo:reconcile:{task_id}:{key_token}:200"
+    )
+    assert _flag_value(create, "--created-by") == "hermes-factory-reconciler"
+    assert _flag_value(create, "--assignee") == "builder"
+    assert _flag_value(create, "--priority") == "100"
+    assert _flag_value(create, "--max-retries") == "2"
+    assert f"Superseded task: {task_id}" in _flag_value(create, "--body")
+
+
+def test_reconcile_creates_fixture_recovery_for_a_recovery_created_card(
+    valid_rig: Path,
+) -> None:
+    valid_rig.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "completion_contract: local-only}",
+            "completion_contract: local-only, fixture_recovery: true}",
+        ),
+        encoding="utf-8",
+    )
+    detail = _blocked_recovery_created_card()
+    detail["children"] = ["new-review"]
+    detail["parents"] = ["parent"]
+    review = _factory_detail(
+        "new-review",
+        "review",
+        "replacement-a",
+        "reviewer",
+        parents=["new-impl"],
+        children=["downstream"],
+        created_by="builder",
+        creator_task_id="seed-recovery",
+    )
+    _, creator_detail = _creator_recovery(created_cards=["new-impl", "new-review"])
+    client = RecoveryCreatedBoardClient(
+        [{"id": "new-impl", "created_by": "builder", "status": "blocked"}],
+        [detail, review, creator_detail],
+    )
+
+    reconcile_board(
+        client, load_rig(valid_rig), fixture_recovery=True, recovery_runtime="60s"
+    )
+
+    create = next(call for call in client.json_calls if call[3] == "create")
+    assert _flag_value(create, "--max-runtime") == "60s"
+    body = _flag_value(create, "--body")
+    prefix = "Factory fixture recovery package: "
+    package_line = next(line for line in body.splitlines() if line.startswith(prefix))
+    package = json.loads(package_line[len(prefix) :])
+    assert package["implementation"]["parents"] == ["parent"]
+    assert package["links"] == [{"parent": "$review_task_id", "child": "downstream"}]
+    assert package["completion_metadata"]["superseded_task_ids"] == [
+        "new-impl",
+        "new-review",
+    ]
+
+
+def test_reconcile_ignores_blocked_card_created_by_a_non_recovery_run(
+    valid_rig: Path,
+) -> None:
+    detail = _blocked_recovery_created_card(creator_task_id="worker-7")
+    worker = _factory_detail(
+        "worker-7",
+        "implementation",
+        "replacement-a",
+        "builder",
+        created_by="builder",
+    )
+    client = RecoveryCreatedBoardClient(
+        [{"id": "new-impl", "created_by": "builder", "status": "blocked"}],
+        [detail, worker],
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.scanned == 1
+    assert result.eligible == 0
+    assert result.recovery_task_ids == {}
+    assert not any(call[3] == "create" for call in client.json_calls)
+
+
+def test_reconcile_classifies_blocked_card_created_by_an_interrupted_recovery_run(
+    valid_rig: Path,
+) -> None:
+    detail = _blocked_recovery_created_card()
+    _, creator_detail = _interrupted_creator_recovery()
+    client = RecoveryCreatedBoardClient(
+        [{"id": "new-impl", "created_by": "builder", "status": "blocked"}],
+        [detail, creator_detail],
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.eligible == 1
+    assert result.recovery_task_ids == {"new-impl": "recovery-2"}
+    create = next(call for call in client.json_calls if call[3] == "create")
+    assert _flag_value(create, "--idempotency-key") == (
+        "factory:demo:reconcile:new-impl:gave-up:200"
+    )
+    assert _flag_value(create, "--created-by") == "hermes-factory-reconciler"
+
+
+def test_reconcile_ignores_blocked_card_created_by_a_completed_run_without_a_manifest(
+    valid_rig: Path,
+) -> None:
+    detail = _blocked_recovery_created_card()
+    _, creator_detail = _creator_recovery(created_cards=["new-impl", "new-review"])
+    # Hermes omits `verified_cards` when a completed run created no cards, so a
+    # completed run without that key recorded an empty manifest. Only a run that never
+    # completed at all may stand in for a missing manifest.
+    for event in creator_detail["events"]:
+        if event["kind"] == "completed":
+            event["payload"] = {"result_len": 0}
+    client = RecoveryCreatedBoardClient(
+        [{"id": "new-impl", "created_by": "builder", "status": "blocked"}],
+        [detail, creator_detail],
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.eligible == 0
+    assert result.recovery_task_ids == {}
+    assert not any(call[3] == "create" for call in client.json_calls)
+
+
+def test_reconcile_ignores_blocked_card_without_a_creator_task_id(
+    valid_rig: Path,
+) -> None:
+    detail = _blocked_recovery_created_card(creator_task_id=None)
+    client = RecoveryCreatedBoardClient(
+        [{"id": "new-impl", "created_by": "builder", "status": "blocked"}],
+        [detail],
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.eligible == 0
+    assert result.recovery_task_ids == {}
+    assert not any(call[3] == "create" for call in client.json_calls)
+
+
+def test_reconcile_ignores_blocked_card_missing_from_its_creator_run_manifest(
+    valid_rig: Path,
+) -> None:
+    detail = _blocked_recovery_created_card()
+    _, creator_detail = _creator_recovery(created_cards=["new-review"])
+    client = RecoveryCreatedBoardClient(
+        [{"id": "new-impl", "created_by": "builder", "status": "blocked"}],
+        [detail, creator_detail],
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.eligible == 0
+    assert result.recovery_task_ids == {}
+    assert not any(call[3] == "create" for call in client.json_calls)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "factory:other:demo-mission:replacement-a:implementation",
+        "factory:demo:demo-mission:replacement-a:review",
+    ],
+)
+def test_reconcile_ignores_blocked_card_without_a_matching_factory_identity(
+    valid_rig: Path, key: str
+) -> None:
+    detail = _blocked_recovery_created_card()
+    detail["task"]["idempotency_key"] = key
+    _, creator_detail = _creator_recovery(created_cards=["new-impl", "new-review"])
+    client = RecoveryCreatedBoardClient(
+        [{"id": "new-impl", "created_by": "builder", "status": "blocked"}],
+        [detail, creator_detail],
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.eligible == 0
+    assert result.recovery_task_ids == {}
+    assert not any(call[3] == "create" for call in client.json_calls)
+
+
+def test_reconcile_supersedes_cards_created_by_a_recovery_run(valid_rig: Path) -> None:
+    recovery, recovery_detail = _completed_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[],
+        superseded=["old-impl", "old-review"],
+    )
+    _, creator_detail = _creator_recovery(created_cards=["old-impl", "old-review"])
+    creator = creator_detail["task"]
+    client = StatefulRecoveryClient(
+        recovery,
+        recovery_detail,
+        [*_replacement_pair(), *_recovery_created_pair(gave_up=True)],
+        extra_recoveries=[(creator, creator_detail)],
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ("recovery-1",)
+    assert [
+        "kanban",
+        "--board",
+        "demo-rig",
+        "archive",
+        "old-impl",
+        "old-review",
+    ] in client.run_calls
+    assert [
+        "kanban",
+        "--board",
+        "demo-rig",
+        "archive",
+        "--rm",
+        "old-review",
+        "old-impl",
+    ] in client.run_calls
+    assert "old-impl" not in client.details
+    assert "old-review" not in client.details
+
+
+def test_reconcile_supersedes_cards_created_by_an_interrupted_recovery_run(
+    valid_rig: Path,
+) -> None:
+    recovery, recovery_detail = _completed_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[],
+        superseded=["old-impl", "old-review"],
+    )
+    _, creator_detail = _interrupted_creator_recovery()
+    creator = creator_detail["task"]
+    client = _CompletedOnlyDoneClient(
+        recovery,
+        recovery_detail,
+        [*_replacement_pair(), *_recovery_created_pair(gave_up=True)],
+        extra_recoveries=[(creator, creator_detail)],
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ("recovery-1",)
+    assert [
+        "kanban",
+        "--board",
+        "demo-rig",
+        "archive",
+        "--rm",
+        "old-review",
+        "old-impl",
+    ] in client.run_calls
+    assert "old-impl" not in client.details
+    assert "old-review" not in client.details
+
+
+def test_reconcile_rejects_superseded_card_without_a_creator_task_id(
+    valid_rig: Path,
+) -> None:
+    recovery, recovery_detail = _completed_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[],
+        superseded=["old-impl", "old-review"],
+    )
+    client = StatefulRecoveryClient(
+        recovery,
+        recovery_detail,
+        [
+            *_replacement_pair(),
+            *_recovery_created_pair(creator_task_id=None, gave_up=True),
+        ],
+    )
+
+    with pytest.raises(HermesCommandError, match="invalid provenance"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert client.run_calls == []
+
+
+def test_reconcile_rejects_superseded_card_created_by_a_non_recovery_run(
+    valid_rig: Path,
+) -> None:
+    recovery, recovery_detail = _completed_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[],
+        superseded=["old-impl", "old-review"],
+    )
+    worker = _factory_detail(
+        "worker-7",
+        "implementation",
+        "replacement-a",
+        "builder",
+        created_by="builder",
+    )
+    client = StatefulRecoveryClient(
+        recovery,
+        recovery_detail,
+        [
+            *_replacement_pair(),
+            *_recovery_created_pair(creator_task_id="worker-7", gave_up=True),
+            worker,
+        ],
+    )
+
+    with pytest.raises(HermesCommandError, match="created inside a worker session"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert client.run_calls == []
+
+
+def test_reconcile_rejects_superseded_card_missing_from_its_creator_run_manifest(
+    valid_rig: Path,
+) -> None:
+    recovery, recovery_detail = _completed_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[],
+        superseded=["old-impl", "old-review"],
+    )
+    _, creator_detail = _creator_recovery(created_cards=["old-impl"])
+    creator = creator_detail["task"]
+    client = StatefulRecoveryClient(
+        recovery,
+        recovery_detail,
+        [*_replacement_pair(), *_recovery_created_pair(gave_up=True)],
+        extra_recoveries=[(creator, creator_detail)],
+    )
+
+    with pytest.raises(HermesCommandError, match="created inside a worker session"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert client.run_calls == []
+
+
+class _RecoveryCreatedUnknownTargetClient(UnknownResumeClient):
+    """An unknown-stall recovery whose blocked target a recovery run created."""
+
+    def __init__(self, action: str = "retry") -> None:
+        super().__init__(action)
+        _, creator_detail = _creator_recovery(created_cards=["unknown-1"])
+        self.creator = creator_detail
+        target = _factory_detail(
+            "unknown-1",
+            "implementation",
+            "original",
+            "builder",
+            parents=[],
+            created_by="builder",
+            creator_task_id="seed-recovery",
+        )
+        target["task"]["status"] = "blocked"
+        target["events"] = [
+            {"kind": "created", "payload": {"creator_task_id": "seed-recovery"}},
+            {
+                "kind": "blocked",
+                "created_at": 100,
+                "run_id": 9,
+                "payload": {"reason": "Need a coordinator decision"},
+            },
+        ]
+        self.target = target
+
+    def run_json(self, args: list[str]) -> object:
+        tail = args[3:]
+        if tail == ["show", "seed-recovery", "--json"]:
+            return self.creator
+        if tail == ["list", "--archived", "--json"]:
+            return [
+                self.recovery["task"],
+                self.target["task"],
+                self.creator["task"],
+            ]
+        return super().run_json(args)
+
+
+def test_unknown_recovery_retries_a_recovery_created_target(valid_rig: Path) -> None:
+    client = _RecoveryCreatedUnknownTargetClient("retry")
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ("unknown-recovery-1",)
+    assert [
+        "kanban",
+        "--board",
+        "demo-rig",
+        "unblock",
+        "unknown-1",
+        "--reason",
+        "Run the safe script and continue.",
+    ] in client.run_calls
+    assert client.target["task"]["status"] == "ready"
+
+
+def test_reconcile_gives_recovery_cards_the_coordinator_runtime(valid_rig: Path):
+    rig_path = valid_rig.parent / "rig-coordinator.yaml"
+    rig_path.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "max_runtime: 30m", "max_runtime: 30m, coordinator_runtime: 45m"
+        ),
+        encoding="utf-8",
+    )
+    client = FakeReconcileClient(
+        [
+            [_blocked_task()],
+            _timed_out_show(),
+            {
+                "id": "recovery-1",
+                "status": "ready",
+                "title": "Decompose blocked task task-1",
+            },
+            [],
+        ]
+    )
+
+    result = reconcile_board(client, load_rig(rig_path))
+
+    assert result.recovery_task_ids == {"task-1": "recovery-1"}
+    create = client.json_calls[2]
+    assert _flag_value(create, "--max-runtime") == "45m"
+    assert _flag_value(create, "--max-retries") == "2"
+
+
+def _creator_recovery_with_interrupted_run(
+    *,
+    created_cards: list[str],
+    card_id: str = "seed-recovery",
+    target: str = "seed-target",
+) -> tuple[dict[str, object], dict[str, object]]:
+    """A Factory recovery card with both a completed run and an interrupted one.
+
+    The completed run vouched only for the cards it declared. An earlier run of the
+    same card was killed by the runtime budget after creating cards of its own, so no
+    manifest can exist for that run.
+    """
+    recovery, detail = _creator_recovery(
+        card_id=card_id, target=target, created_cards=created_cards
+    )
+    detail["runs"].append(
+        {
+            "id": 201,
+            "status": "timed_out",
+            "outcome": "timed_out",
+            "error": "elapsed 1209s > limit 1200s",
+        }
+    )
+    return recovery, detail
+
+
+def test_reconcile_classifies_blocked_card_left_by_an_interrupted_run_of_its_creator(
+    valid_rig: Path,
+) -> None:
+    detail = _blocked_recovery_created_card()
+    _, creator_detail = _creator_recovery_with_interrupted_run(
+        created_cards=["new-review"]
+    )
+    client = RecoveryCreatedBoardClient(
+        [{"id": "new-impl", "created_by": "builder", "status": "blocked"}],
+        [detail, creator_detail],
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.eligible == 1
+    assert result.recovery_task_ids == {"new-impl": "recovery-2"}
+
+
+def test_reconcile_supersedes_a_card_left_by_an_interrupted_run_of_its_creator(
+    valid_rig: Path,
+) -> None:
+    recovery, recovery_detail = _completed_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[],
+        superseded=["old-impl", "old-review"],
+    )
+    _, creator_detail = _creator_recovery_with_interrupted_run(
+        created_cards=["old-impl"]
+    )
+    creator = creator_detail["task"]
+    client = _CompletedOnlyDoneClient(
+        recovery,
+        recovery_detail,
+        [*_replacement_pair(), *_recovery_created_pair(gave_up=True)],
+        extra_recoveries=[(creator, creator_detail)],
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ("recovery-1",)
+    assert "old-impl" not in client.details
+    assert "old-review" not in client.details

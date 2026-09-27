@@ -26,6 +26,11 @@ _RECOVERY_SKILL = "hermes-native-agent-factories"
 _FINALIZED_MARKER = "<!-- hermes-factory:recovery-finalized -->"
 _RECOVERY_REJECTED_MARKER = "<!-- hermes-factory:recovery-rejected -->"
 _VALIDATED_MARKER_PREFIX = "<!-- hermes-factory:recovery-validated:"
+# Every generated Factory recovery card carries exactly one of these body markers.
+_RECOVERY_BODY_MARKERS = (
+    "<!-- hermes-factory:recovery -->",
+    "<!-- hermes-factory:unknown-operational-recovery -->",
+)
 _REPLACEMENT_POLICY_START = "<!-- hermes-factory:replacement-policy -->"
 _REPLACEMENT_POLICY_END = "<!-- /hermes-factory:replacement-policy -->"
 _REPLACEMENT_POLICY_PREFIX = "Factory replacement policy: "
@@ -320,11 +325,12 @@ def _fixture_recovery_package(
     event: dict[str, Any],
     *,
     stall_class: str,
+    identity: FactoryTaskIdentity | None = None,
 ) -> dict[str, Any]:
     task = detail["task"]
     task_id = task["id"]
-    policy = _replacement_policy_data(rig, detail)
-    source_identity = _factory_identity(detail, rig)
+    policy = _replacement_policy_data(rig, detail, identity=identity)
+    source_identity = identity if identity is not None else _factory_identity(detail, rig)
     board = ["kanban", "--board", rig.board.slug]
     if stall_class == _STALL_WORKER_TIMEOUT:
         # The timed-out implementation is replaced together with its own review child.
@@ -338,7 +344,7 @@ def _fixture_recovery_package(
             rig.board.slug,
             _task_show(client.run_json(board + ["show", source_review_id, "--json"])),
         )
-        review_identity = _factory_identity(source_review, rig)
+        review_identity = _proven_identity(client, rig, source_review)
         if (
             review_identity.project != source_identity.project
             or review_identity.mission != source_identity.mission
@@ -465,7 +471,11 @@ Factory fixture recovery package: {payload}"""
 
 
 def _unknown_recovery_body(
-    rig: RigSpec, detail: dict[str, Any], event: dict[str, Any]
+    rig: RigSpec,
+    detail: dict[str, Any],
+    event: dict[str, Any],
+    *,
+    identity: FactoryTaskIdentity | None = None,
 ) -> str:
     task = detail["task"]
     task_id = task["id"]
@@ -474,7 +484,7 @@ def _unknown_recovery_body(
     payload_json = json.dumps(payload, sort_keys=True)
     contract = parse_audit_contract(task.get("body"))
     replacement_policy = (
-        _replacement_policy_block(rig, detail)
+        _replacement_policy_block(rig, detail, identity=identity)
         if contract.get("task_class") in {"implementation", "review"}
         else "No replacement policy is available for this task class. Choose resume, retry, reassign, or terminate."
     )
@@ -532,6 +542,7 @@ def _recovery_body(
     *,
     stall_class: str,
     fixture_package: dict[str, Any] | None = None,
+    identity: FactoryTaskIdentity | None = None,
 ) -> str:
     task = detail["task"]
     parents = detail["parents"]
@@ -585,7 +596,7 @@ Project directory: {rig.project.cwd}
 
 {action}
 
-{_replacement_policy_block(rig, detail)}
+{_replacement_policy_block(rig, detail, identity=identity)}
 
 {render_recovery_contract()}
 
@@ -603,6 +614,7 @@ def _create_recovery_task(
     stall_class: str,
     fixture_recovery: bool = False,
     recovery_runtime: str | None = None,
+    identity: FactoryTaskIdentity | None = None,
 ) -> str:
     task = detail["task"]
     task_id = task.get("id")
@@ -613,12 +625,14 @@ def _create_recovery_task(
     if type(event_time) is not int:
         raise HermesCommandError("Hermes returned malformed recovery event JSON")
     fixture_package = (
-        _fixture_recovery_package(client, rig, detail, event, stall_class=stall_class)
+        _fixture_recovery_package(
+            client, rig, detail, event, stall_class=stall_class, identity=identity
+        )
         if fixture_recovery and stall_class != _STALL_UNKNOWN_OPERATIONAL
         else None
     )
     body = (
-        _unknown_recovery_body(rig, detail, event)
+        _unknown_recovery_body(rig, detail, event, identity=identity)
         if stall_class == _STALL_UNKNOWN_OPERATIONAL
         else _recovery_body(
             rig,
@@ -626,6 +640,7 @@ def _create_recovery_task(
             event,
             stall_class=stall_class,
             fixture_package=fixture_package,
+            identity=identity,
         )
     )
     card_title = (
@@ -657,7 +672,7 @@ def _create_recovery_task(
         "--max-retries",
         str(rig.policies.max_retries),
         "--max-runtime",
-        recovery_runtime or rig.policies.max_runtime,
+        recovery_runtime or rig.policies.coordinator_runtime,
         "--completion-contract",
         rig.policies.completion_contract,
         "--workspace",
@@ -809,7 +824,7 @@ def _factory_identity(
     *,
     replacement: bool = False,
     recovery_task_id: str | None = None,
-    verified_created_cards: tuple[str, ...] = (),
+    verified_created_cards: tuple[str, ...] | None = (),
 ) -> FactoryTaskIdentity:
     task = detail["task"]
     task_id = task.get("id")
@@ -830,7 +845,14 @@ def _factory_identity(
             or len(created_events) != 1
             or not isinstance(created_payload, dict)
             or created_payload.get("creator_task_id") != recovery_task_id
-            or task_id not in verified_created_cards
+            # ``None`` means the creating recovery run never completed, so Hermes
+            # recorded no created-card manifest for it and the creator task id is the
+            # whole anchor. An empty manifest is a completed run that recorded
+            # creating nothing, which can never list this card.
+            or (
+                verified_created_cards is not None
+                and task_id not in verified_created_cards
+            )
         ):
             raise HermesCommandError(f"{prefix} task {task_id} has invalid provenance")
     elif task.get("created_by") != "hermes-factory":
@@ -843,6 +865,153 @@ def _factory_identity(
     if contract.get("task_class") != identity.task_class:
         raise HermesCommandError(f"{prefix} task {task_id} has invalid audit contract")
     return identity
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryRunCards:
+    """What Hermes records a Factory recovery run as having created.
+
+    ``verified_cards`` is ``None`` when that run never completed: a recovery run killed
+    by its own runtime budget leaves the cards it had already created without any
+    completion manifest, so its ``creator_task_id`` is then the whole anchor.
+    """
+
+    recovery_task_id: str
+    verified_cards: tuple[str, ...] | None
+    interrupted_run: bool = False
+
+
+def _recovery_run_cards(
+    client: HermesClient, rig: RigSpec, recovery_task_id: str
+) -> RecoveryRunCards | None:
+    """The created-card manifest of the Factory recovery run that made a card.
+
+    ``None`` means the named task is not a Factory recovery card at all, so it proves
+    nothing about the cards that name it as their creator.
+    """
+    board = ["kanban", "--board", rig.board.slug]
+    detail = _task_show(client.run_json(board + ["show", recovery_task_id, "--json"]))
+    task = detail["task"]
+    body = task.get("body")
+    if (
+        task.get("id") != recovery_task_id
+        or task.get("created_by") != _RECOVERY_CREATOR
+        or not isinstance(body, str)
+        or not any(marker in body for marker in _RECOVERY_BODY_MARKERS)
+    ):
+        return None
+    try:
+        _recovery_target(task, rig)
+    except HermesCommandError:
+        return None
+    runs = detail.get("runs")
+    if not isinstance(runs, list) or any(not isinstance(run, dict) for run in runs):
+        return None
+    successful = next((run for run in reversed(runs) if run_succeeded(run)), None)
+    # A run that never succeeded cannot emit a completion manifest, so a card it created
+    # is left without one. Whether the creator ever had such a run decides if a missing
+    # manifest may stand in for the card's provenance.
+    interrupted = any(not run_succeeded(run) for run in runs)
+    if successful is None or type(successful.get("id")) is not int:
+        # The creating run has no successful run record: it was killed by its runtime
+        # budget, or it is still in flight. No completion manifest can exist for it.
+        return RecoveryRunCards(recovery_task_id, None, interrupted_run=True)
+    completed = [
+        event
+        for event in detail["events"]
+        if event.get("kind") == "completed" and event.get("run_id") == successful["id"]
+    ]
+    if len(completed) != 1:
+        # A successful run without exactly one matching completion record is malformed,
+        # not interrupted, so it may not stand in for a missing manifest.
+        return None
+    payload = completed[0].get("payload")
+    manifest = payload.get("verified_cards") if isinstance(payload, dict) else None
+    if manifest is None:
+        # Hermes omits the key when the run created no cards, so an absent manifest is
+        # an empty one.
+        return RecoveryRunCards(recovery_task_id, ())
+    try:
+        return RecoveryRunCards(
+            recovery_task_id, _string_tuple(manifest, "verified_created_cards"), interrupted
+        )
+    except HermesCommandError:
+        return None
+
+
+def _replacement_identity(
+    client: HermesClient, rig: RigSpec, detail: dict[str, Any]
+) -> FactoryTaskIdentity | None:
+    """The identity of a card a Factory recovery run created, or ``None``.
+
+    ``created_by`` is a free-form CLI flag, so it never proves Factory work on its own.
+    A recovery-created card is accepted only when Hermes's own records agree on all of
+    the facts: the card's single ``created`` event names the task that created it, that
+    task is itself a Factory recovery card, and either that run's completion manifest
+    lists this card or the run never completed at all.
+    """
+    task = detail["task"]
+    if task.get("created_by") != _coordinator_profile(rig):
+        return None
+    created = [event for event in detail["events"] if event.get("kind") == "created"]
+    payload = created[0].get("payload") if len(created) == 1 else None
+    creator_task_id = payload.get("creator_task_id") if isinstance(payload, dict) else None
+    if not isinstance(creator_task_id, str) or not creator_task_id:
+        return None
+    try:
+        run = _recovery_run_cards(client, rig, creator_task_id)
+    except HermesCommandError:
+        # A creator card that cannot be read proves nothing.
+        return None
+    if run is None:
+        return None
+    verified = run.verified_cards
+    if verified is not None and run.interrupted_run:
+        # The creator also has a run that never completed, and such a run can record no
+        # manifest: this card may be that run's leftover. A later successful run vouches
+        # only for the cards it declared, so its manifest cannot veto this one.
+        verified = None
+    try:
+        return _factory_identity(
+            detail,
+            rig,
+            replacement=True,
+            recovery_task_id=run.recovery_task_id,
+            verified_created_cards=verified,
+        )
+    except HermesCommandError:
+        return None
+
+
+def _proven_identity(
+    client: HermesClient, rig: RigSpec, detail: dict[str, Any]
+) -> FactoryTaskIdentity:
+    """A card's Factory identity, proven either by Factory authorship or by its creator.
+
+    Unlike ``_require_proven_factory_identity``, this asserts nothing about authorship:
+    callers that only compare the identities of cards inside the Factory graph use it.
+    """
+    replacement = _replacement_identity(client, rig, detail)
+    if replacement is not None:
+        return replacement
+    return _factory_identity(detail, rig)
+
+
+def _require_proven_factory_identity(
+    client: HermesClient, rig: RigSpec, detail: dict[str, Any], label: str
+) -> FactoryTaskIdentity:
+    """Require Hermes's proof that a card is Factory work, and return its identity.
+
+    A Factory-authored card proves authorship the way it always has. A card a
+    coordinator worker created inside a Factory recovery run proves it through that
+    run's own records instead. Anything else - including a worker-authored lookalike -
+    is refused with the original authorship error.
+    """
+    replacement = _replacement_identity(client, rig, detail)
+    if replacement is not None:
+        return replacement
+    _require_factory_authored(detail, label)
+    return _factory_identity(detail, rig)
 
 
 def _generated_body_sections(body: object) -> dict[str, str]:
@@ -887,8 +1056,13 @@ def _scope_identity(body: object) -> tuple[str, str, str]:
     )
 
 
-def _replacement_policy_data(rig: RigSpec, detail: dict[str, Any]) -> dict[str, Any]:
-    identity = _factory_identity(detail, rig)
+def _replacement_policy_data(
+    rig: RigSpec,
+    detail: dict[str, Any],
+    *,
+    identity: FactoryTaskIdentity | None = None,
+) -> dict[str, Any]:
+    identity = identity if identity is not None else _factory_identity(detail, rig)
     if identity.task_class not in {"implementation", "review"}:
         raise HermesCommandError(
             "recovery target is not a Factory implementation or review task"
@@ -940,8 +1114,13 @@ def _replacement_policy_data(rig: RigSpec, detail: dict[str, Any]) -> dict[str, 
     return policy
 
 
-def _replacement_policy_block(rig: RigSpec, detail: dict[str, Any]) -> str:
-    policy = _replacement_policy_data(rig, detail)
+def _replacement_policy_block(
+    rig: RigSpec,
+    detail: dict[str, Any],
+    *,
+    identity: FactoryTaskIdentity | None = None,
+) -> str:
+    policy = _replacement_policy_data(rig, detail, identity=identity)
     payload = _REPLACEMENT_POLICY_PREFIX + json.dumps(
         policy, sort_keys=True, separators=(",", ":")
     )
@@ -1533,12 +1712,12 @@ def _validate_recovery_plan(
     if plan.target_task_id in details:
         target_detail = details[plan.target_task_id]
         # Re-derive both facts that authorise destruction instead of trusting the
-        # recovery card: the target must be a Factory-authored card, and it must carry
-        # Hermes's own terminal evidence for the class the plan claims. That evidence is
-        # genuine Hermes lifecycle state on another task; the authorship signal is only
+        # recovery card: the target must be Factory work, and it must carry Hermes's own
+        # terminal evidence for the class the plan claims. That evidence is genuine
+        # Hermes lifecycle state on another task; the authorship signal is only
         # the cooperative one described in OPERATIONS.md.
-        _require_factory_authored(
-            target_detail, f"recovery target {plan.target_task_id}"
+        proven_identity = _require_proven_factory_identity(
+            client, rig, target_detail, f"recovery target {plan.target_task_id}"
         )
         # Only a parked target can be recovered. Resolving a card writes no terminal
         # event (`unblock` records `unblocked`, a parent promotion records `promoted`),
@@ -1583,9 +1762,12 @@ def _validate_recovery_plan(
                 raise StaleRecoveryDecision(
                     f"recovery target {plan.target_task_id} no longer has the triggering unknown stall"
                 )
-        if _factory_identity(target_detail, rig) != target_identity:
+        if proven_identity != target_identity:
             raise HermesCommandError("recovery target identity no longer matches its policy")
-        if _replacement_policy_data(rig, target_detail) != policy:
+        if (
+            _replacement_policy_data(rig, target_detail, identity=proven_identity)
+            != policy
+        ):
             raise HermesCommandError("recovery replacement policy no longer matches its target")
     elif surviving_superseded:
         # Without a live target there is no way to re-derive the timeout precondition,
@@ -1600,9 +1782,10 @@ def _validate_recovery_plan(
     for task_id in surviving_superseded:
         # The destroyed set must never be selected by the free-form ``created_by`` flag
         # either: every card this pass may archive or purge has to prove Factory
-        # authorship the same way the target does.
-        _require_factory_authored(details[task_id], f"superseded task {task_id}")
-        identity = _factory_identity(details[task_id], rig)
+        # authorship the same way the target does, from Hermes's own records.
+        identity = _require_proven_factory_identity(
+            client, rig, details[task_id], f"superseded task {task_id}"
+        )
         expected_class = (
             target_class if task_id == plan.target_task_id else paired_class
         )
@@ -1897,7 +2080,9 @@ def _unknown_target_detail(
     )
     if detail["task"].get("id") != plan.target_task_id:
         raise HermesCommandError("unknown recovery target did not resolve exactly")
-    _require_factory_authored(detail, f"unknown recovery target {plan.target_task_id}")
+    _require_proven_factory_identity(
+        client, rig, detail, f"unknown recovery target {plan.target_task_id}"
+    )
     task = detail["task"]
     key = task.get("idempotency_key")
     contract = parse_audit_contract(task.get("body"))
@@ -2212,7 +2397,7 @@ def reconcile_board(
             # loop: the protocol stops here and the operator sees a precise report.
             classification_failures.append(f"recovery card {label} is blocked")
             continue
-        if created_by != "hermes-factory":
+        if created_by != "hermes-factory" and created_by != coordinator_profile:
             continue
         task_id = task.get("id")
         label = (
@@ -2228,6 +2413,14 @@ def reconcile_board(
                 rig.board.slug,
                 _task_show(client.run_json(board + ["show", task_id, "--json"])),
             )
+            identity = None
+            if created_by != "hermes-factory":
+                # A card the coordinator profile owns is Factory work only when
+                # Hermes's own records prove a Factory recovery run created it: the
+                # free-form ``created_by`` flag alone never selects what is recovered.
+                identity = _replacement_identity(client, rig, detail)
+                if identity is None:
+                    continue
             classified = _classify_blocked_factory_task(detail, rig)
             if classified is None:
                 continue
@@ -2241,6 +2434,7 @@ def reconcile_board(
                 stall_class=stall_class,
                 fixture_recovery=fixture_recovery,
                 recovery_runtime=recovery_runtime,
+                identity=identity,
             )
         except Exception as exc:  # noqa: BLE001 - per-card barrier, reported below
             # One anomalous blocked card must not wedge every other recovery in the

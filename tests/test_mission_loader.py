@@ -252,6 +252,16 @@ def test_mission_may_tighten_human_acceptance(no_proof_rig: Path, tmp_path: Path
     assert mission.human_acceptance is True
 
 
+def test_mission_tightening_human_acceptance_requires_declared_authority(
+    valid_rig: Path, tmp_path: Path
+):
+    rig = load_rig(valid_rig)
+    text = _BASE.replace("workflow: delivery", "workflow: delivery\nhuman_acceptance: true")
+
+    with pytest.raises(SpecError, match="decision_authority"):
+        load_mission(_write(tmp_path, text), rig)
+
+
 def test_mission_may_not_weaken_human_acceptance(human_rig: Path, tmp_path: Path):
     rig = load_rig(human_rig)
     text = _BASE.replace("workflow: delivery", "workflow: delivery\nhuman_acceptance: false")
@@ -265,7 +275,8 @@ def no_proof_rig(valid_rig: Path) -> Path:
     rig = valid_rig.parent / "no-proof-rig.yaml"
     rig.write_text(
         valid_rig.read_text(encoding="utf-8").replace(
-            "require_proof: true", "require_proof: false"
+            "require_proof: true",
+            "require_proof: false, decision_authority: coordinator",
         ),
         encoding="utf-8",
     )
@@ -277,7 +288,8 @@ def human_rig(valid_rig: Path) -> Path:
     rig = valid_rig.parent / "human-rig.yaml"
     rig.write_text(
         valid_rig.read_text(encoding="utf-8").replace(
-            "human_acceptance: false", "human_acceptance: true"
+            "human_acceptance: false",
+            "human_acceptance: true, decision_authority: human",
         ),
         encoding="utf-8",
     )

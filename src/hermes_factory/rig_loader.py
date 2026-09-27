@@ -296,6 +296,14 @@ def load_rig(path: Path) -> RigSpec:
     _validate_keys(
         policies, _POLICY_KEYS, "policies", required=_POLICY_REQUIRED_KEYS
     )
+    human_acceptance = _boolean(policies["human_acceptance"], "policies.human_acceptance")
+    decision_authority_declared = "decision_authority" in policies
+    if human_acceptance and not decision_authority_declared:
+        # The operator gate exists only as an explicitly configured stop, so an
+        # omitted authority must not silently decide the human boundary either way.
+        raise SpecError(
+            "policies.human_acceptance: true requires an explicit policies.decision_authority"
+        )
 
     return RigSpec(
         version=version,
@@ -313,9 +321,7 @@ def load_rig(path: Path) -> RigSpec:
         notifications=_load_notifications(data.get("notifications")),
         policies=PolicySpec(
             require_proof=_boolean(policies["require_proof"], "policies.require_proof"),
-            human_acceptance=_boolean(
-                policies["human_acceptance"], "policies.human_acceptance"
-            ),
+            human_acceptance=human_acceptance,
             max_retries=_positive_integer(
                 policies["max_retries"], "policies.max_retries"
             ),
@@ -324,10 +330,11 @@ def load_rig(path: Path) -> RigSpec:
                 policies["completion_contract"], "policies.completion_contract"
             ),
             decision_authority=_choice(
-                policies.get("decision_authority", "human"),
+                policies.get("decision_authority", "coordinator"),
                 "policies.decision_authority",
                 {"coordinator", "human"},
             ),
+            decision_authority_declared=decision_authority_declared,
             git_commit_policy=_choice(
                 policies.get("git_commit_policy", "off"),
                 "policies.git_commit_policy",

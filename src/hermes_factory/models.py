@@ -41,6 +41,7 @@ class PolicySpec:
     max_runtime: str
     completion_contract: str
     decision_authority: str
+    decision_authority_declared: bool
     git_commit_policy: str
     fixture_recovery: bool
 

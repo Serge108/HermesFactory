@@ -50,15 +50,25 @@ slices:
 
 
 @pytest.fixture
-def rig(valid_rig: Path):
-    return load_rig(valid_rig)
+def rig(valid_rig: Path, tmp_path: Path):
+    # A mission that requests human acceptance must be loaded against a rig that
+    # declares its authority explicitly, so the fixture declares the coordinator.
+    declared = tmp_path / "rig-declared.yaml"
+    declared.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "completion_contract: local-only}",
+            "completion_contract: local-only, decision_authority: coordinator}",
+        ),
+        encoding="utf-8",
+    )
+    return load_rig(declared)
 
 
 @pytest.fixture
-def mission(valid_rig: Path, tmp_path: Path):
+def mission(rig, tmp_path: Path):
     path = tmp_path / "mission.yaml"
     path.write_text(_MISSION_YAML, encoding="utf-8")
-    return load_mission(path, load_rig(valid_rig))
+    return load_mission(path, rig)
 
 
 @pytest.fixture
@@ -195,7 +205,7 @@ def test_implementation_body_completes_parent_to_release_review_child(
     assert "kanban_request_review" not in body
     assert "metadata" in body
     assert "attachment" in body
-    assert "block" in body
+    assert "do not request input, permission, approval, or confirmation from the operator" in body
     assert "terminal message" in body
 
 
@@ -208,6 +218,50 @@ def test_worker_body_routes_failure_limit_to_coordinator_decomposition(
     assert "Failure limit: 2 consecutive non-successful runs" in body
     assert "the coordinator must decompose it into smaller sequential tasks" in body
     assert "remove the superseded card" in body
+
+
+def test_coordinator_authority_never_routes_workers_to_the_operator(
+    valid_rig: Path, mission, implement
+):
+    valid_rig.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "completion_contract: local-only}",
+            "completion_contract: local-only, decision_authority: coordinator}",
+        ),
+        encoding="utf-8",
+    )
+    coordinator_rig = load_rig(valid_rig)
+    bodies = [
+        render_implementation_body(coordinator_rig, mission, implement),
+        render_review_body(coordinator_rig, mission, implement),
+        render_acceptance_body(coordinator_rig, mission),
+    ]
+
+    for body in bodies:
+        lowered = body.lower()
+        assert "do not request input, permission, approval, or confirmation from the operator" in lowered
+        assert "manual decision for the operator" not in lowered
+        assert "product and acceptance decisions remain with the human operator" not in lowered
+        assert "choose the safest reversible or non-destructive option" in lowered
+
+
+def test_human_authority_keeps_only_the_explicit_acceptance_gate(
+    valid_rig: Path, mission, implement
+):
+    valid_rig.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "completion_contract: local-only}",
+            "completion_contract: local-only, decision_authority: human}",
+        ),
+        encoding="utf-8",
+    )
+    human_rig = load_rig(valid_rig)
+    implementation = render_implementation_body(human_rig, mission, implement).lower()
+    acceptance = render_acceptance_body(human_rig, mission).lower()
+
+    assert "human gate" not in implementation
+    assert "# human gate" in acceptance
+    assert "until a human operator completes it" in acceptance
 
 
 @pytest.mark.parametrize("renderer", [render_implementation_body, render_review_body])
@@ -284,6 +338,32 @@ def test_acceptance_body_without_human_gate_omits_blocked_task(rig, tmp_path):
 
     assert "The requested behavior exists." in body
     assert "human gate" not in body.lower()
+
+
+def test_human_authority_without_explicit_gate_keeps_acceptance_autonomous(
+    valid_rig: Path, tmp_path: Path
+):
+    valid_rig.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "completion_contract: local-only}",
+            "completion_contract: local-only, decision_authority: human}",
+        ),
+        encoding="utf-8",
+    )
+    human_rig = load_rig(valid_rig)
+    path = tmp_path / "mission.yaml"
+    path.write_text(
+        _MISSION_YAML.replace("human_acceptance: true", "human_acceptance: false"),
+        encoding="utf-8",
+    )
+    loaded = load_mission(path, human_rig)
+
+    body = render_acceptance_body(human_rig, loaded).lower()
+
+    assert "# human gate" not in body
+    assert "the operator for mission completion" not in body
+    assert "do not request input, permission, approval, or confirmation from the operator" in body
+    assert "this mission has no explicit human gate" in body
 
 
 def test_commit_body_requires_local_commit_metadata_and_forbids_push(

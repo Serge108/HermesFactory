@@ -36,6 +36,20 @@ def test_load_rig_preserves_windows_path_with_spaces(tmp_path: Path):
     assert rig.workflows["delivery"].review_seat == "reviewer"
 
 
+def test_load_rig_defaults_decision_authority_to_coordinator(tmp_path: Path):
+    rig = load_rig(write_rig(tmp_path, cwd="."))
+
+    assert rig.policies.decision_authority == "coordinator"
+
+
+def test_load_rig_requires_explicit_authority_with_human_acceptance(tmp_path: Path):
+    spec = write_rig(tmp_path, cwd=".")
+    replace_in_rig(spec, "human_acceptance: false", "human_acceptance: true")
+
+    with pytest.raises(SpecError, match="decision_authority"):
+        load_rig(spec)
+
+
 def test_load_rig_rejects_unknown_workflow_seat(tmp_path: Path):
     spec = write_rig(tmp_path, cwd=".")
     text = spec.read_text(encoding="utf-8").replace("review_seat: reviewer", "review_seat: missing")

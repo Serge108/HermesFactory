@@ -42,6 +42,15 @@ def test_taxonomy_covers_timeout_capability_dispatch_dependency_and_human_classe
         "unknown_operational_stall",
     }
     assert classes["worker_timeout"].automatic is True
+    unknown = classes["unknown_operational_stall"]
+    assert unknown.automatic is True
+    assert unknown.recovery_owner == "coordinator"
+    assert "structured outcome" in unknown.recovery
+    assert "new taxonomy" not in unknown.recovery.lower()
+    assert "operator" not in unknown.fallback.lower()
+    assert unknown.regression_test == (
+        "test_reconcile_routes_unclassified_block_to_coordinator"
+    )
     assert (
         classes["recovery_coordinator_insufficient_kanban_authority"].recovery_owner
         == "factory"

@@ -176,6 +176,12 @@ def load_mission(path: Path, rig: RigSpec) -> MissionSpec:
         if not value and rig.policies.human_acceptance:
             raise SpecError("mission may not weaken human_acceptance from the rig policy")
         human_acceptance = value
+    if human_acceptance and not rig.policies.decision_authority_declared:
+        # A mission that requests the human stop must say which authority the rig
+        # grants; an omitted authority must not silently decide that boundary.
+        raise SpecError(
+            "mission human_acceptance: true requires an explicit policies.decision_authority in the rig"
+        )
 
     acceptance = _string_list(data["acceptance"], "mission.acceptance")
     if not acceptance:

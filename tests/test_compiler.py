@@ -42,8 +42,18 @@ slices:
 
 
 @pytest.fixture
-def rig(valid_rig: Path):
-    return load_rig(valid_rig)
+def rig(valid_rig: Path, tmp_path: Path):
+    # A mission that requests human acceptance must be loaded against a rig that
+    # declares its authority explicitly.
+    declared = tmp_path / "rig-declared.yaml"
+    declared.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "completion_contract: local-only}",
+            "completion_contract: local-only, decision_authority: coordinator}",
+        ),
+        encoding="utf-8",
+    )
+    return load_rig(declared)
 
 
 @pytest.fixture
@@ -98,8 +108,18 @@ def test_acceptance_task_depends_on_all_review_tasks(rig, single_slice_mission):
     assert acceptance.idempotency_key == "factory:demo:demo-mission:acceptance"
 
 
-def test_human_acceptance_makes_acceptance_task_blocked(rig, single_slice_mission):
-    plan = compile_mission(rig, single_slice_mission)
+def test_human_acceptance_makes_acceptance_task_blocked(
+    valid_rig: Path, single_slice_mission
+):
+    valid_rig.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "completion_contract: local-only}",
+            "completion_contract: local-only, decision_authority: human}",
+        ),
+        encoding="utf-8",
+    )
+    human_rig = load_rig(valid_rig)
+    plan = compile_mission(human_rig, single_slice_mission)
     acceptance = plan.tasks[2]
 
     assert acceptance.initial_status == "blocked"
@@ -146,6 +166,30 @@ def test_no_human_acceptance_yields_unblocked_acceptance_task(
 
     assert acceptance.initial_status is None
     assert acceptance.profile == "builder"
+
+
+def test_human_authority_without_human_acceptance_still_assigns_acceptance(
+    valid_rig: Path, tmp_path: Path
+):
+    valid_rig.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "completion_contract: local-only}",
+            "completion_contract: local-only, decision_authority: human}",
+        ),
+        encoding="utf-8",
+    )
+    text = _TWO_SLICES.replace("human_acceptance: true", "human_acceptance: false").split(
+        "  - id: polish"
+    )[0]
+    path = tmp_path / "mission.yaml"
+    path.write_text(text, encoding="utf-8")
+    human_rig = load_rig(valid_rig)
+
+    acceptance = compile_mission(human_rig, load_mission(path, human_rig)).tasks[2]
+
+    assert acceptance.initial_status is None
+    assert acceptance.profile == "builder"
+    assert "the operator for mission completion" not in acceptance.body.lower()
 
 
 def test_coordinator_authority_adds_reviewed_commit_gate_and_removes_human_stop(

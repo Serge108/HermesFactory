@@ -416,6 +416,13 @@ slices:
 def test_mission_plan_compiles_dependent_slices_end_to_end(
     valid_rig: Path, tmp_path: Path, capsys
 ):
+    valid_rig.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "completion_contract: local-only}",
+            "completion_contract: local-only, decision_authority: human}",
+        ),
+        encoding="utf-8",
+    )
     mission_path = tmp_path / "mission.yaml"
     mission_path.write_text(_MULTI_SLICE_MISSION, encoding="utf-8")
     hermes_calls: list[list[str]] = []

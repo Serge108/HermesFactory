@@ -204,6 +204,13 @@ def test_mission_tasks_are_created_in_dependency_order_with_flags(plan):
 def test_human_acceptance_blocks_acceptance_task_without_assignee(
     valid_rig: Path, tmp_path: Path
 ):
+    valid_rig.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "completion_contract: local-only}",
+            "completion_contract: local-only, decision_authority: human}",
+        ),
+        encoding="utf-8",
+    )
     rig = load_rig(valid_rig)
     path = tmp_path / "mission.yaml"
     path.write_text(

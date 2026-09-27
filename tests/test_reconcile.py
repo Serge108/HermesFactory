@@ -12,6 +12,7 @@ from hermes_factory.reconcile import (
     reconcile_board,
 )
 from hermes_factory.rig_loader import load_rig
+from hermes_factory.task_templates import REVIEW_REJECTION_PREFIX
 
 
 def _audit_body(task_class: str, slice_id: str = "original") -> str:
@@ -44,13 +45,18 @@ def _audit_body(task_class: str, slice_id: str = "original") -> str:
     )
 
 
-def _replacement_policy_body() -> str:
+def _replacement_policy_body(
+    *,
+    source_slice: str = "original",
+    incoming: tuple[str, ...] = ("parent",),
+    source_class: str = "implementation",
+) -> str:
     policy = {
         "project": "demo",
         "mission": "demo-mission",
-        "source_slice": "original",
+        "source_slice": source_slice,
         "workflow": "delivery",
-        "incoming_parent_ids": ["parent"],
+        "incoming_parent_ids": list(incoming),
         "workspace_kind": "dir",
         "workspace_path": "F:/Project With Space",
         "max_retries": 2,
@@ -69,7 +75,7 @@ def _replacement_policy_body() -> str:
             "mission": "Demo mission: preserve the mission intent.",
         },
         "source_audit_contract": {
-            "task_class": "implementation",
+            "task_class": source_class,
             "required_commands": [],
             "required_artifacts": [],
             "changed_files_required": False,
@@ -95,6 +101,7 @@ def _factory_detail(
     created_by: str = "hermes-factory",
     creator_task_id: str | None = None,
     gave_up: bool = False,
+    status: str = "todo",
 ) -> dict[str, object]:
     events: list[dict[str, object]] = [
         {
@@ -115,7 +122,9 @@ def _factory_detail(
             "id": task_id,
             "title": f"{task_class.title()} demo",
             "body": _audit_body(task_class, slice_id),
-            "status": "todo",
+            # Hermes parks a card the failure breaker gave up on as blocked; a plain
+            # backlog card stays todo.
+            "status": "blocked" if gave_up else status,
             "assignee": assignee,
             "created_by": created_by,
             "idempotency_key": (
@@ -142,14 +151,24 @@ def _completed_recovery(
     rewires: list[dict[str, str]],
     superseded: list[str],
     worker_session_id: str | None = None,
+    target: str = "old-impl",
+    reason_code: str = "worker_timeout",
+    policy_body: str | None = None,
+    event_time: int = 200,
 ) -> tuple[dict[str, object], dict[str, object]]:
     recovery = {
         "id": "recovery-1",
         "title": "Decompose blocked task old-impl",
-        "body": "Superseded task: old-impl\n\n" + _replacement_policy_body(),
+        "body": (
+            f"Superseded task: {target}\nReason code: {reason_code}\n\n"
+            + (policy_body if policy_body is not None else _replacement_policy_body())
+        ),
         "status": "done",
         "created_by": "hermes-factory-reconciler",
-        "idempotency_key": "factory:demo:reconcile:old-impl:gave-up:200",
+        "idempotency_key": (
+            f"factory:demo:reconcile:{target}:"
+            f"{reconcile_module._KEY_TOKENS[reason_code]}:{event_time}"
+        ),
     }
     detail = {
         "task": recovery,
@@ -232,13 +251,19 @@ class StatefulRecoveryClient:
         if tail == ["list", "--status", "blocked", "--json"]:
             return []
         if tail == ["list", "--status", "done", "--json"]:
-            return [detail["task"] for detail in self.recoveries.values()]
+            return [
+                detail["task"]
+                for detail in self.recoveries.values()
+                if detail["task"]["status"] != "archived"
+            ]
         if tail[:1] == ["show"] and tail[1] in self.recoveries:
             return self.recoveries[tail[1]]
         if tail[:1] == ["show"]:
             return self.details[tail[1]]
         if tail == ["list", "--archived", "--json"]:
-            return [detail["task"] for detail in self.details.values()]
+            return [
+                detail["task"] for detail in self.recoveries.values()
+            ] + [detail["task"] for detail in self.details.values()]
         raise AssertionError(args)
 
     def run(self, args: list[str]) -> str:
@@ -277,7 +302,10 @@ class StatefulRecoveryClient:
                 raise HermesCommandError("simulated interruption after purge")
         elif tail[:1] == ["archive"]:
             for task_id in tail[1:]:
-                self.details[task_id]["task"]["status"] = "archived"
+                if task_id in self.recoveries:
+                    self.recoveries[task_id]["task"]["status"] = "archived"
+                else:
+                    self.details[task_id]["task"]["status"] = "archived"
         elif tail[:2] == ["comment", self.recovery["id"]]:
             self.recovery_detail["comments"].append(
                 {"body": tail[2], "author": tail[4]}
@@ -530,20 +558,113 @@ def test_reconcile_reads_factory_key_from_authoritative_task_record_when_show_om
     assert client.task_record_calls == [("demo-rig", "task-1")]
 
 
-def test_reconcile_ignores_manual_blocks_and_reconciler_tasks(valid_rig: Path):
-    manual = _blocked_task("manual-1")
-    manual["last_failure_error"] = None
-    recovery = _blocked_task("recovery-1")
-    recovery["created_by"] = "hermes-factory-reconciler"
+def test_reconcile_routes_unclassified_block_to_coordinator(valid_rig: Path):
+    unknown = _blocked_task("unknown-1")
+    unknown["last_failure_error"] = None
     client = FakeReconcileClient(
         [
-            [manual, recovery],
+            [unknown],
             {
-                "task": manual,
+                "task": unknown,
                 "parents": [],
                 "children": [],
                 "comments": [],
-                "events": [{"kind": "blocked", "created_at": 100, "run_id": None}],
+                "events": [
+                    {
+                        "kind": "blocked",
+                        "created_at": 100,
+                        "run_id": 9,
+                        "payload": {"reason": "Need somebody to run a script"},
+                    }
+                ],
+                "runs": [],
+            },
+            {
+                "id": "unknown-recovery-1",
+                "status": "ready",
+                "title": "Resolve unknown blocked task unknown-1",
+            },
+            [],
+        ]
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.scanned == 1
+    assert result.eligible == 1
+    assert result.recovery_task_ids == {"unknown-1": "unknown-recovery-1"}
+    create = client.json_calls[2]
+    assert create[:5] == [
+        "kanban",
+        "--board",
+        "demo-rig",
+        "create",
+        "Resolve unknown blocked task unknown-1",
+    ]
+    assert _flag_value(create, "--assignee") == "builder"
+    assert _flag_value(create, "--idempotency-key") == (
+        "factory:demo:reconcile:unknown-1:unknown-stall:100"
+    )
+    body = _flag_value(create, "--body")
+    assert "Reason code: unknown_operational_stall" in body
+    assert "Need somebody to run a script" in body
+    assert "resume" in body
+    assert "retry" in body
+    assert "replace" in body
+    assert "reassign" in body
+    assert "decompose" in body
+    assert "terminate" in body
+    assert "Do not create a new taxonomy class" in body
+
+
+def test_reconcile_skips_explicit_human_acceptance_gate(valid_rig: Path):
+    valid_rig.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "human_acceptance: false,",
+            "human_acceptance: true, decision_authority: human,",
+        ),
+        encoding="utf-8",
+    )
+    body = (
+        "# Project\nDemo\n\n# Mission\nDemo mission\n\n# Acceptance\n- approve\n\n"
+        "# Proof required\n- none\n\n"
+        "<!-- hermes-factory:audit-contract -->\n"
+        'Factory audit contract: {"task_class":"acceptance","required_commands":[],'
+        '"required_artifacts":[],"changed_files_required":false,"required_metadata":[]}\n'
+        "<!-- /hermes-factory:audit-contract -->\n\n"
+        "# Scope boundaries\nProject demo; mission demo-mission; workflow delivery.\n\n"
+        "<!-- hermes-factory:human-gate -->\n# Human gate\nExplicit acceptance.\n\n"
+        "# Handoff\nNext target: operator."
+    )
+    gate = {
+        **_blocked_task("gate-1"),
+        "title": "Accept demo mission",
+        "body": body,
+        "assignee": None,
+        "idempotency_key": "factory:demo:demo-mission:acceptance",
+        "last_failure_error": None,
+    }
+    client = FakeReconcileClient(
+        [
+            [gate],
+            {
+                "task": gate,
+                "parents": ["review-1"],
+                "children": [],
+                "comments": [],
+                "events": [
+                    {
+                        "kind": "created",
+                        "created_at": 90,
+                        "payload": {"creator_task_id": None},
+                    },
+                    {
+                        "kind": "blocked",
+                        "created_at": 100,
+                        "run_id": None,
+                        "payload": {"reason": "human acceptance"},
+                    }
+                ],
                 "runs": [],
             },
             [],
@@ -552,13 +673,276 @@ def test_reconcile_ignores_manual_blocks_and_reconciler_tasks(valid_rig: Path):
 
     result = reconcile_board(client, load_rig(valid_rig))
 
-    assert result.scanned == 2
     assert result.eligible == 0
     assert result.recovery_task_ids == {}
-    assert len(client.json_calls) == 3
-    assert client.json_calls[-1] == [
-        "kanban", "--board", "demo-rig", "list", "--status", "done", "--json"
+    assert not any(call[3] == "create" for call in client.json_calls)
+
+
+class UnreadableChildClient(StatefulRecoveryClient):
+    """Answers one child's ``show`` with something that proves neither graph state."""
+
+    def __init__(
+        self,
+        recovery: dict[str, object],
+        recovery_detail: dict[str, object],
+        details: list[dict[str, object]],
+        child_state: str,
+    ) -> None:
+        super().__init__(recovery, recovery_detail, details)
+        self.child_state = child_state
+
+    def run_json(self, args: list[str]) -> object:
+        if args[3:4] == ["show"] and "downstream-1" in args:
+            if self.child_state == "unreadable":
+                return "not json"
+            return {
+                "task": {"id": "someone-else"},
+                "parents": [],
+                "children": [],
+                "events": [],
+            }
+        return super().run_json(args)
+
+
+class UnknownResumeClient:
+    def __init__(self, action: str = "resume", landing_status: str = "ready") -> None:
+        self.landing_status = landing_status
+        self.run_calls: list[list[str]] = []
+        self.target = {
+            "task": _blocked_task("unknown-1"),
+            "parents": [],
+            "children": [],
+            "comments": [],
+            "events": [
+                {"kind": "created", "payload": {"creator_task_id": None}},
+                {
+                    "kind": "blocked",
+                    "created_at": 100,
+                    "run_id": 9,
+                    "payload": {"reason": "Need a coordinator decision"},
+                },
+            ],
+            "runs": [],
+        }
+        self.recovery = {
+            "task": {
+                "id": "unknown-recovery-1",
+                "title": "Resolve unknown blocked task unknown-1",
+                "body": "Reason code: unknown_operational_stall\nSuperseded task: unknown-1",
+                "status": "done",
+                "created_by": "hermes-factory-reconciler",
+                "idempotency_key": "factory:demo:reconcile:unknown-1:unknown-stall:100",
+            },
+            "parents": [],
+            "children": [],
+            "comments": [],
+            "events": [
+                {"kind": "created", "created_at": 150, "payload": {"creator_task_id": None}},
+                {
+                    "kind": "completed",
+                    "created_at": 200,
+                    "run_id": 20,
+                    # Hermes omits `verified_cards` entirely when no card was created.
+                    "payload": {"result_len": 0, "summary": "Recovered without new cards."},
+                },
+            ],
+            "runs": [
+                {
+                    "id": 20,
+                    "status": "done",
+                    "outcome": "completed",
+                    "metadata": {
+                        "action": action,
+                        "target_task_id": "unknown-1",
+                        "decision": "Run the safe script and continue.",
+                        "assignee": None,
+                        "replacement_task_ids": [],
+                        "rewires": [],
+                        "superseded_task_ids": [],
+                        "limitations": [],
+                    },
+                }
+            ],
+        }
+
+    def run_json(self, args: list[str]) -> object:
+        tail = args[3:]
+        if tail == ["list", "--status", "blocked", "--json"]:
+            return []
+        if tail == ["list", "--status", "done", "--json"]:
+            if self.recovery["task"]["status"] == "archived":
+                return []
+            return [self.recovery["task"]]
+        if tail == ["list", "--archived", "--json"]:
+            return [self.recovery["task"], self.target["task"]]
+        if tail == ["show", "unknown-recovery-1", "--json"]:
+            return self.recovery
+        if tail == ["show", "unknown-1", "--json"]:
+            return self.target
+        raise AssertionError(args)
+
+    def run(self, args: list[str]) -> str:
+        self.run_calls.append(args)
+        tail = args[3:]
+        if tail[:2] == ["unblock", "unknown-1"]:
+            self.target["task"]["status"] = self.landing_status
+            self.target["events"].append(
+                {
+                    "kind": "unblocked",
+                    "created_at": 201,
+                    "payload": {
+                        "status": self.landing_status,
+                        "resume_status": "review",
+                        "reason": tail[3],
+                    },
+                }
+            )
+        elif tail[:2] == ["comment", "unknown-recovery-1"]:
+            self.recovery["comments"].append({"body": tail[2], "author": tail[4]})
+        elif tail == ["archive", "unknown-recovery-1"]:
+            self.recovery["task"]["status"] = "archived"
+        else:
+            raise AssertionError(args)
+        return ""
+
+
+@pytest.mark.parametrize("action", ["resume", "retry"])
+def test_unknown_recovery_resume_and_retry_unblock_target(
+    valid_rig: Path, action: str
+):
+    client = UnknownResumeClient(action)
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ("unknown-recovery-1",)
+    assert [
+        "kanban",
+        "--board",
+        "demo-rig",
+        "unblock",
+        "unknown-1",
+        "--reason",
+        "Run the safe script and continue.",
+    ] in client.run_calls
+    assert client.target["task"]["status"] == "ready"
+
+
+def test_unknown_recovery_termination_is_idempotent_for_archived_leaf(
+    valid_rig: Path,
+):
+    class TerminateClient(UnknownResumeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            metadata = self.recovery["runs"][0]["metadata"]
+            metadata["action"] = "terminate"
+            metadata["decision"] = "No safe in-scope continuation exists."
+
+        def run_json(self, args: list[str]) -> object:
+            tail = args[3:]
+            if tail == ["list", "--archived", "--json"]:
+                return [
+                    {
+                        "id": "unknown-1",
+                        "status": self.target["task"]["status"],
+                    }
+                ]
+            return super().run_json(args)
+
+        def run(self, args: list[str]) -> str:
+            tail = args[3:]
+            if tail == ["archive", "unknown-1"]:
+                self.run_calls.append(args)
+                self.target["task"]["status"] = "archived"
+                self.target["events"].append(
+                    {"kind": "archived", "created_at": 202, "payload": {}}
+                )
+                return ""
+            return super().run(args)
+
+    client = TerminateClient()
+
+    first = reconcile_board(client, load_rig(valid_rig))
+    second = reconcile_board(client, load_rig(valid_rig))
+
+    assert first.finalized_recovery_task_ids == ("unknown-recovery-1",)
+    assert second.finalized_recovery_task_ids == ("unknown-recovery-1",)
+    assert client.target["task"]["status"] == "archived"
+    assert sum(call[3:] == ["archive", "unknown-1"] for call in client.run_calls) == 1
+
+
+def test_unknown_recovery_reassigns_to_configured_profile_then_unblocks(
+    valid_rig: Path,
+):
+    class ReassignClient(UnknownResumeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            metadata = self.recovery["runs"][0]["metadata"]
+            metadata["action"] = "reassign"
+            metadata["assignee"] = "reviewer"
+
+        def run(self, args: list[str]) -> str:
+            tail = args[3:]
+            if tail[:2] == ["reassign", "unknown-1"]:
+                self.run_calls.append(args)
+                self.target["task"]["assignee"] = tail[2]
+                self.target["events"].append(
+                    {"kind": "assigned", "created_at": 200, "payload": {"assignee": tail[2]}}
+                )
+                return ""
+            return super().run(args)
+
+    client = ReassignClient()
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ("unknown-recovery-1",)
+    assert client.target["task"]["assignee"] == "reviewer"
+    assert any(call[3] == "reassign" for call in client.run_calls)
+
+
+def test_unknown_recovery_rejects_reassignment_outside_rig(valid_rig: Path):
+    client = UnknownResumeClient()
+    metadata = client.recovery["runs"][0]["metadata"]
+    metadata["action"] = "reassign"
+    metadata["assignee"] = "unconfigured-profile"
+
+    with pytest.raises(HermesCommandError, match="not a configured rig profile"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert not any(call[3] in {"reassign", "unblock"} for call in client.run_calls)
+
+
+def test_stale_unknown_recovery_decision_is_disposed_once_without_mutation(
+    valid_rig: Path,
+):
+    client = UnknownResumeClient()
+    client.target["events"].append(
+        {
+            "kind": "blocked",
+            "created_at": 101,
+            "run_id": 10,
+            "payload": {"reason": "newer incident"},
+        }
+    )
+
+    first = reconcile_board(client, load_rig(valid_rig))
+
+    assert first.finalized_recovery_task_ids == ()
+    assert not any(call[3] == "unblock" for call in client.run_calls)
+    disposals = [
+        call for call in client.run_calls if call[3] in {"archive", "comment"}
     ]
+    assert [call[3] for call in disposals] == ["archive", "comment"]
+    assert "recovery-rejected" in disposals[1][5]
+    assert "stale" in disposals[1][5]
+    assert client.recovery["task"]["status"] == "archived"
+
+    second = reconcile_board(client, load_rig(valid_rig))
+
+    assert second.finalized_recovery_task_ids == ()
+    assert [
+        call for call in client.run_calls if call[3] in {"archive", "comment"}
+    ] == disposals
 
 
 def test_reconcile_dispatches_only_ready_recovery_tasks(valid_rig: Path):
@@ -1640,10 +2024,7 @@ def test_reconcile_rejects_extra_rewire_declaration(valid_rig: Path):
     assert client.run_calls == []
 
 
-@pytest.mark.parametrize("proof", ["none", "stale"])
-def test_reconcile_rejects_unproven_missing_external_edge(
-    valid_rig: Path, proof: str
-):
+def test_reconcile_rejects_unproven_missing_external_edge(valid_rig: Path):
     recovery, recovery_detail = _completed_recovery(
         replacements=["new-impl", "new-review"],
         rewires=[
@@ -1655,22 +2036,13 @@ def test_reconcile_rejects_unproven_missing_external_edge(
         ],
         superseded=["old-impl", "old-review"],
     )
-    events: list[dict[str, object]] = []
-    if proof == "stale":
-        events.append(
-            {
-                "kind": "unlinked",
-                "created_at": 199,
-                "payload": {"parent": "old-review", "child": "downstream"},
-            }
-        )
     client = StatefulRecoveryClient(
         recovery,
         recovery_detail,
         [
             *_replacement_pair(review_children=["downstream"]),
             *_superseded_pair(),
-            _downstream_detail(["new-review"], events),
+            _downstream_detail(["new-review"]),
         ],
     )
 
@@ -1678,6 +2050,49 @@ def test_reconcile_rejects_unproven_missing_external_edge(
         reconcile_board(client, load_rig(valid_rig))
 
     assert client.run_calls == []
+
+
+def test_reconcile_accepts_unlink_recorded_before_the_plan_completed(valid_rig: Path):
+    """An unlink left by an earlier interrupted pass still satisfies the rewire.
+
+    The record is not time-boxed: a rewire depends on live graph state, and Hermes's
+    unlinked event on the child for this exact edge is what separates a real removal
+    from an edge that vanished because the old parent was purged.
+    """
+    recovery, recovery_detail = _completed_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[
+            {
+                "old_parent": "old-review",
+                "new_parent": "new-review",
+                "child": "downstream",
+            }
+        ],
+        superseded=["old-impl", "old-review"],
+    )
+    client = StatefulRecoveryClient(
+        recovery,
+        recovery_detail,
+        [
+            *_replacement_pair(review_children=["downstream"]),
+            *_superseded_pair(),
+            _downstream_detail(
+                ["new-review"],
+                [
+                    {
+                        "kind": "unlinked",
+                        "created_at": 199,
+                        "payload": {"parent": "old-review", "child": "downstream"},
+                    }
+                ],
+            ),
+        ],
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ("recovery-1",)
+    assert not any(call[3] == "unlink" for call in client.run_calls)
 
 
 def test_reconcile_accepts_retry_with_authoritative_unlink_record(valid_rig: Path):
@@ -1895,6 +2310,16 @@ def test_reconcile_finalizes_other_recoveries_when_one_plan_is_rejected(
         [*_replacement_pair(creator_task_id="recovery-2"), *_superseded_pair()],
         extra_recoveries=[(accepted_recovery, accepted_detail)],
     )
+    # recovery-2 answers the newer timeout incident recorded at 201; recovery-1 still
+    # answers the 200 incident, so only its own rejection is under test here.
+    client.details["old-impl"]["events"].append(
+        {
+            "kind": "gave_up",
+            "created_at": 201,
+            "run_id": 12,
+            "payload": {"trigger_outcome": "timed_out"},
+        }
+    )
 
     with pytest.raises(HermesCommandError, match="recovery-1"):
         reconcile_board(client, load_rig(valid_rig))
@@ -2027,6 +2452,15 @@ def test_reconcile_finalizes_other_recoveries_after_unexpected_error(
         broken_detail,
         [*_replacement_pair(creator_task_id="recovery-2"), *_superseded_pair()],
         extra_recoveries=[(accepted_recovery, accepted_detail)],
+    )
+    # recovery-2 answers the newer timeout incident recorded at 201.
+    client.details["old-impl"]["events"].append(
+        {
+            "kind": "gave_up",
+            "created_at": 201,
+            "run_id": 12,
+            "payload": {"trigger_outcome": "timed_out"},
+        }
     )
 
     with pytest.raises(HermesCommandError, match="worker body indexing failure"):
@@ -2254,9 +2688,1290 @@ def test_reconcile_continues_after_spec_error_in_one_recovery(
         [*_replacement_pair(creator_task_id="recovery-2"), *_superseded_pair()],
         extra_recoveries=[(accepted_recovery, accepted_detail)],
     )
+    # recovery-2 answers the newer timeout incident recorded at 201.
+    client.details["old-impl"]["events"].append(
+        {
+            "kind": "gave_up",
+            "created_at": 201,
+            "run_id": 12,
+            "payload": {"trigger_outcome": "timed_out"},
+        }
+    )
 
     with pytest.raises(HermesCommandError, match="simulated rig-level rejection"):
         reconcile_board(client, load_rig(valid_rig))
 
     assert any(call[3] == "archive" for call in client.run_calls)
     assert "old-impl" not in client.details
+
+
+def _rejected_review_detail(
+    review_id: str = "old-review",
+    *,
+    implementation_id: str = "old-impl",
+    reason: str | None = None,
+    run_id: int | None = 9,
+    status: str = "blocked",
+) -> dict[str, object]:
+    detail = _factory_detail(
+        review_id,
+        "review",
+        "original",
+        "reviewer",
+        parents=[implementation_id],
+        children=["downstream"],
+    )
+    detail["task"]["status"] = status
+    detail["events"] = [
+        {"kind": "created", "created_at": 100, "payload": {"creator_task_id": None}},
+        {"kind": "claimed", "created_at": 110, "run_id": run_id},
+        {
+            "kind": "blocked",
+            "created_at": 300,
+            "run_id": run_id,
+            "payload": {
+                "reason": reason
+                if reason is not None
+                else f"{REVIEW_REJECTION_PREFIX} proof command failed after independent rerun",
+                "kind": None,
+                "recurrences": 1,
+                "source_status": "ready",
+            },
+        },
+    ]
+    return detail
+
+
+def test_reconcile_creates_recovery_card_for_rejected_review(valid_rig: Path):
+    client = FakeReconcileClient(
+        [
+            [
+                {
+                    "id": "old-review",
+                    "title": "Review original",
+                    "status": "blocked",
+                    "assignee": "reviewer",
+                    "created_by": "hermes-factory",
+                }
+            ],
+            _rejected_review_detail(),
+            {
+                "id": "recovery-2",
+                "status": "ready",
+                "title": "Correct rejected review old-review",
+            },
+            [],
+        ]
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.eligible == 1
+    assert result.recovery_task_ids == {"old-review": "recovery-2"}
+    create = client.json_calls[2]
+    assert create[:5] == [
+        "kanban",
+        "--board",
+        "demo-rig",
+        "create",
+        "Correct rejected review old-review",
+    ]
+    assert _flag_value(create, "--assignee") == "builder"
+    assert _flag_value(create, "--idempotency-key") == (
+        "factory:demo:reconcile:old-review:review-rejected:300"
+    )
+    body = _flag_value(create, "--body")
+    assert "Reason code: review_rejected" in body
+    assert "Superseded task: old-review" in body
+    assert "Incoming parents: old-impl" in body
+    assert "proof command failed after independent rerun" in body
+    assert "fresh independent review" in body
+    assert "Do not run unlink, archive, or purge from this worker" in body
+    assert "archive and purge superseded cards" in body
+
+
+def test_reconcile_routes_blocked_review_without_rejection_marker_as_unknown(
+    valid_rig: Path,
+):
+    client = FakeReconcileClient(
+        [
+            [
+                {
+                    "id": "old-review",
+                    "title": "Review original",
+                    "status": "blocked",
+                    "assignee": "reviewer",
+                    "created_by": "hermes-factory",
+                }
+            ],
+            _rejected_review_detail(reason="need a product decision on the acceptance scope"),
+            {
+                "id": "unknown-recovery-2",
+                "status": "ready",
+                "title": "Resolve unknown blocked task old-review",
+            },
+            [],
+        ]
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.eligible == 1
+    assert result.recovery_task_ids == {"old-review": "unknown-recovery-2"}
+    create = client.json_calls[2]
+    assert _flag_value(create, "--idempotency-key") == (
+        "factory:demo:reconcile:old-review:unknown-stall:300"
+    )
+    assert "Reason code: unknown_operational_stall" in _flag_value(create, "--body")
+
+
+def test_reconcile_routes_rejection_marker_without_worker_run_as_unknown(
+    valid_rig: Path,
+):
+    client = FakeReconcileClient(
+        [
+            [
+                {
+                    "id": "old-review",
+                    "title": "Review original",
+                    "status": "blocked",
+                    "assignee": "reviewer",
+                    "created_by": "hermes-factory",
+                }
+            ],
+            _rejected_review_detail(run_id=None),
+            {
+                "id": "unknown-recovery-3",
+                "status": "ready",
+                "title": "Resolve unknown blocked task old-review",
+            },
+            [],
+        ]
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.eligible == 1
+    assert result.recovery_task_ids == {"old-review": "unknown-recovery-3"}
+
+
+def test_reconcile_prefers_timeout_evidence_over_rejection_marker(valid_rig: Path):
+    detail = _rejected_review_detail()
+    detail["events"].append(
+        {
+            "kind": "gave_up",
+            "created_at": 102,
+            "run_id": None,
+            "payload": {"trigger_outcome": "timed_out", "error": "elapsed 61s > limit 60s"},
+        }
+    )
+    client = FakeReconcileClient(
+        [
+            [
+                {
+                    "id": "old-review",
+                    "title": "Review original",
+                    "status": "blocked",
+                    "assignee": "reviewer",
+                    "created_by": "hermes-factory",
+                }
+            ],
+            detail,
+            {"id": "recovery-2", "status": "ready", "title": "Decompose blocked task"},
+            [],
+        ]
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.recovery_task_ids == {"old-review": "recovery-2"}
+    create = client.json_calls[2]
+    assert _flag_value(create, "--idempotency-key") == (
+        "factory:demo:reconcile:old-review:gave-up:102"
+    )
+    assert "Reason code: worker_timeout" in _flag_value(create, "--body")
+
+
+def _rejected_review_recovery_details() -> list[dict[str, object]]:
+    return [
+        _factory_detail(
+            "new-impl",
+            "implementation",
+            "original-recovery-300",
+            "builder",
+            parents=["old-impl"],
+            children=["new-review"],
+            created_by="builder",
+            creator_task_id="recovery-1",
+        ),
+        _factory_detail(
+            "new-review",
+            "review",
+            "original-recovery-300",
+            "reviewer",
+            parents=["new-impl"],
+            children=["downstream"],
+            created_by="builder",
+            creator_task_id="recovery-1",
+        ),
+        _rejected_review_detail(),
+        _factory_detail(
+            "old-impl",
+            "implementation",
+            "original",
+            "builder",
+            parents=["parent"],
+            children=["old-review"],
+        ),
+        {
+            "task": {"id": "downstream", "status": "todo"},
+            "parents": ["old-review", "new-review"],
+            "children": [],
+            "comments": [],
+            "events": [],
+            "runs": [],
+        },
+    ]
+
+
+def _completed_rejected_review_recovery() -> tuple[dict[str, object], dict[str, object]]:
+    return _completed_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[
+            {"old_parent": "old-review", "new_parent": "new-review", "child": "downstream"}
+        ],
+        superseded=["old-review"],
+        target="old-review",
+        reason_code="review_rejected",
+        # The rejecting worker recorded its block at 300 in _rejected_review_detail.
+        event_time=300,
+        policy_body=_replacement_policy_body(
+            source_slice="original", incoming=("old-impl",), source_class="review"
+        ),
+    )
+
+
+def test_reconcile_finalizes_rejected_review_recovery_plan(valid_rig: Path):
+    recovery, detail = _completed_rejected_review_recovery()
+    client = StatefulRecoveryClient(
+        recovery, detail, _rejected_review_recovery_details()
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ("recovery-1",)
+    assert [
+        "kanban", "--board", "demo-rig", "unlink", "old-review", "downstream"
+    ] in client.run_calls
+    assert ["kanban", "--board", "demo-rig", "archive", "old-review"] in client.run_calls
+    assert [
+        "kanban", "--board", "demo-rig", "archive", "--rm", "old-review"
+    ] in client.run_calls
+    assert "old-review" not in client.details
+    assert "new-review" in client.details["downstream"]["parents"]
+    assert any(call[3] == "comment" and call[4] == "recovery-1" for call in client.run_calls)
+
+
+def test_reconcile_rejects_review_recovery_without_rejection_evidence(valid_rig: Path):
+    recovery, detail = _completed_rejected_review_recovery()
+    details = _rejected_review_recovery_details()
+    target = next(item for item in details if item["task"]["id"] == "old-review")
+    target["events"] = [
+        {"kind": "created", "created_at": 100, "payload": {"creator_task_id": None}},
+        {
+            "kind": "blocked",
+            "created_at": 300,
+            "run_id": 9,
+            "payload": {
+                "reason": "need a product decision",
+                "kind": None,
+                "recurrences": 1,
+                "source_status": "ready",
+            },
+        },
+    ]
+    client = StatefulRecoveryClient(recovery, detail, details)
+
+    with pytest.raises(HermesCommandError, match="no terminal review rejection"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert [call for call in client.run_calls if call[3] in {"unlink", "archive"}] == []
+    assert "old-review" in client.details
+
+
+def _completed_unknown_recovery(
+    *,
+    replacements: list[str],
+    rewires: list[dict[str, str]],
+    superseded: list[str],
+    action: str,
+    decision: str = "Recover the unknown stall without operator input.",
+    target: str = "old-impl",
+    event_time: int = 200,
+) -> tuple[dict[str, object], dict[str, object]]:
+    recovery, detail = _completed_recovery(
+        replacements=replacements,
+        rewires=rewires,
+        superseded=superseded,
+        target=target,
+        reason_code="unknown_operational_stall",
+        event_time=event_time,
+        policy_body=_replacement_policy_body(
+            source_slice="original", incoming=("parent",), source_class="implementation"
+        ),
+    )
+    metadata = detail["runs"][0]["metadata"]
+    metadata.update(
+        {
+            "action": action,
+            "target_task_id": target,
+            "decision": decision,
+            "assignee": None,
+        }
+    )
+    return recovery, detail
+
+
+def _unknown_replacement_recovery_details(
+    replacements: list[str], slice_id: str
+) -> list[dict[str, object]]:
+    details: list[dict[str, object]] = []
+    for index, task_id in enumerate(replacements):
+        implementation = index % 2 == 0
+        details.append(
+            _factory_detail(
+                task_id,
+                "implementation" if implementation else "review",
+                slice_id,
+                "builder" if implementation else "reviewer",
+                parents=["parent"] if index == 0 else [replacements[index - 1]],
+                children=(
+                    [replacements[index + 1]]
+                    if index + 1 < len(replacements)
+                    else ["downstream-1"]
+                ),
+                created_by="builder",
+                creator_task_id="recovery-1",
+            )
+        )
+    target = _factory_detail(
+        "old-impl",
+        "implementation",
+        "original",
+        "builder",
+        parents=["parent"],
+        children=["downstream-1"],
+    )
+    target["task"]["status"] = "blocked"
+    target["events"] = [
+        {"kind": "created", "created_at": 100, "payload": {"creator_task_id": None}},
+        {
+            "kind": "blocked",
+            "created_at": 200,
+            "run_id": 9,
+            "payload": {
+                "reason": "Need somebody to run a script",
+                "kind": None,
+                "recurrences": 1,
+                "source_status": "ready",
+            },
+        },
+    ]
+    downstream = {
+        "task": {"id": "downstream-1", "status": "todo"},
+        "parents": ["old-impl", replacements[-1]],
+        "children": [],
+        "comments": [],
+        "events": [],
+        "runs": [],
+    }
+    return [*details, target, downstream]
+
+
+def test_reconcile_finalizes_unknown_replace_recovery_plan(valid_rig: Path):
+    recovery, detail = _completed_unknown_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[
+            {
+                "old_parent": "old-impl",
+                "new_parent": "new-review",
+                "child": "downstream-1",
+            }
+        ],
+        superseded=["old-impl"],
+        action="replace",
+    )
+    client = StatefulRecoveryClient(
+        recovery,
+        detail,
+        _unknown_replacement_recovery_details(
+            ["new-impl", "new-review"], "original-recovery-200"
+        ),
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ("recovery-1",)
+    assert [
+        "kanban", "--board", "demo-rig", "unlink", "old-impl", "downstream-1"
+    ] in client.run_calls
+    assert ["kanban", "--board", "demo-rig", "archive", "old-impl"] in client.run_calls
+    assert [
+        "kanban", "--board", "demo-rig", "archive", "--rm", "old-impl"
+    ] in client.run_calls
+    assert "old-impl" not in client.details
+    assert "new-review" in client.details["downstream-1"]["parents"]
+    assert any(call[3] == "comment" and call[4] == "recovery-1" for call in client.run_calls)
+
+
+def test_reconcile_finalizes_unknown_decompose_recovery_plan(valid_rig: Path):
+    replacements = ["new-impl", "new-review", "new-impl-2", "new-review-2"]
+    recovery, detail = _completed_unknown_recovery(
+        replacements=replacements,
+        rewires=[
+            {
+                "old_parent": "old-impl",
+                "new_parent": "new-review-2",
+                "child": "downstream-1",
+            }
+        ],
+        superseded=["old-impl"],
+        action="decompose",
+    )
+    client = StatefulRecoveryClient(
+        recovery,
+        detail,
+        _unknown_replacement_recovery_details(replacements, "original-recovery-200"),
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ("recovery-1",)
+    assert "old-impl" not in client.details
+    assert "new-review-2" in client.details["downstream-1"]["parents"]
+    assert "new-impl-2" in client.details["new-review-2"]["parents"]
+
+
+def test_unknown_recovery_rejects_graph_mutation_for_non_replacement_action(
+    valid_rig: Path,
+):
+    client = UnknownResumeClient()
+    metadata = client.recovery["runs"][0]["metadata"]
+    metadata["rewires"] = [
+        {"old_parent": "unknown-1", "new_parent": "elsewhere", "child": "child-1"}
+    ]
+
+    with pytest.raises(HermesCommandError, match="may not mutate the graph"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert client.run_calls == []
+
+
+def test_reconcile_routes_breaker_parked_card_without_block_event_to_unknown(
+    valid_rig: Path,
+):
+    crashed = _blocked_task("crashed-1")
+    crashed["last_failure_error"] = "worker exited with code 9"
+    client = FakeReconcileClient(
+        [
+            [crashed],
+            {
+                "task": crashed,
+                "parents": [],
+                "children": [],
+                "comments": [],
+                "events": [
+                    {"kind": "created", "created_at": 100, "payload": {"creator_task_id": None}},
+                    {
+                        "kind": "gave_up",
+                        "created_at": 300,
+                        "run_id": 9,
+                        "payload": {
+                            "failures": 2,
+                            "effective_limit": 2,
+                            "trigger_outcome": "crashed",
+                            "retry_status": "blocked",
+                            "error": "worker exited with code 9",
+                        },
+                    },
+                ],
+                "runs": [],
+            },
+            {
+                "id": "unknown-recovery-1",
+                "status": "ready",
+                "title": "Resolve unknown blocked task crashed-1",
+            },
+            [],
+        ]
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.eligible == 1
+    assert result.recovery_task_ids == {"crashed-1": "unknown-recovery-1"}
+    create = client.json_calls[2]
+    assert _flag_value(create, "--idempotency-key") == (
+        "factory:demo:reconcile:crashed-1:unknown-stall:300"
+    )
+    body = _flag_value(create, "--body")
+    assert "Reason code: unknown_operational_stall" in body
+    assert "worker exited with code 9" in body
+
+
+def test_reconcile_reports_card_without_terminal_events_without_aborting_pass(
+    valid_rig: Path,
+):
+    broken = _blocked_task("broken-1")
+    unknown = _blocked_task("unknown-1")
+    client = FakeReconcileClient(
+        [
+            [broken, unknown],
+            {
+                "task": broken,
+                "parents": [],
+                "children": [],
+                "comments": [],
+                "events": [
+                    {"kind": "created", "created_at": 100, "payload": {"creator_task_id": None}}
+                ],
+                "runs": [],
+            },
+            {
+                "task": unknown,
+                "parents": [],
+                "children": [],
+                "comments": [],
+                "events": [
+                    {"kind": "created", "created_at": 100, "payload": {"creator_task_id": None}},
+                    {
+                        "kind": "blocked",
+                        "created_at": 200,
+                        "run_id": 9,
+                        "payload": {"reason": "Need a coordinator decision"},
+                    },
+                ],
+                "runs": [],
+            },
+            {
+                "id": "unknown-recovery-2",
+                "status": "ready",
+                "title": "Resolve unknown blocked task unknown-1",
+            },
+            [],
+        ]
+    )
+
+    with pytest.raises(HermesCommandError, match="broken-1.*no authoritative terminal event"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert any(
+        call[3] == "create" and "unknown-1" in call[4] for call in client.json_calls
+    )
+    assert client.json_calls[-1] == [
+        "kanban", "--board", "demo-rig", "list", "--status", "done", "--json"
+    ]
+
+
+def _acceptance_gate_lookalike(creator_task_id: str | None) -> tuple[dict[str, object], dict]:
+    body = (
+        "# Project\nDemo\n\n# Mission\nDemo mission\n\n# Acceptance\n- approve\n\n"
+        "# Proof required\n- none\n\n"
+        "<!-- hermes-factory:audit-contract -->\n"
+        'Factory audit contract: {"task_class":"acceptance","required_commands":[],'
+        '"required_artifacts":[],"changed_files_required":false,"required_metadata":[]}\n'
+        "<!-- /hermes-factory:audit-contract -->\n\n"
+        "# Scope boundaries\nProject demo; mission demo-mission; workflow delivery.\n\n"
+        "<!-- hermes-factory:human-gate -->\n# Human gate\nExplicit acceptance.\n\n"
+        "# Handoff\nNext target: operator."
+    )
+    gate = {
+        **_blocked_task("gate-1"),
+        "title": "Accept demo mission",
+        "body": body,
+        "assignee": None,
+        "idempotency_key": "factory:demo:demo-mission:acceptance",
+        "last_failure_error": None,
+    }
+    detail = {
+        "task": gate,
+        "parents": ["review-1"],
+        "children": [],
+        "comments": [],
+        "events": [
+            {
+                "kind": "created",
+                "created_at": 90,
+                "payload": {"creator_task_id": creator_task_id},
+            },
+            {
+                "kind": "blocked",
+                "created_at": 100,
+                "run_id": None,
+                "payload": {"reason": "human acceptance"},
+            },
+        ],
+        "runs": [],
+    }
+    return gate, detail
+
+
+def test_reconcile_rejects_worker_authored_human_gate_lookalike(valid_rig: Path):
+    valid_rig.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "human_acceptance: false,",
+            "human_acceptance: true, decision_authority: human,",
+        ),
+        encoding="utf-8",
+    )
+    gate, detail = _acceptance_gate_lookalike("t_worker99")
+    client = FakeReconcileClient(
+        [
+            [gate],
+            detail,
+            {
+                "id": "unknown-recovery-gate",
+                "status": "ready",
+                "title": "Resolve unknown blocked task gate-1",
+            },
+            [],
+        ]
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.eligible == 1
+    assert result.recovery_task_ids == {"gate-1": "unknown-recovery-gate"}
+    create = client.json_calls[2]
+    assert "Reason code: unknown_operational_stall" in _flag_value(create, "--body")
+
+
+def test_reconcile_disposes_stale_unknown_replace_without_mutation(valid_rig: Path):
+    recovery, detail = _completed_unknown_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[
+            {
+                "old_parent": "old-impl",
+                "new_parent": "new-review",
+                "child": "downstream-1",
+            }
+        ],
+        superseded=["old-impl"],
+        action="replace",
+    )
+    details = _unknown_replacement_recovery_details(
+        ["new-impl", "new-review"], "original-recovery-200"
+    )
+    target = next(item for item in details if item["task"]["id"] == "old-impl")
+    target["task"]["status"] = "done"
+    client = StatefulRecoveryClient(recovery, detail, details)
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ()
+    assert [call for call in client.run_calls if call[3] == "unlink"] == []
+    assert [call[3] for call in client.run_calls] == ["archive", "comment"]
+    assert client.run_calls[0][-1] == "recovery-1"
+    assert "recovery-rejected" in client.run_calls[1][5]
+    assert "no longer blocked" in client.run_calls[1][5]
+
+    reconcile_board(client, load_rig(valid_rig))
+
+    assert [call[3] for call in client.run_calls] == ["archive", "comment"]
+
+
+def test_unknown_replace_recovery_requires_verified_cards_manifest(valid_rig: Path):
+    recovery, detail = _completed_unknown_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[
+            {
+                "old_parent": "old-impl",
+                "new_parent": "new-review",
+                "child": "downstream-1",
+            }
+        ],
+        superseded=["old-impl"],
+        action="replace",
+    )
+    detail["events"][1]["payload"].pop("verified_cards")
+    client = StatefulRecoveryClient(
+        recovery,
+        detail,
+        _unknown_replacement_recovery_details(
+            ["new-impl", "new-review"], "original-recovery-200"
+        ),
+    )
+
+    with pytest.raises(HermesCommandError, match="verified_cards"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert [call for call in client.run_calls if call[3] in {"unlink", "archive"}] == []
+
+
+def test_unknown_recovery_resume_lands_review_status_and_finalizes(valid_rig: Path):
+    # Hermes's unblock restores the card's resumable phase: a review-phase card
+    # lands in `review` rather than `ready` (kanban_db.unblock_task).
+    client = UnknownResumeClient(landing_status="review")
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ("unknown-recovery-1",)
+    assert client.target["task"]["status"] == "review"
+    assert any(
+        call[3] == "comment"
+        and call[4] == "unknown-recovery-1"
+        and "recovery-finalized" in call[5]
+        for call in client.run_calls
+    )
+
+
+def test_unknown_recovery_resume_accepts_a_card_claimed_after_unblock(
+    valid_rig: Path,
+):
+    # The native dispatcher may claim the released card between the unblock and the
+    # read-back; a claim is proof the unblock persisted, not a failed recovery.
+    client = UnknownResumeClient(landing_status="claimed")
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ("unknown-recovery-1",)
+
+
+def test_reconcile_reports_blocked_recovery_card_without_creating_another(
+    valid_rig: Path,
+):
+    unknown = _blocked_task("unknown-1")
+    unknown["last_failure_error"] = None
+    stuck = _blocked_task("recovery-1")
+    stuck["created_by"] = "hermes-factory-reconciler"
+    client = FakeReconcileClient(
+        [
+            [stuck, unknown],
+            {
+                "task": unknown,
+                "parents": [],
+                "children": [],
+                "comments": [],
+                "events": [
+                    {
+                        "kind": "blocked",
+                        "created_at": 100,
+                        "run_id": 9,
+                        "payload": {"reason": "Need somebody to run a script"},
+                    }
+                ],
+                "runs": [],
+            },
+            {
+                "id": "unknown-recovery-1",
+                "status": "ready",
+                "title": "Resolve unknown blocked task unknown-1",
+            },
+            [],
+        ]
+    )
+
+    with pytest.raises(HermesCommandError, match="recovery card recovery-1 is blocked"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    creates = [call for call in client.json_calls if call[3] == "create"]
+    assert len(creates) == 1
+    assert "unknown-1" in creates[0][4]
+
+
+def test_reconcile_contains_malformed_blocked_entry_without_aborting_pass(
+    valid_rig: Path,
+):
+    unknown = _blocked_task("unknown-1")
+    unknown["last_failure_error"] = None
+    client = FakeReconcileClient(
+        [
+            [{"created_by": "hermes-factory", "title": "no id"}, unknown],
+            {
+                "task": unknown,
+                "parents": [],
+                "children": [],
+                "comments": [],
+                "events": [
+                    {
+                        "kind": "blocked",
+                        "created_at": 100,
+                        "run_id": 9,
+                        "payload": {"reason": "Need somebody to run a script"},
+                    }
+                ],
+                "runs": [],
+            },
+            {
+                "id": "unknown-recovery-1",
+                "status": "ready",
+                "title": "Resolve unknown blocked task unknown-1",
+            },
+            [],
+        ]
+    )
+
+    with pytest.raises(HermesCommandError, match="blocked entry #0"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert client.json_calls[2][3] == "create"
+
+
+class _MalformedDoneClient(UnknownResumeClient):
+    def run_json(self, args: list[str]) -> object:
+        if args[3:] == ["list", "--status", "done", "--json"]:
+            return [
+                {"created_by": "hermes-factory-reconciler", "title": "no id"},
+                self.recovery["task"],
+            ]
+        return super().run_json(args)
+
+
+def test_reconcile_contains_malformed_done_entry_and_still_finalizes(
+    valid_rig: Path,
+):
+    client = _MalformedDoneClient()
+
+    with pytest.raises(HermesCommandError, match="done entry #0"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert any(
+        call[3] == "comment" and call[4] == "unknown-recovery-1"
+        for call in client.run_calls
+    )
+
+
+def test_reconcile_classifies_newest_terminal_event_over_older_timeout(
+    valid_rig: Path,
+):
+    unknown = _blocked_task("unknown-1")
+    unknown["last_failure_error"] = None
+    client = FakeReconcileClient(
+        [
+            [unknown],
+            {
+                "task": unknown,
+                "parents": [],
+                "children": [],
+                "comments": [],
+                "events": [
+                    {
+                        "kind": "created",
+                        "created_at": 90,
+                        "payload": {"creator_task_id": None},
+                    },
+                    {
+                        "kind": "gave_up",
+                        "created_at": 150,
+                        "run_id": 9,
+                        "payload": {"trigger_outcome": "timed_out", "error": "elapsed"},
+                    },
+                    {
+                        "kind": "blocked",
+                        "created_at": 300,
+                        "run_id": 10,
+                        "payload": {"reason": "Need a coordinator decision"},
+                    },
+                ],
+                "runs": [],
+            },
+            {
+                "id": "unknown-recovery-1",
+                "status": "ready",
+                "title": "Resolve unknown blocked task unknown-1",
+            },
+            [],
+        ]
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.recovery_task_ids == {"unknown-1": "unknown-recovery-1"}
+    create = client.json_calls[2]
+    assert _flag_value(create, "--idempotency-key") == (
+        "factory:demo:reconcile:unknown-1:unknown-stall:300"
+    )
+    assert "Reason code: unknown_operational_stall" in _flag_value(create, "--body")
+
+
+def test_known_recovery_plan_for_an_older_incident_is_disposed_once(valid_rig: Path):
+    # The recovery card answers the timeout recorded at key time 200; the target is now
+    # blocked by a newer incident, so the plan can never apply to live state.
+    recovery, recovery_detail = _completed_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[],
+        superseded=["old-impl"],
+    )
+    target = _factory_detail(
+        "old-impl",
+        "implementation",
+        "original",
+        "builder",
+        gave_up=True,
+    )
+    target["events"].append(
+        {
+            "kind": "blocked",
+            "created_at": 300,
+            "run_id": 11,
+            "payload": {"reason": "Need a coordinator decision"},
+        }
+    )
+    client = StatefulRecoveryClient(
+        recovery,
+        recovery_detail,
+        [
+            _factory_detail(
+                "new-impl",
+                "implementation",
+                "replacement-a",
+                "builder",
+                parents=["parent"],
+                children=["new-review"],
+                created_by="builder",
+                creator_task_id="recovery-1",
+            ),
+            _factory_detail(
+                "new-review",
+                "review",
+                "replacement-a",
+                "reviewer",
+                parents=["new-impl"],
+                created_by="builder",
+                creator_task_id="recovery-1",
+            ),
+            target,
+        ],
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ()
+    assert [call[3] for call in client.run_calls] == ["archive", "comment"]
+    assert client.run_calls[0][-1] == "recovery-1"
+    assert "recovery-rejected" in client.run_calls[1][5]
+    assert "newer incident" in client.run_calls[1][5]
+    assert client.details["old-impl"]["task"]["status"] == "blocked"
+
+    reconcile_board(client, load_rig(valid_rig))
+
+    assert [call[3] for call in client.run_calls] == ["archive", "comment"]
+
+
+def test_known_recovery_plan_without_terminal_evidence_is_reported(valid_rig: Path):
+    recovery, recovery_detail = _completed_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[],
+        superseded=["old-impl"],
+    )
+    target = _factory_detail("old-impl", "implementation", "original", "builder")
+    target["task"]["status"] = "blocked"
+    client = StatefulRecoveryClient(
+        recovery,
+        recovery_detail,
+        [
+            _factory_detail(
+                "new-impl",
+                "implementation",
+                "replacement-a",
+                "builder",
+                parents=["parent"],
+                children=["new-review"],
+                created_by="builder",
+                creator_task_id="recovery-1",
+            ),
+            _factory_detail(
+                "new-review",
+                "review",
+                "replacement-a",
+                "reviewer",
+                parents=["new-impl"],
+                created_by="builder",
+                creator_task_id="recovery-1",
+            ),
+            target,
+        ],
+    )
+
+    with pytest.raises(HermesCommandError, match="no terminal timeout evidence"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert client.run_calls == []
+    assert client.recovery["status"] == "done"
+
+
+class _ConcurrentPromotionClient(StatefulRecoveryClient):
+    """Promotes the target inside the rewire window, as a live Hermes mutation can."""
+
+    def run(self, args: list[str]) -> str:
+        result = super().run(args)
+        if args[3:4] == ["unlink"]:
+            self.details["old-impl"]["task"]["status"] = "ready"
+        return result
+
+
+def test_stale_after_partial_mutation_is_reported_not_disposed(valid_rig: Path):
+    recovery, detail = _completed_unknown_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[
+            {
+                "old_parent": "old-impl",
+                "new_parent": "new-review",
+                "child": "downstream-1",
+            }
+        ],
+        superseded=["old-impl"],
+        action="replace",
+    )
+    client = _ConcurrentPromotionClient(
+        recovery,
+        detail,
+        _unknown_replacement_recovery_details(
+            ["new-impl", "new-review"], "original-recovery-200"
+        ),
+    )
+
+    with pytest.raises(HermesCommandError, match="stale after a partial mutation"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert [
+        "kanban",
+        "--board",
+        "demo-rig",
+        "unlink",
+        "old-impl",
+        "downstream-1",
+    ] in client.run_calls
+    assert not any(call[3] == "comment" for call in client.run_calls)
+    assert not any(
+        call[3] == "archive" and call[-1] == "recovery-1" for call in client.run_calls
+    )
+    assert client.recovery["status"] == "done"
+
+
+@pytest.mark.parametrize("resolved_status", ["done", "ready"])
+def test_known_recovery_plan_is_stale_when_the_target_was_resolved(
+    valid_rig: Path, resolved_status: str
+):
+    # Resolving a card writes no terminal event (`unblocked`, `promoted`), so the
+    # trigger time still matches while the incident is over: only the live status can
+    # see that the plan must not run.
+    recovery, recovery_detail = _completed_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[],
+        superseded=["old-impl"],
+    )
+    target = _factory_detail(
+        "old-impl",
+        "implementation",
+        "original",
+        "builder",
+        gave_up=True,
+    )
+    target["task"]["status"] = resolved_status
+    target["events"].append(
+        {
+            "kind": "unblocked",
+            "created_at": 300,
+            "payload": {"status": resolved_status, "resume_status": "blocked"},
+        }
+    )
+    client = StatefulRecoveryClient(
+        recovery,
+        recovery_detail,
+        [
+            _factory_detail(
+                "new-impl",
+                "implementation",
+                "replacement-a",
+                "builder",
+                parents=["parent"],
+                children=["new-review"],
+                created_by="builder",
+                creator_task_id="recovery-1",
+            ),
+            _factory_detail(
+                "new-review",
+                "review",
+                "replacement-a",
+                "reviewer",
+                parents=["new-impl"],
+                created_by="builder",
+                creator_task_id="recovery-1",
+            ),
+            target,
+        ],
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ()
+    assert [call[3] for call in client.run_calls] == ["archive", "comment"]
+    assert client.run_calls[0][-1] == "recovery-1"
+    assert "no longer blocked" in client.run_calls[1][5]
+    assert client.details["old-impl"]["task"]["status"] == resolved_status
+    assert "new-impl" in client.details
+
+
+def test_stale_plan_with_an_already_applied_rewire_is_disposed_with_a_warning(
+    valid_rig: Path,
+):
+    recovery, detail = _completed_unknown_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[
+            {
+                "old_parent": "old-impl",
+                "new_parent": "new-review",
+                "child": "downstream-1",
+            }
+        ],
+        superseded=["old-impl"],
+        action="replace",
+    )
+    client = StatefulRecoveryClient(
+        recovery,
+        detail,
+        _unknown_replacement_recovery_details(
+            ["new-impl", "new-review"], "original-recovery-200"
+        ),
+    )
+    # An earlier interrupted pass already unlinked the edge and rewired the child.
+    downstream = client.details["downstream-1"]
+    downstream["parents"] = ["new-review"]
+    # Hermes drops the edge on both sides when it unlinks.
+    client.details["old-impl"]["children"] = []
+    downstream["events"].append(
+        {
+            "kind": "unlinked",
+            "created_at": 250,
+            "payload": {"parent": "old-impl", "child": "downstream-1"},
+        }
+    )
+    # The target is now blocked by a newer incident, so the plan is stale.
+    client.details["old-impl"]["events"].append(
+        {
+            "kind": "blocked",
+            "created_at": 900,
+            "run_id": 13,
+            "payload": {"reason": "newer incident"},
+        }
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ()
+    assert [call[3] for call in client.run_calls] == ["archive", "comment"]
+    assert client.run_calls[0][-1] == "recovery-1"
+    assert "newer incident" in client.run_calls[1][5]
+    assert "already applied a rewire" in client.run_calls[1][5]
+    assert client.recovery["status"] == "archived"
+    # The applied rewire stays and the superseded cards are left to the newer incident.
+    assert client.details["downstream-1"]["parents"] == ["new-review"]
+    assert "old-impl" in client.details
+
+
+@pytest.mark.parametrize("child_state", ["unreadable", "mismatched"])
+def test_stale_plan_keeps_the_reason_honest_when_the_child_cannot_be_read(
+    valid_rig: Path, child_state: str
+):
+    """An unreadable child proves neither graph state, so the reason claims neither."""
+    recovery, detail = _completed_unknown_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[
+            {
+                "old_parent": "old-impl",
+                "new_parent": "new-review",
+                "child": "downstream-1",
+            }
+        ],
+        superseded=["old-impl"],
+        action="replace",
+    )
+    client = UnreadableChildClient(
+        recovery,
+        detail,
+        _unknown_replacement_recovery_details(
+            ["new-impl", "new-review"], "original-recovery-200"
+        ),
+        child_state,
+    )
+    client.details["old-impl"]["events"].append(
+        {
+            "kind": "blocked",
+            "created_at": 900,
+            "run_id": 13,
+            "payload": {"reason": "newer incident"},
+        }
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ()
+    assert [call[3] for call in client.run_calls] == ["archive", "comment"]
+    reason = str(client.run_calls[1][5])
+    assert "cannot be excluded" in reason
+    assert "already applied a rewire" not in reason
+
+
+def test_recovery_finalizes_on_top_of_an_earlier_interrupted_application(
+    valid_rig: Path,
+):
+    # Pass 1 of the chain unlinked the edge and died before purging; the target then
+    # re-blocked, so the live plan answers the newer incident. The graph is already in
+    # the state the plan wants, so it must apply instead of wedging on the old unlink.
+    recovery, detail = _completed_unknown_recovery(
+        replacements=["new-impl", "new-review"],
+        rewires=[
+            {
+                "old_parent": "old-impl",
+                "new_parent": "new-review",
+                "child": "downstream-1",
+            }
+        ],
+        superseded=["old-impl"],
+        action="replace",
+        event_time=900,
+    )
+    client = StatefulRecoveryClient(
+        recovery,
+        detail,
+        _unknown_replacement_recovery_details(
+            ["new-impl", "new-review"], "original-recovery-200"
+        ),
+    )
+    target = client.details["old-impl"]
+    target["events"].append(
+        {
+            "kind": "blocked",
+            "created_at": 900,
+            "run_id": 13,
+            "payload": {
+                "reason": "Need somebody to run a script",
+                "kind": None,
+                "recurrences": 2,
+                "source_status": "ready",
+            },
+        }
+    )
+    downstream = client.details["downstream-1"]
+    downstream["parents"] = ["new-review"]
+    # Hermes drops the edge on both sides when it unlinks.
+    client.details["old-impl"]["children"] = []
+    downstream["events"].append(
+        {
+            "kind": "unlinked",
+            "created_at": 250,
+            "payload": {"parent": "old-impl", "child": "downstream-1"},
+        }
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ("recovery-1",)
+    assert "old-impl" not in client.details
+    assert client.details["downstream-1"]["parents"] == ["new-review"]
+    assert any(
+        "recovery-finalized" in call[5]
+        for call in client.run_calls
+        if call[3] == "comment"
+    )

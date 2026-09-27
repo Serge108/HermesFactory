@@ -34,7 +34,9 @@ WORKER_PROTOCOL = """\
 Work only on the assigned slice. Re-read this intent chain before changing scope.
 Record commands actually run and their real exit status. Attach required artifacts.
 Include a concise summary and structured metadata in the task's terminal lifecycle transition.
-Block the task when a product, security, destructive, external-write, or acceptance decision is required.
+Do not request input, permission, approval, or confirmation from the operator.
+Resolve in-scope ambiguity from the mission intent and acceptance criteria. Choose the safest reversible or non-destructive option and record the assumption.
+For an unapproved destructive or external-write action, do not perform it: complete every independent safe step and record the precise technical limitation for coordinator handling, never as a question to the operator.
 Do not treat another agent's approval as human approval."""
 
 COORDINATOR_ACCEPTANCE_PROTOCOL = """\
@@ -42,8 +44,13 @@ Work only inside the accepted mission scope. Re-read this intent chain before ch
 Record commands actually run and their real exit status. Attach required artifacts.
 Include a concise summary and structured metadata in the task's terminal lifecycle transition.
 Independently verify the evidence and exercise delegated acceptance authority for in-scope decisions.
-Block the task when a security, destructive, irreversible external-write, or out-of-scope decision is required.
+Do not request input, permission, approval, or confirmation from the operator.
+Choose the safest reversible or non-destructive option for any remaining ambiguity, record the decision, and complete every independently safe step.
+Do not perform an unapproved destructive or irreversible external write; record the precise limitation as a terminal mission result instead of asking the operator.
 Record the decision as coordinator acceptance; do not represent it as human approval."""
+
+REVIEW_REJECTION_PREFIX = "Factory review rejected:"
+HUMAN_GATE_MARKER = "<!-- hermes-factory:human-gate -->"
 
 KANBAN_HANDBOOK = """\
 Report results in the Kanban task summary with structured metadata and attach required artifacts as Kanban attachments instead of terminal messages."""
@@ -244,10 +251,12 @@ def _scope_section(
 ) -> str:
     authority = (
         "The coordinator has delegated decision authority inside the accepted mission. Product "
-        "ambiguities must be routed to that coordinator, who selects the recommended option and "
-        "records the decision without waiting for the operator.\n"
+        "ambiguities are resolved autonomously from mission intent and acceptance criteria; choose "
+        "the safest reversible or non-destructive option and record the decision without operator input.\n"
         if rig.policies.decision_authority == "coordinator"
-        else "Product and acceptance decisions remain with the human operator.\n"
+        else "Human authority applies only to the explicit final acceptance gate. During execution, "
+        "choose the safest reversible or non-destructive option, record assumptions, and do not request "
+        "interim operator input.\n"
     )
     return (
         "# Scope boundaries\n"
@@ -260,7 +269,8 @@ def _scope_section(
         "superseded card.\n"
         f"Completion contract: {rig.policies.completion_contract}.\n"
         f"{authority}"
-        "Anything beyond the slice goal and acceptance lists requires a blocked decision, not a code change."
+        "Anything beyond the slice goal and acceptance lists must be recorded for coordinator handling; "
+        "continue every independently safe in-scope step instead of asking the operator."
     )
 
 
@@ -319,7 +329,10 @@ def render_review_body(
             "Independently verify the parent implementation result against the slice acceptance lists; "
             "re-run the recorded proof commands yourself. Do not accept an implementation claim without evidence.\n"
             "If verification passes, call kanban_complete with the reviewer summary and structured metadata. "
-            "If verification fails, call kanban_block with actionable findings so dependent work cannot start."
+            "If verification fails, call kanban_block so dependent work cannot start, and begin the reason "
+            f"with {REVIEW_REJECTION_PREFIX} followed by the actionable findings; the coordinator reacts "
+            "automatically to that exact prefix. An unmarked block is an unclassified operational stall "
+            "for coordinator diagnosis, never a request for operator input."
         ),
         _handoff_section(rig, mission, handoff_target),
     ]
@@ -330,9 +343,12 @@ def render_acceptance_body(rig: RigSpec, mission: MissionSpec) -> str:
     workflow = rig.workflows[mission.workflow]
     acceptance_seat_name = workflow.acceptance_seat
     acceptance_seat = rig.seats[acceptance_seat_name]
-    coordinator_authority = rig.policies.decision_authority == "coordinator"
+    explicit_human_gate = (
+        rig.policies.decision_authority == "human" and mission.human_acceptance
+    )
+    autonomous_acceptance = not explicit_human_gate
     protocol = (
-        COORDINATOR_ACCEPTANCE_PROTOCOL if coordinator_authority else WORKER_PROTOCOL
+        COORDINATOR_ACCEPTANCE_PROTOCOL if autonomous_acceptance else WORKER_PROTOCOL
     )
     parts = [
         _intent_sections(rig, mission, None),
@@ -343,19 +359,28 @@ def render_acceptance_body(rig: RigSpec, mission: MissionSpec) -> str:
             rig, mission, acceptance_seat_name, acceptance_seat.role
         ),
     ]
-    if coordinator_authority:
+    if autonomous_acceptance:
+        if rig.policies.decision_authority == "coordinator":
+            authority = (
+                "The coordinator has delegated decision authority for this mission. "
+                "Choose the recommended option for any remaining in-scope product ambiguity, record the "
+                "decision and evidence, and complete acceptance without waiting for the operator."
+            )
+        else:
+            authority = (
+                "This mission has no explicit human gate. The assigned acceptance seat owns the final "
+                "in-scope decision and must complete acceptance autonomously without requesting operator input."
+            )
         parts.append(
-            "# Delegated authority\nThe coordinator has delegated decision authority for this mission. "
-            "Choose the recommended option for any remaining in-scope product ambiguity, record the "
-            "decision and evidence, and complete acceptance without waiting for the operator. Do not "
-            "push commits or perform irreversible external actions."
+            "# Delegated authority\n"
+            f"{authority} Do not push commits or perform irreversible external actions."
         )
-    elif mission.human_acceptance:
+    else:
         parts.append(
-            "# Human gate\nThis mission requires human acceptance: a blocked task stays blocked until a human operator completes it. "
+            f"{HUMAN_GATE_MARKER}\n# Human gate\nThis mission requires human acceptance: a blocked task stays blocked until a human operator completes it. "
             "Agent review results are context for that decision, never acceptance."
         )
-    target = "mission completion" if coordinator_authority else "the operator for mission completion"
+    target = "mission completion" if autonomous_acceptance else "the operator for mission completion"
     parts.append(_handoff_section(rig, mission, target))
     return _limit("\n\n".join(parts))
 

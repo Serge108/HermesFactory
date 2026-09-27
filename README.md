@@ -49,7 +49,7 @@ hermes kanban --board <board-slug> watch
 hermes dashboard --no-open
 ```
 
-`hermes-factory` compiles, reconciles, and audits work; it does not keep idle interactive agents alive. Real execution is owned by the Hermes gateway dispatcher, which spawns and supervises Kanban task sessions. `reconcile` scans blocked Factory tasks for an authoritative timeout `gave_up` event, creates or reuses a high-priority coordinator recovery card, then consumes completed structured recovery plans. Privileged `unlink`, archive, purge, verification, and follow-up dispatch run in the trusted no-agent reconciler rather than inside the delegated coordinator context. Run the command from a durable Hermes no-agent cron job for automatic recovery. `stall-taxonomy` exposes stable reason codes and their detection, authority, recovery, verification, fallback, and regression-test contracts. `status` exits non-zero when it finds critical or error findings, while `report` is a read-only metrics projection.
+`hermes-factory` compiles, reconciles, and audits work; it does not keep idle interactive agents alive. Real execution is owned by the Hermes gateway dispatcher, which spawns and supervises Kanban task sessions. `reconcile` scans blocked Factory tasks and classifies each one from authoritative Hermes evidence (a timeout `gave_up` event, a review card blocked by its own reviewer with the recorded rejection prefix, or the `unknown_operational_stall` catch-all for any other block that is not an explicit human gate), creates or reuses one high-priority coordinator recovery card with a bounded structured outcome, then consumes completed structured recovery plans. Privileged `unlink`, archive, purge, verification, and follow-up dispatch run in the trusted no-agent reconciler rather than inside the delegated coordinator context. Run the command from a durable Hermes no-agent cron job for automatic recovery. `stall-taxonomy` exposes stable reason codes and their detection, authority, recovery, verification, fallback, and regression-test contracts. `status` exits non-zero when it finds critical or error findings, while `report` is a read-only metrics projection.
 
 ## Handoff rules
 
@@ -60,7 +60,8 @@ Implementation occupant
   → completes its implementation card with summary and metadata
   → completion releases the pre-created reviewer child
   → reviewer independently reads the parent result and evidence
-  → reviewer completes the review or blocks it with actionable findings
+  → reviewer completes the review or blocks it with the review-rejection prefix and actionable findings
+  → that recorded rejection lets the reconciler start an automatic correction pass
   → optional commit task creates a verified local commit without push
   → dependent slice receives parent summaries
   → coordinator or operator completes acceptance according to rig authority
@@ -84,7 +85,7 @@ Required artifacts must be uploaded as Hermes Kanban attachments. Self-reported 
 - Hermes remains the only agent runtime and source of session truth.
 - Persistent identity belongs to a seat, not to one model context.
 - Repository artifacts and Hermes Kanban records are authoritative; agent chat is not.
-- Decision authority is explicit: `human` keeps a real operator gate; `coordinator` resolves in-scope ambiguity without waiting for a person.
+- Decision authority defaults to `coordinator`: workers resolve in-scope ambiguity autonomously, choose the safest reversible or non-destructive option, and never request interim operator input. `human` creates a real operator gate only when the mission explicitly requires human acceptance.
 - Automatic Git policy is local-only. Factory never pushes; rollback remains an explicit `git revert` operation.
 
 Hermes Kanban owns queue persistence, worker dispatch, retries, claims, heartbeats, and task history. Hermes Factory must not duplicate those systems.

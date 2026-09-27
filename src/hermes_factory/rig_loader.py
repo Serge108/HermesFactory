@@ -43,6 +43,7 @@ _POLICY_KEYS = {
     "human_acceptance",
     "max_retries",
     "max_runtime",
+    "coordinator_runtime",
     "completion_contract",
     "decision_authority",
     "git_commit_policy",
@@ -52,6 +53,7 @@ _POLICY_REQUIRED_KEYS = _POLICY_KEYS - {
     "decision_authority",
     "git_commit_policy",
     "fixture_recovery",
+    "coordinator_runtime",
 }
 
 
@@ -326,6 +328,11 @@ def load_rig(path: Path) -> RigSpec:
                 policies["max_retries"], "policies.max_retries"
             ),
             max_runtime=parse_duration(policies["max_runtime"]),
+            # Coordinator work (recovery cards, acceptance, commits) inspects graphs and
+            # resolves incidents, so it may need more than one slice-sized run.
+            coordinator_runtime=parse_duration(
+                policies.get("coordinator_runtime", policies["max_runtime"])
+            ),
             completion_contract=_string(
                 policies["completion_contract"], "policies.completion_contract"
             ),

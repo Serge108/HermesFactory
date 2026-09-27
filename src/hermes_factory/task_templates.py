@@ -247,7 +247,12 @@ def _proof_section(rig: RigSpec, slice_spec: SliceSpec | None) -> str:
 
 
 def _scope_section(
-    rig: RigSpec, mission: MissionSpec, seat_name: str, role: str
+    rig: RigSpec,
+    mission: MissionSpec,
+    seat_name: str,
+    role: str,
+    *,
+    runtime: str | None = None,
 ) -> str:
     authority = (
         "The coordinator has delegated decision authority inside the accepted mission. Product "
@@ -263,7 +268,7 @@ def _scope_section(
         f"Project {rig.project.slug}; mission {mission.id}; workflow {mission.workflow}.\n"
         f"Assigned seat: {seat_name}; role: {role}.\n"
         f"Failure limit: {rig.policies.max_retries} consecutive non-successful runs; "
-        f"bounded runtime per task: {rig.policies.max_runtime}.\n"
+        f"bounded runtime per task: {runtime or rig.policies.max_runtime}.\n"
         "When a task reaches the failure limit, do not retry the same scope: the coordinator "
         "must decompose it into smaller sequential tasks, rewire dependencies, and remove the "
         "superseded card.\n"
@@ -356,7 +361,11 @@ def render_acceptance_body(rig: RigSpec, mission: MissionSpec) -> str:
         _audit_contract("acceptance", None),
         protocol,
         _scope_section(
-            rig, mission, acceptance_seat_name, acceptance_seat.role
+            rig,
+            mission,
+            acceptance_seat_name,
+            acceptance_seat.role,
+            runtime=rig.policies.coordinator_runtime,
         ),
     ]
     if autonomous_acceptance:
@@ -396,7 +405,13 @@ def render_commit_body(
         "# Proof required\nThe parent review must be complete and approved with its required proof.",
         _audit_contract("commit", None),
         _completion_metadata_section("commit", None),
-        _scope_section(rig, mission, coordinator_name, coordinator.role),
+        _scope_section(
+            rig,
+            mission,
+            coordinator_name,
+            coordinator.role,
+            runtime=rig.policies.coordinator_runtime,
+        ),
         (
             "# Commit policy\nInspect the parent implementation metadata and the live repository diff. "
             "Create one local Git commit containing only the reviewed slice. Preserve unrelated dirty-tree "

@@ -39,6 +39,7 @@ class PolicySpec:
     human_acceptance: bool
     max_retries: int
     max_runtime: str
+    coordinator_runtime: str
     completion_contract: str
     decision_authority: str
     decision_authority_declared: bool

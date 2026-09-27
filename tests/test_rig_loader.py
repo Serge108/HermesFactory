@@ -316,3 +316,36 @@ def test_load_rig_rejects_invalid_autonomy_policy(
 
     with pytest.raises(SpecError, match=expected):
         load_rig(spec)
+
+
+def test_load_rig_defaults_coordinator_runtime_to_max_runtime(tmp_path: Path):
+    rig = load_rig(write_rig(tmp_path, cwd="."))
+
+    assert rig.policies.max_runtime == "30m"
+    assert rig.policies.coordinator_runtime == "30m"
+
+
+def test_load_rig_reads_explicit_coordinator_runtime(tmp_path: Path):
+    spec = write_rig(tmp_path, cwd=".")
+    replace_in_rig(
+        spec,
+        "max_runtime: 30m, completion_contract",
+        "max_runtime: 30m, coordinator_runtime: 45m, completion_contract",
+    )
+
+    rig = load_rig(spec)
+
+    assert rig.policies.max_runtime == "30m"
+    assert rig.policies.coordinator_runtime == "45m"
+
+
+def test_load_rig_rejects_invalid_coordinator_runtime(tmp_path: Path):
+    spec = write_rig(tmp_path, cwd=".")
+    replace_in_rig(
+        spec,
+        "completion_contract: local-only}",
+        "completion_contract: local-only, coordinator_runtime: soon}",
+    )
+
+    with pytest.raises(SpecError, match="invalid duration"):
+        load_rig(spec)

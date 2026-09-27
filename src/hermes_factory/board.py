@@ -72,6 +72,13 @@ def _parse_task_creation(value: Any) -> str:
     return task_id
 
 
+def _task_runtime(rig: RigSpec, task: PlannedTask) -> str:
+    """Coordinator-owned cards get the coordinator budget; slice cards keep the slice one."""
+    if task.key == "acceptance" or task.key.endswith(":commit"):
+        return rig.policies.coordinator_runtime
+    return rig.policies.max_runtime
+
+
 def _create_task(
     client: HermesClient,
     rig: RigSpec,
@@ -86,7 +93,7 @@ def _create_task(
         argv += ["--skill", skill]
     argv += ["--idempotency-key", task.idempotency_key]
     argv += ["--max-retries", str(rig.policies.max_retries)]
-    argv += ["--max-runtime", rig.policies.max_runtime]
+    argv += ["--max-runtime", _task_runtime(rig, task)]
     argv += ["--completion-contract", rig.policies.completion_contract]
     argv += ["--workspace", f"dir:{rig.project.cwd}"]
     argv += ["--created-by", "hermes-factory"]

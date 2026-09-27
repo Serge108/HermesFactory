@@ -312,6 +312,7 @@ def handle_reconcile(args: argparse.Namespace, client_factory: ClientFactory) ->
         "eligible": result.eligible,
         "recovery_task_ids": result.recovery_task_ids,
         "finalized_recovery_task_ids": result.finalized_recovery_task_ids,
+        "board_incident_task_id": result.board_incident_task_id,
         "dispatched": result.dispatched,
     }
     if args.json:
@@ -320,6 +321,7 @@ def handle_reconcile(args: argparse.Namespace, client_factory: ClientFactory) ->
         print(
             f"scanned {result.scanned} blocked tasks; "
             f"created or reused {len(result.recovery_task_ids)} recovery tasks; "
+            f"board incident {result.board_incident_task_id or '-'}; "
             f"finalized {len(result.finalized_recovery_task_ids)} recovery plans; "
             f"dispatched {result.dispatched}"
         )

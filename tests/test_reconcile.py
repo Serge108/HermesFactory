@@ -367,6 +367,424 @@ def _flag_value(args: list[str], flag: str) -> str:
     return args[args.index(flag) + 1]
 
 
+class IdleBoardClient:
+    def __init__(self, snapshot: dict[str, object], *, dispatch: bool = False) -> None:
+        self.snapshot = snapshot
+        self.dispatch_enabled = dispatch
+        self.json_calls: list[list[str]] = []
+        self.run_calls: list[list[str]] = []
+        self.activity_calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def board_activity(
+        self,
+        board_slug: str,
+        *,
+        observed_at: int | None = None,
+        excluded_creators: tuple[str, ...] = (),
+    ) -> dict[str, object]:
+        self.activity_calls.append((board_slug, excluded_creators))
+        return self.snapshot
+
+    def run_json(self, args: list[str]) -> object:
+        self.json_calls.append(args)
+        tail = args[3:]
+        if tail == ["list", "--status", "blocked", "--json"]:
+            return []
+        if tail == ["list", "--status", "done", "--json"]:
+            return []
+        if tail[:1] == ["create"]:
+            return {
+                "id": "incident-1",
+                "status": "ready",
+                "title": tail[1],
+            }
+        if tail == ["show", "incident-1", "--json"]:
+            return {
+                "task": {"id": "incident-1", "status": "ready"},
+                "parents": [],
+                "children": [],
+                "events": [],
+            }
+        if tail[:2] == ["dispatch", "--max"]:
+            assert self.dispatch_enabled
+            return {"spawned": [{"task_id": "incident-1"}]}
+        raise AssertionError(args)
+
+    def run(self, args: list[str]) -> str:
+        self.run_calls.append(args)
+        return ""
+
+
+def _idle_snapshot(
+    *,
+    observed_at: int = 1000,
+    last_activity_at: int = 800,
+    tasks: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    return {
+        "observed_at": observed_at,
+        "last_activity_at": last_activity_at,
+        "tasks": tasks
+        if tasks is not None
+        else [
+            {"id": "todo-1", "status": "todo", "created_by": "hermes-factory"}
+        ],
+    }
+
+
+def test_reconcile_registers_board_incident_before_task_recovery_when_todo_is_idle(
+    valid_rig: Path,
+):
+    class PreflightIdleClient(IdleBoardClient):
+        def run_json(self, args: list[str]) -> object:
+            self.json_calls.append(args)
+            tail = args[3:]
+            if tail == ["list", "--status", "blocked", "--json"]:
+                return [_blocked_task()]
+            if tail[:1] == ["create"]:
+                return {"id": "incident-1", "status": "ready", "title": tail[1]}
+            raise AssertionError(f"task-scoped recovery ran before board incident: {args}")
+
+    client = PreflightIdleClient(_idle_snapshot())
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.board_incident_task_id == "incident-1"
+    assert result.recovery_task_ids == {}
+    assert not any(call[3] == "show" for call in client.json_calls)
+
+
+def test_reconcile_registers_board_incident_when_no_agent_is_running_past_grace(
+    valid_rig: Path,
+):
+    client = IdleBoardClient(_idle_snapshot())
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.board_incident_task_id == "incident-1"
+    assert client.activity_calls == [
+        ("demo-rig", ("hermes-factory-watchdog",))
+    ]
+    create = next(call for call in client.json_calls if call[3] == "create")
+    assert create[:5] == [
+        "kanban",
+        "--board",
+        "demo-rig",
+        "create",
+        "Restore agent activity on demo-rig",
+    ]
+    assert _flag_value(create, "--assignee") == "builder"
+    assert _flag_value(create, "--priority") == "100"
+    assert _flag_value(create, "--created-by") == "hermes-factory-watchdog"
+    assert _flag_value(create, "--max-runtime") == "30m"
+    assert _flag_value(create, "--idempotency-key").startswith(
+        "factory:demo:reconcile:board:no-agent:800:"
+    )
+    body = _flag_value(create, "--body")
+    assert "Reason code: no_agent_activity" in body
+    assert "todo-1" in body
+    assert "Do not edit the Kanban SQLite database" in body
+
+
+def test_reconcile_does_not_register_board_incident_without_backlog(valid_rig: Path):
+    client = IdleBoardClient(
+        {
+            "observed_at": 1000,
+            "last_activity_at": None,
+            "tasks": [],
+        }
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.board_incident_task_id is None
+    assert not any(call[3] == "create" for call in client.json_calls)
+
+
+def test_reconcile_does_not_register_board_incident_during_grace(valid_rig: Path):
+    client = IdleBoardClient(_idle_snapshot(last_activity_at=900))
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.board_incident_task_id is None
+    assert not any(call[3] == "create" for call in client.json_calls)
+
+
+def test_reconcile_does_not_register_board_incident_while_agent_is_running(
+    valid_rig: Path,
+):
+    client = IdleBoardClient(
+        _idle_snapshot(
+            tasks=[
+                {"id": "run-1", "status": "running", "created_by": "hermes-factory"},
+                {"id": "todo-1", "status": "todo", "created_by": "hermes-factory"},
+            ]
+        )
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.board_incident_task_id is None
+    assert not any(call[3] == "create" for call in client.json_calls)
+
+
+def test_reconcile_reports_todo_board_incident_without_suppressing_finalization(
+    valid_rig: Path,
+):
+    client = IdleBoardClient(
+        _idle_snapshot(
+            tasks=[
+                {
+                    "id": "incident-1",
+                    "status": "todo",
+                    "created_by": "hermes-factory-watchdog",
+                },
+                {"id": "todo-1", "status": "todo", "created_by": "hermes-factory"},
+            ]
+        )
+    )
+
+    with pytest.raises(HermesCommandError, match="board incident incident-1 is todo"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert [
+        "kanban",
+        "--board",
+        "demo-rig",
+        "list",
+        "--status",
+        "done",
+        "--json",
+    ] in client.json_calls
+
+
+def test_reconcile_reports_blocked_board_incident_without_recursion(valid_rig: Path):
+    class BlockedIncidentClient(IdleBoardClient):
+        def run_json(self, args: list[str]) -> object:
+            self.json_calls.append(args)
+            tail = args[3:]
+            if tail == ["list", "--status", "blocked", "--json"]:
+                return [
+                    {
+                        "id": "incident-1",
+                        "status": "blocked",
+                        "created_by": "hermes-factory-watchdog",
+                    }
+                ]
+            if tail == ["list", "--status", "done", "--json"]:
+                return []
+            raise AssertionError(args)
+
+    client = BlockedIncidentClient(
+        _idle_snapshot(
+            tasks=[
+                {
+                    "id": "incident-1",
+                    "status": "blocked",
+                    "created_by": "hermes-factory-watchdog",
+                },
+                {"id": "todo-1", "status": "todo", "created_by": "hermes-factory"},
+            ]
+        )
+    )
+
+    with pytest.raises(HermesCommandError, match="board incident incident-1 is blocked"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert not any(call[3] == "create" for call in client.json_calls)
+
+
+def test_reconcile_reuses_active_board_incident_while_idle_backlog_persists(
+    valid_rig: Path,
+):
+    client = IdleBoardClient(
+        _idle_snapshot(
+            tasks=[
+                {
+                    "id": "incident-1",
+                    "status": "running",
+                    "created_by": "hermes-factory-watchdog",
+                },
+                {"id": "todo-1", "status": "todo", "created_by": "hermes-factory"},
+            ]
+        )
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.board_incident_task_id == "incident-1"
+    assert not any(call[3] == "create" for call in client.json_calls)
+
+
+def test_reconcile_ignores_stale_board_incident_after_running_resumes(
+    valid_rig: Path,
+):
+    client = IdleBoardClient(
+        _idle_snapshot(
+            last_activity_at=999,
+            tasks=[
+                {
+                    "id": "incident-1",
+                    "status": "ready",
+                    "created_by": "hermes-factory-watchdog",
+                },
+                {"id": "run-1", "status": "running", "created_by": "hermes-factory"},
+                {"id": "todo-1", "status": "todo", "created_by": "hermes-factory"},
+            ],
+        )
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.board_incident_task_id is None
+
+
+def test_reconcile_ignores_stale_board_incident_without_backlog(valid_rig: Path):
+    client = IdleBoardClient(
+        {
+            "observed_at": 1000,
+            "last_activity_at": None,
+            "tasks": [
+                {
+                    "id": "incident-1",
+                    "status": "todo",
+                    "created_by": "hermes-factory-watchdog",
+                }
+            ],
+        }
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.board_incident_task_id is None
+    assert [
+        "kanban",
+        "--board",
+        "demo-rig",
+        "list",
+        "--status",
+        "done",
+        "--json",
+    ] in client.json_calls
+
+
+def test_reconcile_replaces_terminal_idempotent_incident(valid_rig: Path):
+    class TerminalIncidentClient(IdleBoardClient):
+        def __init__(self) -> None:
+            super().__init__(_idle_snapshot())
+            self.snapshots = [
+                _idle_snapshot(),
+                {
+                    **_idle_snapshot(),
+                    "latest_incident_terminal": {
+                        "id": "incident-1",
+                        "status": "done",
+                        "terminal_at": 850,
+                    },
+                },
+            ]
+            self.create_count = 0
+
+        def board_activity(self, *args, **kwargs):
+            self.activity_calls.append((args[0], kwargs.get("excluded_creators", ())))
+            return self.snapshots.pop(0)
+
+        def run_json(self, args: list[str]) -> object:
+            self.json_calls.append(args)
+            tail = args[3:]
+            if tail in (
+                ["list", "--status", "blocked", "--json"],
+                ["list", "--status", "done", "--json"],
+            ):
+                return []
+            if tail[:1] == ["create"]:
+                self.create_count += 1
+                return {
+                    "id": f"incident-{self.create_count}",
+                    "status": "done" if self.create_count == 1 else "ready",
+                    "title": tail[1],
+                }
+            raise AssertionError(args)
+
+    client = TerminalIncidentClient()
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    creates = [call for call in client.json_calls if call[3] == "create"]
+    assert result.board_incident_task_id == "incident-2"
+    assert len(creates) == 2
+    assert _flag_value(creates[0], "--idempotency-key") != _flag_value(
+        creates[1], "--idempotency-key"
+    )
+    assert _flag_value(creates[1], "--idempotency-key").endswith(
+        ":after:incident-1:850"
+    )
+
+
+def test_reconcile_reports_board_incident_blocked_during_postflight(valid_rig: Path):
+    class PostflightBlockedIncidentClient(IdleBoardClient):
+        def __init__(self) -> None:
+            super().__init__(_idle_snapshot())
+            self.snapshots = [
+                {"observed_at": 1000, "last_activity_at": None, "tasks": []},
+                {
+                    "observed_at": 1000,
+                    "last_activity_at": 800,
+                    "tasks": [
+                        {
+                            "id": "incident-1",
+                            "status": "blocked",
+                            "created_by": "hermes-factory-watchdog",
+                        }
+                    ],
+                },
+            ]
+
+        def board_activity(self, *args, **kwargs):
+            self.activity_calls.append((args[0], kwargs.get("excluded_creators", ())))
+            return self.snapshots.pop(0)
+
+    client = PostflightBlockedIncidentClient()
+
+    with pytest.raises(HermesCommandError, match="board incident incident-1 is blocked"):
+        reconcile_board(client, load_rig(valid_rig))
+
+
+def test_reconcile_registers_board_incident_when_review_has_no_running_agent(
+    valid_rig: Path,
+):
+    client = IdleBoardClient(
+        _idle_snapshot(
+            tasks=[
+                {"id": "review-1", "status": "review", "created_by": "hermes-factory"},
+                {"id": "todo-1", "status": "todo", "created_by": "hermes-factory"},
+            ]
+        )
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.board_incident_task_id == "incident-1"
+
+
+def test_reconcile_dispatches_ready_board_incident(valid_rig: Path):
+    client = IdleBoardClient(_idle_snapshot(), dispatch=True)
+
+    result = reconcile_board(client, load_rig(valid_rig), dispatch=True)
+
+    assert result.board_incident_task_id == "incident-1"
+    assert result.dispatched == 1
+    assert [
+        "kanban",
+        "--board",
+        "demo-rig",
+        "dispatch",
+        "--max",
+        "1",
+        "--json",
+    ] in client.json_calls
+
+
 def test_reconcile_creates_idempotent_coordinator_task_for_gave_up_factory_task(
     valid_rig: Path,
 ):
@@ -644,7 +1062,26 @@ def test_reconcile_skips_explicit_human_acceptance_gate(valid_rig: Path):
         "idempotency_key": "factory:demo:demo-mission:acceptance",
         "last_failure_error": None,
     }
-    client = FakeReconcileClient(
+
+    class HumanGateClient(FakeReconcileClient):
+        def board_activity(
+            self,
+            board_slug: str,
+            *,
+            observed_at: int | None = None,
+            excluded_creators: tuple[str, ...] = (),
+        ) -> dict[str, object]:
+            return _idle_snapshot(
+                tasks=[
+                    {
+                        "id": "gate-1",
+                        "status": "blocked",
+                        "created_by": "hermes-factory",
+                    }
+                ]
+            )
+
+    client = HumanGateClient(
         [
             [gate],
             {
@@ -675,6 +1112,7 @@ def test_reconcile_skips_explicit_human_acceptance_gate(valid_rig: Path):
 
     assert result.eligible == 0
     assert result.recovery_task_ids == {}
+    assert result.board_incident_task_id is None
     assert not any(call[3] == "create" for call in client.json_calls)
 
 

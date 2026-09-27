@@ -22,6 +22,8 @@ from hermes_factory.task_templates import (
 )
 
 _RECOVERY_CREATOR = "hermes-factory-reconciler"
+_NO_AGENT_INCIDENT_CREATOR = "hermes-factory-watchdog"
+_NO_AGENT_INCIDENT_MARKER = "<!-- hermes-factory:no-agent-incident -->"
 _RECOVERY_SKILL = "hermes-native-agent-factories"
 _FINALIZED_MARKER = "<!-- hermes-factory:recovery-finalized -->"
 _RECOVERY_REJECTED_MARKER = "<!-- hermes-factory:recovery-rejected -->"
@@ -41,6 +43,7 @@ _REASON_CODE_PREFIX = "Reason code: "
 # the Superseded-task class, and the replacement class of the recovery target.
 _STALL_WORKER_TIMEOUT = "worker_timeout"
 _STALL_REVIEW_REJECTED = "review_rejected"
+_STALL_NO_AGENT_ACTIVITY = "no_agent_activity"
 _STALL_UNKNOWN_OPERATIONAL = "unknown_operational_stall"
 _KEY_TOKENS = {
     _STALL_WORKER_TIMEOUT: "gave-up",
@@ -80,6 +83,7 @@ class ReconcileResult:
     recovery_task_ids: dict[str, str]
     finalized_recovery_task_ids: tuple[str, ...]
     dispatched: int
+    board_incident_task_id: str | None = None
 
 
 def _task_list(value: Any) -> list[dict[str, Any]]:
@@ -237,6 +241,132 @@ def _coordinator_profile(rig: RigSpec) -> str:
             "reconcile requires every workflow acceptance seat to resolve to one coordinator profile"
         )
     return next(iter(profiles))
+
+
+def _no_agent_incident(
+    snapshot: object,
+    rig: RigSpec,
+    human_gate_ids: set[str],
+    *,
+    include_blocked: bool = True,
+) -> dict[str, Any] | None:
+    """Describe a stable board-level idle episode, or return ``None``."""
+    if not isinstance(snapshot, dict):
+        raise HermesCommandError("Hermes returned malformed board activity snapshot")
+    observed_at = snapshot.get("observed_at")
+    last_activity_at = snapshot.get("last_activity_at")
+    tasks = snapshot.get("tasks")
+    if (
+        type(observed_at) is not int
+        or not isinstance(tasks, list)
+        or any(not isinstance(task, dict) for task in tasks)
+    ):
+        raise HermesCommandError("Hermes returned malformed board activity snapshot")
+
+    incident_ids: list[str] = []
+    blocked_incident_ids: list[str] = []
+    stalled_incidents: list[tuple[str, str]] = []
+    active: list[tuple[str, str, object]] = []
+    for task in tasks:
+        task_id = task.get("id")
+        status = task.get("status")
+        creator = task.get("created_by")
+        if not isinstance(task_id, str) or not task_id or not isinstance(status, str):
+            raise HermesCommandError("Hermes returned malformed board activity task")
+        active.append((task_id, status, creator))
+        if creator == _NO_AGENT_INCIDENT_CREATOR:
+            if status == "blocked":
+                blocked_incident_ids.append(task_id)
+            elif status in {"ready", "running", "review"}:
+                incident_ids.append(task_id)
+            else:
+                stalled_incidents.append((task_id, status))
+
+    if blocked_incident_ids:
+        return {"blocked_incident_task_id": sorted(blocked_incident_ids)[0]}
+
+    if any(
+        status == "running" and creator != _NO_AGENT_INCIDENT_CREATOR
+        for _, status, creator in active
+    ):
+        return None
+
+    todo_ids = sorted(
+        task_id
+        for task_id, status, creator in active
+        if status == "todo"
+        and creator not in {_RECOVERY_CREATOR, _NO_AGENT_INCIDENT_CREATOR}
+    )
+    blocked_ids = sorted(
+        task_id
+        for task_id, status, creator in active
+        if include_blocked
+        and status == "blocked"
+        and task_id not in human_gate_ids
+        and creator not in {_RECOVERY_CREATOR, _NO_AGENT_INCIDENT_CREATOR}
+    )
+    if not todo_ids and not blocked_ids:
+        return None
+    if (
+        type(last_activity_at) is not int
+        or last_activity_at <= 0
+        or last_activity_at > observed_at
+    ):
+        raise HermesCommandError("Hermes returned malformed board activity snapshot")
+    if observed_at - last_activity_at < _runtime_seconds(rig.policies.no_agent_grace):
+        return None
+    if stalled_incidents:
+        stalled_id, stalled_status = sorted(stalled_incidents)[0]
+        return {
+            "stalled_incident_task_id": stalled_id,
+            "stalled_incident_status": stalled_status,
+        }
+    if incident_ids:
+        return {"existing_task_id": sorted(incident_ids)[0]}
+
+    fingerprint_source = "\n".join(
+        [*(f"todo:{task_id}" for task_id in todo_ids), *(f"blocked:{task_id}" for task_id in blocked_ids)]
+    )
+    fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:16]
+    idempotency_key = (
+        f"factory:{rig.project.slug}:reconcile:board:no-agent:"
+        f"{last_activity_at}:{fingerprint}"
+    )
+    terminal = snapshot.get("latest_incident_terminal")
+    if terminal is not None:
+        if not isinstance(terminal, dict):
+            raise HermesCommandError("Hermes returned malformed incident terminal record")
+        terminal_id = terminal.get("id")
+        terminal_status = terminal.get("status")
+        terminal_at = terminal.get("terminal_at")
+        if (
+            not isinstance(terminal_id, str)
+            or not terminal_id
+            or terminal_status not in {"done", "archived"}
+            or type(terminal_at) is not int
+            or terminal_at <= 0
+        ):
+            raise HermesCommandError("Hermes returned malformed incident terminal record")
+        idempotency_key += f":after:{terminal_id}:{terminal_at}"
+    return {
+        "existing_task_id": None,
+        "observed_at": observed_at,
+        "last_activity_at": last_activity_at,
+        "todo_ids": todo_ids,
+        "blocked_ids": blocked_ids,
+        "idempotency_key": idempotency_key,
+    }
+
+
+def _no_agent_incident_failure(incident: dict[str, Any]) -> str | None:
+    blocked_id = incident.get("blocked_incident_task_id")
+    if isinstance(blocked_id, str):
+        return f"board incident {blocked_id} is blocked"
+    stalled_id = incident.get("stalled_incident_task_id")
+    stalled_status = incident.get("stalled_incident_status")
+    if isinstance(stalled_id, str) and isinstance(stalled_status, str):
+        return f"board incident {stalled_id} is {stalled_status}"
+    return None
 
 
 def _fixture_replacement_body(
@@ -686,6 +816,76 @@ def _create_recovery_task(
     recovery_id = _parse_task_creation(client.run_json(argv))
     _subscribe_task(client, rig, recovery_id)
     return recovery_id
+
+
+def _create_no_agent_incident_task(
+    client: HermesClient,
+    rig: RigSpec,
+    coordinator_profile: str,
+    incident: dict[str, Any],
+) -> tuple[str, str]:
+    body = f"""{_NO_AGENT_INCIDENT_MARKER}
+# Board-level incident
+Reason code: {_STALL_NO_AGENT_ACTIVITY}
+Board: {rig.board.slug}
+Project: {rig.project.slug}
+Observed at: {incident['observed_at']}
+Last non-incident activity: {incident['last_activity_at']}
+Configured grace: {rig.policies.no_agent_grace}
+Todo cards: {json.dumps(incident['todo_ids'])}
+Blocked cards: {json.dumps(incident['blocked_ids'])}
+
+# Required coordinator action
+No task is running although queued or blocked work remains beyond the configured grace period.
+Diagnose the board-level orchestration failure through authoritative Hermes surfaces: task events,
+runs, diagnostics, dependency edges, dispatcher state, and existing recovery cards. Create or repair
+the smallest in-scope coordinator work needed to restore execution. Prefer an existing task-scoped
+recovery when one explains the stop. Record the diagnosis and every action in `decision_log`.
+
+Do not request operator input. Do not edit the Kanban SQLite database. Do not bypass delegated-child
+mutation fences. Factory retains privileged unlink, archive, and purge operations behind validated
+recovery plans.
+
+{render_task_contract('incident', None)}
+
+Use Hermes Kanban as the only task-state store.
+<!-- /hermes-factory:no-agent-incident -->"""
+    argv = [
+        "kanban",
+        "--board",
+        rig.board.slug,
+        "create",
+        f"Restore agent activity on {rig.board.slug}",
+        "--body",
+        body,
+        "--assignee",
+        coordinator_profile,
+        "--skill",
+        _RECOVERY_SKILL,
+        "--idempotency-key",
+        incident["idempotency_key"],
+        "--max-retries",
+        str(rig.policies.max_retries),
+        "--max-runtime",
+        rig.policies.coordinator_runtime,
+        "--completion-contract",
+        rig.policies.completion_contract,
+        "--workspace",
+        f"dir:{rig.project.cwd}",
+        "--created-by",
+        _NO_AGENT_INCIDENT_CREATOR,
+        "--priority",
+        "100",
+        "--json",
+    ]
+    creation = client.run_json(argv)
+    incident_id = _parse_task_creation(creation)
+    if not isinstance(creation, dict) or not isinstance(creation.get("status"), str):
+        raise HermesCommandError("Hermes returned malformed incident creation JSON")
+    status = creation["status"]
+    if status not in {"done", "archived"}:
+        _subscribe_task(client, rig, incident_id)
+    return incident_id, status
 
 
 @dataclass(frozen=True, slots=True)
@@ -2359,6 +2559,35 @@ def _finalize_completed_recoveries(
     return tuple(finalized), tuple(failures)
 
 
+def _dispatch_reconcile_tasks(
+    client: HermesClient,
+    rig: RigSpec,
+    task_ids: list[str],
+    *,
+    released_work: bool = False,
+) -> int:
+    board = ["kanban", "--board", rig.board.slug]
+    ready = 0
+    for task_id in dict.fromkeys(task_ids):
+        detail = _task_show(client.run_json(board + ["show", task_id, "--json"]))
+        if detail["task"].get("status") == "ready":
+            ready += 1
+    dispatch_limit = ready + (1 if released_work else 0)
+    if not dispatch_limit:
+        return 0
+    dispatch_result = client.run_json(
+        board + ["dispatch", "--max", str(dispatch_limit), "--json"]
+    )
+    if not isinstance(dispatch_result, dict):
+        raise HermesCommandError("Hermes returned malformed dispatch JSON")
+    spawned = dispatch_result.get("spawned")
+    if not isinstance(spawned, list) or any(
+        not isinstance(item, dict) for item in spawned
+    ):
+        raise HermesCommandError("Hermes returned malformed dispatch JSON")
+    return len(spawned)
+
+
 def reconcile_board(
     client: HermesClient,
     rig: RigSpec,
@@ -2382,20 +2611,85 @@ def reconcile_board(
     coordinator_profile = _coordinator_profile(rig)
     recovery_task_ids: dict[str, str] = {}
     classification_failures: list[str] = []
+    human_gate_ids: set[str] = set()
     eligible = 0
+    activity_reader = getattr(client, "board_activity", None)
+    if callable(activity_reader):
+        preflight_incident = _no_agent_incident(
+            activity_reader(
+                rig.board.slug,
+                excluded_creators=(_NO_AGENT_INCIDENT_CREATOR,),
+            ),
+            rig,
+            set(),
+            include_blocked=False,
+        )
+        for attempt in range(2):
+            if preflight_incident is None:
+                break
+            preflight_failure = _no_agent_incident_failure(preflight_incident)
+            if preflight_failure is not None:
+                if preflight_failure not in classification_failures:
+                    classification_failures.append(preflight_failure)
+                break
+            existing_task_id = preflight_incident.get("existing_task_id")
+            if isinstance(existing_task_id, str):
+                board_incident_task_id = existing_task_id
+                incident_status = "ready"
+            else:
+                board_incident_task_id, incident_status = _create_no_agent_incident_task(
+                    client, rig, coordinator_profile, preflight_incident
+                )
+            if incident_status in {"ready", "running", "review"}:
+                dispatched = (
+                    _dispatch_reconcile_tasks(
+                        client,
+                        rig,
+                        [board_incident_task_id],
+                    )
+                    if dispatch
+                    else 0
+                )
+                return ReconcileResult(
+                    scanned=len(blocked),
+                    eligible=0,
+                    recovery_task_ids={},
+                    finalized_recovery_task_ids=(),
+                    dispatched=dispatched,
+                    board_incident_task_id=board_incident_task_id,
+                )
+            if incident_status not in {"done", "archived"}:
+                classification_failures.append(
+                    f"board incident {board_incident_task_id} is {incident_status}"
+                )
+                break
+            if attempt == 0:
+                preflight_incident = _no_agent_incident(
+                    activity_reader(
+                        rig.board.slug,
+                        excluded_creators=(_NO_AGENT_INCIDENT_CREATOR,),
+                    ),
+                    rig,
+                    set(),
+                    include_blocked=False,
+                )
+            else:
+                classification_failures.append(
+                    f"board incident {board_incident_task_id} is already {incident_status}"
+                )
     for index, task in enumerate(blocked):
         created_by = task.get("created_by")
-        if created_by == _RECOVERY_CREATOR:
+        if created_by in {_RECOVERY_CREATOR, _NO_AGENT_INCIDENT_CREATOR}:
             task_id = task.get("id")
             label = (
                 task_id
                 if isinstance(task_id, str) and task_id
                 else f"blocked entry #{index}"
             )
-            # Factory's own recovery card cannot be answered by another recovery card
-            # without unbounded recursion, but silence would hide a stalled autonomy
-            # loop: the protocol stops here and the operator sees a precise report.
-            classification_failures.append(f"recovery card {label} is blocked")
+            # Factory's own coordinator cards cannot be answered by another task-scoped
+            # recovery without unbounded recursion. Report the stopped autonomy loop.
+            kind = "recovery card" if created_by == _RECOVERY_CREATOR else "board incident"
+            classification_failures.append(f"{kind} {label} is blocked")
             continue
         if created_by != "hermes-factory" and created_by != coordinator_profile:
             continue
@@ -2423,6 +2717,7 @@ def reconcile_board(
                     continue
             classified = _classify_blocked_factory_task(detail, rig)
             if classified is None:
+                human_gate_ids.add(task_id)
                 continue
             stall_class, event = classified
             recovery_task_ids[task_id] = _create_recovery_task(
@@ -2445,28 +2740,61 @@ def reconcile_board(
     finalized_recovery_task_ids, finalization_failures = (
         _finalize_completed_recoveries(client, rig)
     )
-    dispatched = 0
-    if dispatch and (recovery_task_ids or finalized_recovery_task_ids):
-        ready = 0
-        for recovery_id in recovery_task_ids.values():
-            detail = _task_show(
-                client.run_json(board + ["show", recovery_id, "--json"])
-            )
-            if detail["task"].get("status") == "ready":
-                ready += 1
-        dispatch_limit = ready + (1 if finalized_recovery_task_ids else 0)
-        if dispatch_limit:
-            dispatch_result = client.run_json(
-                board + ["dispatch", "--max", str(dispatch_limit), "--json"]
-            )
-            if not isinstance(dispatch_result, dict):
-                raise HermesCommandError("Hermes returned malformed dispatch JSON")
-            spawned = dispatch_result.get("spawned")
-            if not isinstance(spawned, list) or any(
-                not isinstance(item, dict) for item in spawned
-            ):
-                raise HermesCommandError("Hermes returned malformed dispatch JSON")
-            dispatched = len(spawned)
+    board_incident_task_id: str | None = None
+    activity_reader = getattr(client, "board_activity", None)
+    if (
+        callable(activity_reader)
+        and not recovery_task_ids
+        and not finalized_recovery_task_ids
+        and not classification_failures
+        and not finalization_failures
+    ):
+        incident = _no_agent_incident(
+            activity_reader(
+                rig.board.slug,
+                excluded_creators=(_NO_AGENT_INCIDENT_CREATOR,),
+            ),
+            rig,
+            human_gate_ids,
+        )
+        if incident is not None:
+            incident_failure = _no_agent_incident_failure(incident)
+            if incident_failure is not None:
+                if incident_failure not in classification_failures:
+                    classification_failures.append(incident_failure)
+            else:
+                existing_task_id = incident.get("existing_task_id")
+                if isinstance(existing_task_id, str):
+                    board_incident_task_id = existing_task_id
+                else:
+                    created_incident_id, incident_status = _create_no_agent_incident_task(
+                        client, rig, coordinator_profile, incident
+                    )
+                    if incident_status in {"done", "archived"}:
+                        classification_failures.append(
+                            f"board incident {created_incident_id} is already {incident_status}"
+                        )
+                    elif incident_status in {"ready", "running", "review"}:
+                        board_incident_task_id = created_incident_id
+                    else:
+                        classification_failures.append(
+                            f"board incident {created_incident_id} is {incident_status}"
+                        )
+
+    dispatch_candidates = list(recovery_task_ids.values())
+    if board_incident_task_id is not None:
+        dispatch_candidates.append(board_incident_task_id)
+    dispatched = (
+        _dispatch_reconcile_tasks(
+            client,
+            rig,
+            dispatch_candidates,
+            released_work=bool(finalized_recovery_task_ids),
+        )
+        if dispatch
+        and (dispatch_candidates or finalized_recovery_task_ids)
+        else 0
+    )
     failures: list[str] = []
     if classification_failures:
         failures.append(
@@ -2485,4 +2813,5 @@ def reconcile_board(
         recovery_task_ids=recovery_task_ids,
         finalized_recovery_task_ids=finalized_recovery_task_ids,
         dispatched=dispatched,
+        board_incident_task_id=board_incident_task_id,
     )

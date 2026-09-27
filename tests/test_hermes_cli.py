@@ -81,6 +81,180 @@ def test_task_record_reads_authoritative_fields_from_board_database(tmp_path: Pa
     }
 
 
+def test_board_activity_reads_authoritative_state_and_excludes_incident_events(
+    tmp_path: Path,
+):
+    import sqlite3
+
+    db_path = tmp_path / "Board With Spaces" / "kanban.db"
+    db_path.parent.mkdir()
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        create table tasks (
+            id text primary key,
+            status text not null,
+            created_by text,
+            created_at integer,
+            started_at integer,
+            completed_at integer
+        );
+        create table task_events (
+            id integer primary key,
+            task_id text not null,
+            kind text not null,
+            created_at integer not null
+        );
+        """
+    )
+    connection.executemany(
+        "insert into tasks values (?, ?, ?, ?, ?, ?)",
+        [
+            ("todo-1", "todo", "hermes-factory", 100, None, None),
+            ("blocked-1", "blocked", "hermes-factory", 110, 120, None),
+            ("incident-1", "ready", "hermes-factory-watchdog", 900, None, None),
+            ("incident-done", "done", "hermes-factory-watchdog", 700, 800, 850),
+            ("done-1", "done", "hermes-factory", 10, 20, 30),
+            ("archived-1", "archived", "hermes-factory", 5, 6, 7),
+        ],
+    )
+    connection.executemany(
+        "insert into task_events (task_id, kind, created_at) values (?, ?, ?)",
+        [
+            ("todo-1", "created", 100),
+            ("blocked-1", "blocked", 200),
+            ("incident-1", "created", 900),
+            ("incident-done", "completed", 950),
+            ("done-1", "completed", 300),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    def fake_run(argv, **kwargs):
+        payload = [
+            {
+                "slug": "demo-rig",
+                "archived": False,
+                "db_path": str(db_path),
+            }
+        ]
+        return CompletedProcess(argv, 0, __import__("json").dumps(payload), "")
+
+    snapshot = HermesClient(runner=fake_run).board_activity(
+        "demo-rig",
+        observed_at=1000,
+        excluded_creators=("hermes-factory-watchdog",),
+    )
+
+    assert snapshot == {
+        "observed_at": 1000,
+        "last_activity_at": 300,
+        "tasks": [
+            {"id": "blocked-1", "status": "blocked", "created_by": "hermes-factory"},
+            {"id": "incident-1", "status": "ready", "created_by": "hermes-factory-watchdog"},
+            {"id": "todo-1", "status": "todo", "created_by": "hermes-factory"},
+        ],
+        "latest_incident_terminal": {
+            "id": "incident-done",
+            "status": "done",
+            "terminal_at": 850,
+        },
+    }
+
+
+def test_board_activity_reads_one_consistent_snapshot_during_concurrent_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import json
+    import sqlite3
+
+    import hermes_factory.hermes_cli as hermes_cli
+
+    db_path = tmp_path / "racing-board" / "kanban.db"
+    db_path.parent.mkdir()
+    connection = sqlite3.connect(db_path)
+    connection.execute("pragma journal_mode=wal")
+    connection.executescript(
+        """
+        create table tasks (
+            id text primary key,
+            status text not null,
+            created_by text,
+            created_at integer,
+            started_at integer,
+            completed_at integer
+        );
+        create table task_events (
+            id integer primary key,
+            task_id text not null,
+            kind text not null,
+            created_at integer not null
+        );
+        insert into tasks values ('todo-1', 'todo', 'hermes-factory', 100, null, null);
+        insert into task_events (task_id, kind, created_at)
+        values ('todo-1', 'created', 100);
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    real_connect = sqlite3.connect
+
+    class RacingConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        @property
+        def row_factory(self):
+            return self.inner.row_factory
+
+        @row_factory.setter
+        def row_factory(self, value):
+            self.inner.row_factory = value
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.inner.__exit__(*args)
+
+        def execute(self, sql, params=()):
+            if "select max(e.created_at)" in sql:
+                writer = real_connect(db_path)
+                writer.execute("update tasks set status = 'archived' where id = 'todo-1'")
+                writer.commit()
+                writer.close()
+            return self.inner.execute(sql, params)
+
+    def racing_connect(*args, **kwargs):
+        return RacingConnection(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(hermes_cli.sqlite3, "connect", racing_connect)
+
+    def fake_run(argv, **kwargs):
+        return CompletedProcess(
+            argv,
+            0,
+            json.dumps(
+                [{"slug": "demo-rig", "archived": False, "db_path": str(db_path)}]
+            ),
+            "",
+        )
+
+    snapshot = HermesClient(runner=fake_run).board_activity(
+        "demo-rig",
+        observed_at=1000,
+        excluded_creators=("hermes-factory-watchdog",),
+    )
+
+    assert snapshot["tasks"] == [
+        {"id": "todo-1", "status": "todo", "created_by": "hermes-factory"}
+    ]
+    assert snapshot["last_activity_at"] == 100
+
+
 def test_run_uses_safe_utf8_subprocess_options():
     calls = []
 

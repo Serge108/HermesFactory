@@ -37,6 +37,7 @@ def test_taxonomy_covers_timeout_capability_dispatch_dependency_and_human_classe
         "stale_runner",
         "stale_dependency_edge",
         "review_rejected",
+        "no_agent_activity",
         "human_gate",
         "corrupt_state",
         "unknown_operational_stall",

@@ -14,7 +14,7 @@ Hermes Factory не запускает модели самостоятельно
 - Hermes dashboard и `kanban watch` показывают работу.
 - `hermes-factory status` проверяет здоровье и доказательства выполнения.
 - `hermes-factory report` рассчитывает статистику.
-- `hermes-factory reconcile` создаёт recovery-задачу для тайм-аута или отклонённого review и применяет проверенный план замены вне capability fence исполнителя.
+- `hermes-factory reconcile` регистрирует board-level инцидент, если после grace period на доске нет `running`, но остаётся `todo` или recoverable `blocked`; отдельно создаёт recovery-задачи для task-level остановок и применяет проверенные планы замены вне capability fence исполнителя.
 - `hermes-factory stall-taxonomy` показывает стабильные классы остановок и контракты восстановления.
 
 Короткая схема:
@@ -423,6 +423,21 @@ hermes kanban --board hermes-factory runs <task-id> --json
 
 ## 12. Понять нормальный lifecycle
 
+### Нет running при оставшемся backlog
+
+Если после `no_agent_grace` на доске нет карточек в `running`, но остаётся `todo` либо `blocked`, не являющийся подтверждённым human gate, reconciler регистрирует класс `no_agent_activity`. Значение по умолчанию равно `2m` и задаётся в rig:
+
+```yaml
+policies:
+  no_agent_grace: 2m
+```
+
+Factory читает активные статусы и время последней lifecycle-активности одной read-only транзакцией из authoritative SQLite доски, потому что JSON-поверхность Hermes не возвращает все поля, необходимые reconciler. Запись в SQLite запрещена: incident-карточка создаётся только через `hermes kanban`.
+
+Если в snapshot есть `todo`, watchdog создаёт или повторно находит board-level incident до разбора task-level recovery, чтобы зависший разбор отдельной блокировки не заглушил сигнал полной остановки доски. При blocked-only состоянии reconciler сначала исключает подтверждённые human gates. Короткий handoff внутри grace period и доска, где уже есть `running`, incident не создают.
+
+Incident имеет priority `100`, назначается coordinator profile, содержит reason code `no_agent_activity` и стабильный ключ `factory:{project}:reconcile:board:no-agent:{idle_epoch}:{fingerprint}`. Собственные incident-карточки и их события исключаются из idle clock и fingerprint, поэтому повторный cron-проход не размножает карточки. При `--dispatch` Factory только вызывает штатный Hermes dispatcher. Координатор диагностирует причину и создаёт ограниченную корректирующую работу; watchdog не ремонтирует backlog и не меняет граф напрямую.
+
 ### Тайм-аут и декомпозиция
 
 При `max_retries: 1` первый неуспешный запуск переводит карточку в `blocked`. Hermes отвечает за остановку процесса и событие `gave_up`; Factory отвечает за следующую процессную реакцию:
@@ -530,7 +545,12 @@ completed = subprocess.run(command, text=True, capture_output=True, check=False)
 if completed.returncode:
     raise SystemExit(completed.stderr or completed.stdout or completed.returncode)
 payload = json.loads(completed.stdout)
-if payload["recovery_task_ids"] or payload["finalized_recovery_task_ids"] or payload["dispatched"]:
+if (
+    payload["recovery_task_ids"]
+    or payload["finalized_recovery_task_ids"]
+    or payload["board_incident_task_id"]
+    or payload["dispatched"]
+):
     print(json.dumps(payload, ensure_ascii=False))
 ```
 
@@ -552,7 +572,7 @@ hermes cron list
 hermes cron run <job-id>
 ```
 
-Cron обнаруживает timeout, создаёт recovery-карточку и применяет завершённые планы. Декомпозицию выполняет обычная координаторская Hermes-сессия с лимитом из `rig.yaml`; привилегированную очистку графа выполняет только no-agent reconciler.
+Cron сначала регистрирует и передаёт координатору board-level `no_agent_activity`, если backlog остался без исполнителя дольше grace period. Отдельно он обнаруживает task-level timeout/review/unknown stalls, создаёт recovery-карточки и применяет завершённые планы. Диагностику idle-доски и декомпозицию выполняет обычная координаторская Hermes-сессия с лимитом из `rig.yaml`; привилегированную очистку графа выполняет только no-agent reconciler.
 
 ### Типизация остановок
 
@@ -563,7 +583,7 @@ uv run hermes-factory stall-taxonomy
 uv run hermes-factory stall-taxonomy --json
 ```
 
-Основные `reason_code`: `normal_dependency_wait`, `awaiting_dispatch`, `stale_runner`, `worker_timeout`, `stale_dependency_edge`, `review_rejected`, `human_gate`, `corrupt_state`, `recovery_coordinator_insufficient_kanban_authority`, `unknown_operational_stall`. Для каждого класса фиксируются detection, cause, recovery, authority, verification, fallback и regression test. Автоматическое восстановление объявлено для восьми классов; собственные detector и recovery reconciler'а есть у `worker_timeout`, `review_rejected` и универсального catch-all `unknown_operational_stall` (любая заблокированная Factory-карточка без класса и без явного human gate), остальные закрываются нативной реакцией Hermes (`awaiting_dispatch`, `normal_dependency_wait`, `stale_runner`), финализацией графа (`stale_dependency_edge`) или исправленной поверхностью создания карточек (`recovery_coordinator_insufficient_kanban_authority`). Новая остановка не закрывается единичным ручным ремонтом: сначала добавляется воспроизводимый тест, затем detector и безопасная процедура восстановления.
+Основные `reason_code`: `normal_dependency_wait`, `awaiting_dispatch`, `stale_runner`, `worker_timeout`, `stale_dependency_edge`, `review_rejected`, `no_agent_activity`, `human_gate`, `corrupt_state`, `recovery_coordinator_insufficient_kanban_authority`, `unknown_operational_stall`. Для каждого класса фиксируются detection, cause, recovery, authority, verification, fallback и regression test. Автоматическое восстановление объявлено для девяти классов; собственные detector и recovery reconciler'а есть у board-level `no_agent_activity`, task-level `worker_timeout`, `review_rejected` и универсального catch-all `unknown_operational_stall` (любая заблокированная Factory-карточка без класса и без явного human gate), остальные закрываются нативной реакцией Hermes (`awaiting_dispatch`, `normal_dependency_wait`, `stale_runner`), финализацией графа (`stale_dependency_edge`) или исправленной поверхностью создания карточек (`recovery_coordinator_insufficient_kanban_authority`). Новая остановка не закрывается единичным ручным ремонтом: сначала добавляется воспроизводимый тест, затем detector и безопасная процедура восстановления.
 
 ### Implementation
 

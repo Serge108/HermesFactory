@@ -1092,6 +1092,7 @@ def test_reconcile_json_reports_created_recovery_task(valid_rig: Path, capsys):
         "eligible": 1,
         "recovery_task_ids": {"task-1": "recovery-1"},
         "finalized_recovery_task_ids": [],
+        "board_incident_task_id": None,
         "dispatched": 0,
     }
 

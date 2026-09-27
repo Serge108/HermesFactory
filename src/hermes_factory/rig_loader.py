@@ -44,6 +44,7 @@ _POLICY_KEYS = {
     "max_retries",
     "max_runtime",
     "coordinator_runtime",
+    "no_agent_grace",
     "completion_contract",
     "decision_authority",
     "git_commit_policy",
@@ -54,6 +55,7 @@ _POLICY_REQUIRED_KEYS = _POLICY_KEYS - {
     "git_commit_policy",
     "fixture_recovery",
     "coordinator_runtime",
+    "no_agent_grace",
 }
 
 
@@ -333,6 +335,7 @@ def load_rig(path: Path) -> RigSpec:
             coordinator_runtime=parse_duration(
                 policies.get("coordinator_runtime", policies["max_runtime"])
             ),
+            no_agent_grace=parse_duration(policies.get("no_agent_grace", "2m")),
             completion_contract=_string(
                 policies["completion_contract"], "policies.completion_contract"
             ),

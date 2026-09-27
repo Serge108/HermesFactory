@@ -40,6 +40,7 @@ class PolicySpec:
     max_retries: int
     max_runtime: str
     coordinator_runtime: str
+    no_agent_grace: str
     completion_contract: str
     decision_authority: str
     decision_authority_declared: bool

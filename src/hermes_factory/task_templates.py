@@ -27,6 +27,7 @@ _COMPLETION_METADATA_FIELDS = {
         "superseded_task_ids",
         "limitations",
     ],
+    "incident": ["decision_log", "limitations"],
     "acceptance": [],
 }
 
@@ -98,6 +99,12 @@ def _completion_metadata_section(task_class: str, proof: ProofSpec | None) -> st
         explanation = (
             "Every id must be an exact Kanban task id. `rewires` must contain only objects with "
             "the exact keys `old_parent`, `new_parent`, and `child`."
+        )
+    elif task_class == "incident":
+        metadata = {"decision_log": [], "limitations": []}
+        explanation = (
+            "`decision_log` and `limitations` must be flat lists of non-empty strings. "
+            "Record every diagnosis and corrective action in `decision_log`."
         )
     else:
         metadata = {}

@@ -103,6 +103,18 @@ _CLASSES = (
         automatic=True,
     ),
     StallClass(
+        code="no_agent_activity",
+        detection="No task is running while todo or non-human-gate blocked work remains unchanged beyond the rig's no-agent grace period.",
+        cause="Dispatch, dependency, recovery, or orchestration state left the board with backlog but no active worker.",
+        recovery_owner="coordinator",
+        recovery="Create one idempotent board-level incident for the coordinator to diagnose and restore Hermes-native execution.",
+        authority="The coordinator may diagnose and create bounded in-scope work; Factory retains privileged graph cleanup.",
+        verification="A task reaches running state or the remaining backlog is resolved, intentionally gated, or terminated with evidence.",
+        fallback="Preserve every card and report the incident without editing the board database or bypassing mutation fences.",
+        regression_test="test_reconcile_registers_board_incident_when_no_agent_is_running_past_grace",
+        automatic=True,
+    ),
+    StallClass(
         code="human_gate",
         detection="A blocked acceptance task belongs to a rig whose decision_authority is human and human_acceptance is true, and Factory - not a worker session - authored the card.",
         cause="The mission explicitly reserved product acceptance for the operator.",

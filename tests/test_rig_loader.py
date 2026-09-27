@@ -42,6 +42,35 @@ def test_load_rig_defaults_decision_authority_to_coordinator(tmp_path: Path):
     assert rig.policies.decision_authority == "coordinator"
 
 
+def test_load_rig_defaults_no_agent_grace_to_two_minutes(tmp_path: Path):
+    rig = load_rig(write_rig(tmp_path, cwd="."))
+
+    assert rig.policies.no_agent_grace == "2m"
+
+
+def test_load_rig_accepts_explicit_no_agent_grace(tmp_path: Path):
+    spec = write_rig(tmp_path, cwd=".")
+    replace_in_rig(
+        spec,
+        "completion_contract: local-only}",
+        "completion_contract: local-only, no_agent_grace: 45s}",
+    )
+
+    assert load_rig(spec).policies.no_agent_grace == "45s"
+
+
+def test_load_rig_rejects_invalid_no_agent_grace(tmp_path: Path):
+    spec = write_rig(tmp_path, cwd=".")
+    replace_in_rig(
+        spec,
+        "completion_contract: local-only}",
+        "completion_contract: local-only, no_agent_grace: immediately}",
+    )
+
+    with pytest.raises(SpecError, match="invalid duration"):
+        load_rig(spec)
+
+
 def test_load_rig_requires_explicit_authority_with_human_acceptance(tmp_path: Path):
     spec = write_rig(tmp_path, cwd=".")
     replace_in_rig(spec, "human_acceptance: false", "human_acceptance: true")

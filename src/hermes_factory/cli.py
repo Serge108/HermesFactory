@@ -64,6 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--rig", type=Path, required=True)
     reconcile.add_argument("--json", action="store_true")
     reconcile.add_argument("--dispatch", action="store_true")
+    reconcile.add_argument("--fixture-recovery", action="store_true")
+    reconcile.add_argument("--recovery-runtime")
     reconcile.add_argument("--hermes", default="hermes")
     reconcile.set_defaults(handler_key="reconcile")
     taxonomy = subparsers.add_parser("stall-taxonomy")
@@ -299,7 +301,11 @@ def handle_report(args: argparse.Namespace, client_factory: ClientFactory) -> in
 def handle_reconcile(args: argparse.Namespace, client_factory: ClientFactory) -> int:
     rig = load_rig(args.rig)
     result = reconcile_board(
-        client_factory(args.hermes), rig, dispatch=args.dispatch
+        client_factory(args.hermes),
+        rig,
+        dispatch=args.dispatch,
+        fixture_recovery=args.fixture_recovery,
+        recovery_runtime=args.recovery_runtime,
     )
     payload = {
         "scanned": result.scanned,

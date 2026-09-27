@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -56,6 +57,39 @@ class HermesClient:
             return json.loads(output)
         except json.JSONDecodeError as exc:
             raise HermesCommandError("Hermes returned invalid JSON") from exc
+
+    def task_record(self, board_slug: str, task_id: str) -> dict[str, Any]:
+        """Read fields omitted by Hermes JSON from the authoritative board database."""
+        boards = self.run_json(["kanban", "boards", "list", "--json", "--all"])
+        if not isinstance(boards, list) or any(
+            not isinstance(board, dict) for board in boards
+        ):
+            raise HermesCommandError("Hermes returned malformed board list JSON")
+        matches = [
+            board
+            for board in boards
+            if board.get("slug") == board_slug and board.get("archived") is False
+        ]
+        if len(matches) != 1 or not isinstance(matches[0].get("db_path"), str):
+            raise HermesCommandError(
+                f"Hermes board {board_slug} has no authoritative database path"
+            )
+        database_path = Path(matches[0]["db_path"])
+        try:
+            uri = database_path.resolve().as_uri() + "?mode=ro"
+            with sqlite3.connect(uri, uri=True) as connection:
+                connection.row_factory = sqlite3.Row
+                row = connection.execute(
+                    "select id, idempotency_key, created_by from tasks where id = ?",
+                    (task_id,),
+                ).fetchone()
+        except (OSError, sqlite3.Error) as exc:
+            raise HermesCommandError("failed to read authoritative Hermes task record") from exc
+        if row is None:
+            raise HermesCommandError(
+                f"Hermes task {task_id} is missing from board {board_slug}"
+            )
+        return dict(row)
 
     def profile_exists(self, profile: str) -> bool:
         args = (

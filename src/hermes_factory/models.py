@@ -42,6 +42,7 @@ class PolicySpec:
     completion_contract: str
     decision_authority: str
     git_commit_policy: str
+    fixture_recovery: bool
 
 
 @dataclass(frozen=True, slots=True)

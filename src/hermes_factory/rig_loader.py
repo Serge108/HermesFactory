@@ -46,8 +46,13 @@ _POLICY_KEYS = {
     "completion_contract",
     "decision_authority",
     "git_commit_policy",
+    "fixture_recovery",
 }
-_POLICY_REQUIRED_KEYS = _POLICY_KEYS - {"decision_authority", "git_commit_policy"}
+_POLICY_REQUIRED_KEYS = _POLICY_KEYS - {
+    "decision_authority",
+    "git_commit_policy",
+    "fixture_recovery",
+}
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -327,6 +332,10 @@ def load_rig(path: Path) -> RigSpec:
                 policies.get("git_commit_policy", "off"),
                 "policies.git_commit_policy",
                 {"off", "reviewed-slices"},
+            ),
+            fixture_recovery=_boolean(
+                policies.get("fixture_recovery", False),
+                "policies.fixture_recovery",
             ),
         ),
     )

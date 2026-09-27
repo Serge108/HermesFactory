@@ -4,9 +4,11 @@ from pathlib import Path
 
 import pytest
 
+from hermes_factory import cli as cli_module
 from hermes_factory.cli import main
 from hermes_factory.errors import HermesCommandError
 from hermes_factory.metrics import compute_metrics
+from hermes_factory.reconcile import ReconcileResult
 
 
 class FakeHermesClient:
@@ -1085,3 +1087,36 @@ def test_reconcile_json_reports_created_recovery_task(valid_rig: Path, capsys):
         "finalized_recovery_task_ids": [],
         "dispatched": 0,
     }
+
+
+def test_reconcile_forwards_explicit_fixture_recovery_options(
+    valid_rig: Path, monkeypatch, capsys
+):
+    captured = {}
+
+    def fake_reconcile(client, rig, **kwargs):
+        captured.update(kwargs)
+        return ReconcileResult(0, 0, {}, (), 0)
+
+    monkeypatch.setattr(cli_module, "reconcile_board", fake_reconcile)
+
+    result = main(
+        [
+            "reconcile",
+            "--rig",
+            str(valid_rig),
+            "--fixture-recovery",
+            "--recovery-runtime",
+            "60s",
+            "--json",
+        ],
+        client_factory=lambda executable: object(),
+    )
+
+    assert result == 0
+    assert captured == {
+        "dispatch": False,
+        "fixture_recovery": True,
+        "recovery_runtime": "60s",
+    }
+    assert json.loads(capsys.readouterr().out)["eligible"] == 0

@@ -42,6 +42,45 @@ def test_run_json_preserves_argument_boundaries_for_windows_path():
     ]
 
 
+def test_task_record_reads_authoritative_fields_from_board_database(tmp_path: Path):
+    import sqlite3
+
+    db_path = tmp_path / "Board With Spaces" / "kanban.db"
+    db_path.parent.mkdir()
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "create table tasks (id text primary key, idempotency_key text, created_by text)"
+    )
+    connection.execute(
+        "insert into tasks (id, idempotency_key, created_by) values (?, ?, ?)",
+        (
+            "task-1",
+            "factory:demo:mission:slice:implementation",
+            "hermes-factory",
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    def fake_run(argv, **kwargs):
+        payload = [
+            {
+                "slug": "demo-rig",
+                "archived": False,
+                "db_path": str(db_path),
+            }
+        ]
+        return CompletedProcess(argv, 0, __import__("json").dumps(payload), "")
+
+    record = HermesClient(runner=fake_run).task_record("demo-rig", "task-1")
+
+    assert record == {
+        "id": "task-1",
+        "idempotency_key": "factory:demo:mission:slice:implementation",
+        "created_by": "hermes-factory",
+    }
+
+
 def test_run_uses_safe_utf8_subprocess_options():
     calls = []
 

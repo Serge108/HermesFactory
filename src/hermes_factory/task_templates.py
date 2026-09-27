@@ -385,9 +385,14 @@ def render_commit_body(
 
 
 def render_recovery_contract() -> str:
+    return render_task_contract("recovery", None)
+
+
+def render_task_contract(task_class: str, proof: ProofSpec | None) -> str:
+    """Render the exact audit and completion contract for a generated task."""
     return "\n\n".join(
         [
-            _audit_contract("recovery", None),
-            _completion_metadata_section("recovery", None),
+            _audit_contract(task_class, proof),
+            _completion_metadata_section(task_class, proof),
         ]
     )

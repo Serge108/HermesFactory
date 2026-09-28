@@ -9,6 +9,7 @@ from hermes_factory.board import _parse_task_creation, _subscribe_task
 from hermes_factory.errors import HermesCommandError, SpecError, StaleRecoveryDecision
 from hermes_factory.health import run_succeeded
 from hermes_factory.hermes_cli import HermesClient
+from hermes_factory.materialize import materialize_completed_decompositions
 from hermes_factory.models import ProofSpec, RigSpec
 from hermes_factory.task_templates import (
     AUDIT_CONTRACT_START,
@@ -2679,6 +2680,17 @@ def reconcile_board(
     classification_failures: list[str] = []
     human_gate_ids: set[str] = set()
     eligible = 0
+    materialized_missions: dict[str, dict[str, str]] = {}
+    materialization_failures: dict[str, str] = {}
+    if rig.version >= 2 and any(
+        workflow.decomposition_seat is not None for workflow in rig.workflows.values()
+    ):
+        try:
+            materialization = materialize_completed_decompositions(client, rig)
+            materialized_missions = materialization.materialized
+            materialization_failures = materialization.rejected
+        except Exception as exc:  # noqa: BLE001 - recovery must still dispatch
+            materialization_failures = {"board": str(exc)}
     activity_reader = getattr(client, "board_activity", None)
     if callable(activity_reader):
         preflight_incident = _no_agent_incident(
@@ -2712,10 +2724,19 @@ def reconcile_board(
                         client,
                         rig,
                         [board_incident_task_id],
+                        released_work=bool(materialized_missions),
                     )
                     if dispatch
                     else 0
                 )
+                if materialization_failures:
+                    raise HermesCommandError(
+                        "materialization failed for: "
+                        + "; ".join(
+                            f"{mission}: {reason}"
+                            for mission, reason in sorted(materialization_failures.items())
+                        )
+                    )
                 return ReconcileResult(
                     scanned=len(blocked),
                     eligible=0,
@@ -2814,6 +2835,8 @@ def reconcile_board(
         and not finalized_recovery_task_ids
         and not classification_failures
         and not finalization_failures
+        and not materialized_missions
+        and not materialization_failures
     ):
         incident = _no_agent_incident(
             activity_reader(
@@ -2855,10 +2878,10 @@ def reconcile_board(
             client,
             rig,
             dispatch_candidates,
-            released_work=bool(finalized_recovery_task_ids),
+            released_work=bool(finalized_recovery_task_ids or materialized_missions),
         )
         if dispatch
-        and (dispatch_candidates or finalized_recovery_task_ids)
+        and (dispatch_candidates or finalized_recovery_task_ids or materialized_missions)
         else 0
     )
     failures: list[str] = []
@@ -2870,6 +2893,14 @@ def reconcile_board(
         # Raised only after dispatch: a rejected plan must not wedge released work.
         failures.append(
             "recovery finalization failed for: " + "; ".join(finalization_failures)
+        )
+    if materialization_failures:
+        failures.append(
+            "materialization failed for: "
+            + "; ".join(
+                f"{mission}: {reason}"
+                for mission, reason in sorted(materialization_failures.items())
+            )
         )
     if failures:
         raise HermesCommandError("; ".join(failures))

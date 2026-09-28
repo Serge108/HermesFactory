@@ -185,6 +185,8 @@ def test_decomposition_body_binds_source_contract_and_runtime(
 
     assert canonical_source_contract_sha256(contract) in body
     assert json.dumps(contract, indent=2, ensure_ascii=False) in body
+    assert contract["mission"]["version"] == decomposition_mission.version
+    assert contract["mission"]["human_acceptance"] is decomposition_mission.human_acceptance
     assert "Assigned seat: decomposer; role: decomposition." in body
     assert "workflow.decomposition_seat: decomposer" in body
     assert "decomposer_runtime: 60m" in body

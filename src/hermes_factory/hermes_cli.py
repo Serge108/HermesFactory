@@ -84,7 +84,10 @@ class HermesClient:
             with sqlite3.connect(uri, uri=True) as connection:
                 connection.row_factory = sqlite3.Row
                 row = connection.execute(
-                    "select id, idempotency_key, created_by from tasks where id = ?",
+                    "select id, title, body, assignee, status, created_by, "
+                    "workspace_kind, workspace_path, idempotency_key, "
+                    "max_runtime_seconds, skills, max_retries, completion_contract "
+                    "from tasks where id = ?",
                     (task_id,),
                 ).fetchone()
         except (OSError, sqlite3.Error) as exc:
@@ -93,7 +96,19 @@ class HermesClient:
             raise HermesCommandError(
                 f"Hermes task {task_id} is missing from board {board_slug}"
             )
-        return dict(row)
+        record = dict(row)
+        raw_skills = record.get("skills")
+        if raw_skills is None:
+            record["skills"] = []
+        else:
+            try:
+                skills = json.loads(raw_skills)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise HermesCommandError("Hermes task has malformed authoritative skills") from exc
+            if not isinstance(skills, list) or any(not isinstance(skill, str) for skill in skills):
+                raise HermesCommandError("Hermes task has malformed authoritative skills")
+            record["skills"] = skills
+        return record
 
     def board_activity(
         self,

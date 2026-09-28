@@ -347,10 +347,13 @@ def decomposition_source_contract(
             "cwd": str(rig.project.cwd),
         },
         "mission": {
+            "version": mission.version,
             "id": mission.id,
             "title": mission.title,
             "intent": mission.intent,
             "workflow": mission.workflow,
+            "human_acceptance": mission.human_acceptance,
+            "slice_ids": [item.id for item in mission.slices],
             "acceptance": list(mission.acceptance),
         },
         "source_slice": {

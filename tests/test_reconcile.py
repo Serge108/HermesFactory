@@ -440,6 +440,43 @@ def _idle_snapshot(
     }
 
 
+def test_completed_materialization_runs_before_no_agent_preflight_return(
+    valid_rig: Path, tmp_path: Path, monkeypatch
+):
+    rig_path = tmp_path / "rig-v2.yaml"
+    text = valid_rig.read_text(encoding="utf-8")
+    text = text.replace("version: 1", "version: 2", 1)
+    text = text.replace(
+        "  reviewer: {profile: reviewer, role: independent_review, skills: []}",
+        "  reviewer: {profile: reviewer, role: independent_review, skills: []}\n"
+        "  decomposer: {profile: decomposer, role: decomposition, skills: []}",
+    )
+    text = text.replace(
+        "delivery: {implementation_seat: builder, review_seat: reviewer, acceptance_seat: builder}",
+        "delivery: {decomposition_seat: decomposer, implementation_seat: builder, "
+        "review_seat: reviewer, acceptance_seat: builder}",
+    )
+    text = text.replace(
+        "max_runtime: 30m, completion_contract",
+        "max_runtime: 30m, decomposer_runtime: 60m, max_packets_per_slice: 8, "
+        "max_packet_acceptance_items: 5, completion_contract",
+    )
+    rig_path.write_text(text, encoding="utf-8")
+    calls: list[str] = []
+    monkeypatch.setattr(
+        reconcile_module,
+        "materialize_completed_decompositions",
+        lambda client, rig: calls.append(rig.board.slug)
+        or type("Result", (), {"materialized": {"mission-1": {"task": "task-1"}}, "rejected": {}})(),
+    )
+    client = IdleBoardClient(_idle_snapshot())
+
+    result = reconcile_board(client, load_rig(rig_path))
+
+    assert calls == ["demo-rig"]
+    assert result.board_incident_task_id == "incident-1"
+
+
 def test_reconcile_registers_board_incident_before_task_recovery_when_todo_is_idle(
     valid_rig: Path,
 ):
@@ -1389,6 +1426,57 @@ def test_stale_unknown_recovery_decision_is_disposed_once_without_mutation(
     assert [
         call for call in client.run_calls if call[3] in {"archive", "comment"}
     ] == disposals
+
+
+def test_rejected_materialization_does_not_prevent_recovery_dispatch(
+    valid_rig: Path, tmp_path: Path, monkeypatch
+):
+    rig_path = tmp_path / "rig-v2.yaml"
+    text = valid_rig.read_text(encoding="utf-8")
+    text = text.replace("version: 1", "version: 2", 1)
+    text = text.replace(
+        "  reviewer: {profile: reviewer, role: independent_review, skills: []}",
+        "  reviewer: {profile: reviewer, role: independent_review, skills: []}\n"
+        "  decomposer: {profile: decomposer, role: decomposition, skills: []}",
+    )
+    text = text.replace(
+        "delivery: {implementation_seat: builder, review_seat: reviewer, acceptance_seat: builder}",
+        "delivery: {decomposition_seat: decomposer, implementation_seat: builder, "
+        "review_seat: reviewer, acceptance_seat: builder}",
+    )
+    text = text.replace(
+        "max_runtime: 30m, completion_contract",
+        "max_runtime: 30m, decomposer_runtime: 60m, max_packets_per_slice: 8, "
+        "max_packet_acceptance_items: 5, completion_contract",
+    )
+    rig_path.write_text(text, encoding="utf-8")
+    client = FakeReconcileClient(
+        [
+            [_blocked_task()],
+            _timed_out_show(),
+            {"id": "recovery-1", "status": "ready", "title": "Decompose blocked task task-1"},
+            [],
+        ]
+    )
+    dispatched: list[list[str]] = []
+    monkeypatch.setattr(
+        reconcile_module,
+        "materialize_completed_decompositions",
+        lambda client, rig: type(
+            "Result", (), {"materialized": {}, "rejected": {"bad-mission": "bad manifest"}}
+        )(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        reconcile_module,
+        "_dispatch_reconcile_tasks",
+        lambda client, rig, candidates, **kwargs: dispatched.append(list(candidates)) or 1,
+    )
+
+    with pytest.raises(HermesCommandError, match="materialization failed.*bad-mission"):
+        reconcile_board(client, load_rig(rig_path), dispatch=True)
+
+    assert dispatched == [["recovery-1"]]
 
 
 def test_reconcile_dispatches_only_ready_recovery_tasks(valid_rig: Path):

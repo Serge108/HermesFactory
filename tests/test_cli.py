@@ -341,6 +341,8 @@ def test_mission_plan_prints_json_plan_without_invoking_hermes(
     assert result == 0
     payload = json.loads(captured.out)
     assert payload["board_slug"] == "demo-rig"
+    assert payload["phase"] == "execution"
+    assert payload["pending_materialization"] is False
     assert [task["key"] for task in payload["tasks"]] == [
         "implement:implementation",
         "implement:review",
@@ -356,6 +358,39 @@ def test_mission_plan_prints_json_plan_without_invoking_hermes(
     assert payload["tasks"][0]["idempotency_key"] == (
         "factory:demo:demo-mission:implement:implementation"
     )
+
+
+def test_version_two_plan_reports_decomposition_phase_and_pending_materialization(
+    valid_rig: Path, mission_file: Path, tmp_path: Path, capsys
+):
+    rig_path = tmp_path / "rig-v2.yaml"
+    text = valid_rig.read_text(encoding="utf-8")
+    text = text.replace("version: 1", "version: 2", 1)
+    text = text.replace(
+        "  reviewer: {profile: reviewer, role: independent_review, skills: []}",
+        "  reviewer: {profile: reviewer, role: independent_review, skills: []}\n"
+        "  decomposer: {profile: decomposer-seat, role: decomposition, skills: []}",
+    )
+    text = text.replace(
+        "delivery: {implementation_seat: builder, review_seat: reviewer, acceptance_seat: builder}",
+        "delivery: {decomposition_seat: decomposer, implementation_seat: builder, "
+        "review_seat: reviewer, acceptance_seat: builder}",
+    )
+    rig_path.write_text(text, encoding="utf-8")
+
+    result = main(
+        ["mission", "plan", str(mission_file), "--rig", str(rig_path), "--json"],
+        client_factory=lambda executable: (_ for _ in ()).throw(
+            AssertionError("mission plan must never invoke Hermes")
+        ),
+    )
+
+    assert result == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["phase"] == "decomposition"
+    assert payload["pending_materialization"] is True
+    assert [task["task_class"] for task in payload["tasks"]] == ["decomposition"]
+    assert [task["profile"] for task in payload["tasks"]] == ["decomposer-seat"]
 
 
 def test_mission_plan_rejects_malformed_mission_as_clean_error(

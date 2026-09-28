@@ -22,15 +22,49 @@ class PlannedTask:
     skills: tuple[str, ...]
     initial_status: str | None
     idempotency_key: str
+    task_class: str
 
 
 @dataclass(frozen=True, slots=True)
 class MissionPlan:
     board_slug: str
     tasks: tuple[PlannedTask, ...]
+    phase: str
+    pending_materialization: bool
 
 
-def compile_mission(rig: RigSpec, mission: MissionSpec) -> MissionPlan:
+def compile_decomposition_phase(rig: RigSpec, mission: MissionSpec) -> MissionPlan:
+    from hermes_factory.task_templates import render_decomposition_body
+
+    workflow = rig.workflows[mission.workflow]
+    if workflow.decomposition_seat is None:
+        raise ValueError("decomposition phase requires a decomposition seat")
+    decomposition_seat = rig.seats[workflow.decomposition_seat]
+    tasks = tuple(
+        PlannedTask(
+            key=f"{slice_spec.id}:decomposition",
+            title=f"Decompose {slice_spec.title}",
+            body=render_decomposition_body(rig, mission, slice_spec),
+            profile=decomposition_seat.profile,
+            parents=(),
+            skills=decomposition_seat.skills,
+            initial_status=None,
+            idempotency_key=(
+                f"factory:{rig.project.slug}:{mission.id}:{slice_spec.id}:decomposition"
+            ),
+            task_class="decomposition",
+        )
+        for slice_spec in topological_slices(mission)
+    )
+    return MissionPlan(
+        board_slug=rig.board.slug,
+        tasks=tasks,
+        phase="decomposition",
+        pending_materialization=True,
+    )
+
+
+def compile_execution_phase(rig: RigSpec, mission: MissionSpec) -> MissionPlan:
     workflow = rig.workflows[mission.workflow]
     implementation_seat = rig.seats[workflow.implementation_seat]
     review_seat = rig.seats[workflow.review_seat]
@@ -72,6 +106,7 @@ def compile_mission(rig: RigSpec, mission: MissionSpec) -> MissionPlan:
                 idempotency_key=(
                     f"factory:{rig.project.slug}:{mission.id}:{slice_spec.id}:implementation"
                 ),
+                task_class="implementation",
             )
         )
         next_slices = dependent_slices[slice_spec.id]
@@ -105,6 +140,7 @@ def compile_mission(rig: RigSpec, mission: MissionSpec) -> MissionPlan:
                 idempotency_key=(
                     f"factory:{rig.project.slug}:{mission.id}:{slice_spec.id}:review"
                 ),
+                task_class="review",
             )
         )
         if commit_reviewed_slices:
@@ -121,6 +157,7 @@ def compile_mission(rig: RigSpec, mission: MissionSpec) -> MissionPlan:
                     idempotency_key=(
                         f"factory:{rig.project.slug}:{mission.id}:{slice_spec.id}:commit"
                     ),
+                    task_class="commit",
                 )
             )
         terminal_keys.append(terminal_key(slice_spec.id))
@@ -139,7 +176,20 @@ def compile_mission(rig: RigSpec, mission: MissionSpec) -> MissionPlan:
             skills=acceptance_seat.skills,
             initial_status="blocked" if blocked else None,
             idempotency_key=f"factory:{rig.project.slug}:{mission.id}:acceptance",
+            task_class="acceptance",
         )
     )
 
-    return MissionPlan(board_slug=rig.board.slug, tasks=tuple(tasks))
+    return MissionPlan(
+        board_slug=rig.board.slug,
+        tasks=tuple(tasks),
+        phase="execution",
+        pending_materialization=False,
+    )
+
+
+def compile_mission(rig: RigSpec, mission: MissionSpec) -> MissionPlan:
+    workflow = rig.workflows[mission.workflow]
+    if rig.version >= 2 and workflow.decomposition_seat is not None:
+        return compile_decomposition_phase(rig, mission)
+    return compile_execution_phase(rig, mission)

@@ -194,6 +194,52 @@ def test_factory_completion_metadata_requires_limitations_field():
     )
 
 
+def test_completed_decomposition_manifest_passes_the_health_audit():
+    task = _done_task("decompose-1", result="decomposed")
+    task["created_by"] = "hermes-factory"
+    task["body"] = _contract_body(
+        '{"task_class":"decomposition","required_commands":[],'
+        '"required_artifacts":[],"changed_files_required":false,'
+        '"required_metadata":["version","project","mission","source_slice",'
+        '"source_contract_sha256","packets","limitations"]}'
+    )
+    run = {
+        "status": "done",
+        "outcome": "completed",
+        "summary": "decomposed",
+        "metadata": {
+            "version": 1,
+            "project": "demo",
+            "mission": "mission-one",
+            "source_slice": "architecture",
+            "source_contract_sha256": "a" * 64,
+            "packets": [
+                {
+                    "id": "packet-one",
+                    "title": "Packet one",
+                    "goal": "Deliver one bounded outcome.",
+                    "depends_on": [],
+                    "acceptance": ["Outcome is observable."],
+                    "source_acceptance_indexes": [0],
+                    "likely_files": ["src/demo.py"],
+                    "symbols": ["demo.run"],
+                    "first_artifact": "Add the focused failing test.",
+                    "proof": {
+                        "commands": ["uv run pytest tests/test_demo.py -q"],
+                        "artifacts": [],
+                        "changed_files_required": True,
+                    },
+                }
+            ],
+            "limitations": [],
+        },
+    }
+
+    assert audit_tasks(
+        tasks=[task], runs_by_task={"decompose-1": [run]}, diagnostics=[]
+    ) == ()
+
+
 def test_commit_contract_requires_git_hash_and_decision_log():
     task = _done_task("t-commit", result="committed")
     task["created_by"] = "hermes-factory"

@@ -139,11 +139,22 @@ def handle_mission_plan(args: argparse.Namespace, client_factory: ClientFactory)
             "parents": list(task.parents),
             "idempotency_key": task.idempotency_key,
             "initial_status": task.initial_status,
+            "task_class": task.task_class,
         }
         for task in plan.tasks
     ]
     if args.json:
-        print(json.dumps({"board_slug": plan.board_slug, "tasks": tasks}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "board_slug": plan.board_slug,
+                    "phase": plan.phase,
+                    "pending_materialization": plan.pending_materialization,
+                    "tasks": tasks,
+                },
+                indent=2,
+            )
+        )
     else:
         for task in tasks:
             parents = ", ".join(task["parents"]) or "-"

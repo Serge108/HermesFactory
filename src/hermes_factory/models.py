@@ -31,6 +31,7 @@ class WorkflowSpec:
     implementation_seat: str
     review_seat: str
     acceptance_seat: str
+    decomposition_seat: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +47,9 @@ class PolicySpec:
     decision_authority_declared: bool
     git_commit_policy: str
     fixture_recovery: bool
+    decomposer_runtime: str | None = None
+    max_packets_per_slice: int | None = None
+    max_packet_acceptance_items: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

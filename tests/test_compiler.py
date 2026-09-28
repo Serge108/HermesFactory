@@ -71,6 +71,28 @@ def single_slice_mission(valid_rig: Path, tmp_path: Path, rig):
     return load_mission(path, rig)
 
 
+def _decomposer_rig(valid_rig: Path, tmp_path: Path):
+    path = tmp_path / "rig-v2.yaml"
+    text = valid_rig.read_text(encoding="utf-8")
+    text = text.replace("version: 1", "version: 2", 1)
+    text = text.replace(
+        "  reviewer: {profile: reviewer, role: independent_review, skills: []}",
+        "  reviewer: {profile: reviewer, role: independent_review, skills: []}\n"
+        "  decomposer: {profile: decomposer-seat, role: decomposition, skills: []}",
+    )
+    text = text.replace(
+        "delivery: {implementation_seat: builder, review_seat: reviewer, acceptance_seat: builder}",
+        "delivery: {decomposition_seat: decomposer, implementation_seat: builder, "
+        "review_seat: reviewer, acceptance_seat: builder}",
+    )
+    text = text.replace(
+        "completion_contract: local-only}",
+        "completion_contract: local-only, decision_authority: coordinator}",
+    )
+    path.write_text(text, encoding="utf-8")
+    return load_rig(path)
+
+
 def test_single_slice_yields_implementation_review_and_acceptance(rig, single_slice_mission):
     plan = compile_mission(rig, single_slice_mission)
 
@@ -87,6 +109,38 @@ def test_single_slice_yields_implementation_review_and_acceptance(rig, single_sl
     assert implementation.parents == ()
     assert implementation.idempotency_key == "factory:demo:demo-mission:implement:implementation"
     assert implementation.initial_status is None
+
+
+def test_version_two_compiles_only_decomposition_tasks_before_materialization(
+    valid_rig: Path, tmp_path: Path
+):
+    rig = _decomposer_rig(valid_rig, tmp_path)
+    mission_path = tmp_path / "mission-v2.yaml"
+    mission_path.write_text(_TWO_SLICES, encoding="utf-8")
+    mission = load_mission(mission_path, rig)
+
+    plan = compile_mission(rig, mission)
+
+    assert plan.phase == "decomposition"
+    assert plan.pending_materialization is True
+    assert [task.key for task in plan.tasks] == [
+        "implement:decomposition",
+        "polish:decomposition",
+    ]
+    assert all(task.task_class == "decomposition" for task in plan.tasks)
+    assert all(task.profile == "decomposer-seat" for task in plan.tasks)
+    assert all(task.parents == () for task in plan.tasks)
+    assert [task.idempotency_key for task in plan.tasks] == [
+        "factory:demo:demo-mission:implement:decomposition",
+        "factory:demo:demo-mission:polish:decomposition",
+    ]
+
+
+def test_version_one_plan_remains_direct_execution(rig, single_slice_mission):
+    plan = compile_mission(rig, single_slice_mission)
+
+    assert plan.phase == "execution"
+    assert plan.pending_materialization is False
 
 
 def test_review_task_depends_on_implementation_and_uses_review_profile(rig, single_slice_mission):

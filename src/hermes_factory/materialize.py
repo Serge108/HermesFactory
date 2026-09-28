@@ -233,8 +233,32 @@ def _latest_manifest(
         raise HermesCommandError(
             "completed decomposition task has no single authoritative completion event"
         )
+    metadata = successful.get("metadata")
+    if isinstance(metadata, dict):
+        # Hermes stamps its own run envelope onto the metadata of the completion a worker
+        # records: `kanban_complete` merges `worker_session_id`, and `_merge_artifacts` merges
+        # the attachments the worker declared. A real manifest always arrives inside that
+        # envelope, which belongs to the runtime and never to the decomposer, so it is removed
+        # here. Every other key stays validated exactly: an unknown key is decomposer drift and
+        # still rejects the whole mission, and a malformed envelope is refused rather than
+        # silently dropped, even though an authored key of the same name cannot be told apart
+        # from the runtime's - the runtime wins, and its value is never interpreted.
+        manifest = dict(metadata)
+        worker_session_id = manifest.pop("worker_session_id", None)
+        if worker_session_id is not None and (
+            not isinstance(worker_session_id, str) or not worker_session_id
+        ):
+            raise HermesCommandError("completed decomposition task has malformed run envelope")
+        artifacts = manifest.pop("artifacts", None)
+        if artifacts is not None and (
+            not isinstance(artifacts, list)
+            or any(not isinstance(name, str) or not name for name in artifacts)
+        ):
+            raise HermesCommandError("completed decomposition task has malformed run envelope")
+    else:
+        manifest = metadata
     return parse_decomposition_manifest(
-        successful.get("metadata"),
+        manifest,
         expected_project=rig.project.slug,
         expected_mission=mission.id,
         expected_source_slice=source_slice.id,

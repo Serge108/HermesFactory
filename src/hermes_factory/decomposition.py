@@ -314,6 +314,32 @@ def _validate_packet_graph(packets: tuple[ExecutionPacketSpec, ...]) -> None:
             remaining[packet_id].discard(ready)
 
 
+_PROOF_COMMAND_SHELL_SYNTAX = frozenset("&|;<>`$()\\\n\r")
+
+
+def is_trusted_proof_command(command: str, trusted_commands: set[str]) -> bool:
+    """Whether a packet proof command stays anchored in the source contract's commands.
+
+    A packet proves one bounded behavior, so it may narrow the slice's own command - the
+    packet contract asks for a focused proof per packet, while a real slice declares a
+    suite-wide one. Only *arguments* may be added: a shell control operator, substitution,
+    redirection, or escape in the remainder starts a second command, so the card would label
+    that second command as validated. A declared command is trusted verbatim whatever it
+    contains, a different base is exactly the drift the trust set exists to catch, and an
+    empty trust set trusts nothing.
+    """
+    for trusted in trusted_commands:
+        if command == trusted:
+            return True
+        if not command.startswith(f"{trusted} "):
+            continue
+        extension = command[len(trusted) :]
+        if any(character in _PROOF_COMMAND_SHELL_SYNTAX for character in extension):
+            continue
+        return True
+    return False
+
+
 def parse_decomposition_manifest(
     value: Any,
     *,
@@ -406,7 +432,7 @@ def parse_decomposition_manifest(
                     f"index {acceptance_index} verbatim"
                 )
         for command in packet.proof.commands:
-            if command not in trusted_commands:
+            if not is_trusted_proof_command(command, trusted_commands):
                 raise SpecError(
                     f"packet {packet.id!r}.proof contains untrusted proof command {command!r}"
                 )

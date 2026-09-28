@@ -224,6 +224,44 @@ def test_decomposition_body_requires_exact_manifest_and_full_coverage(
     assert "run metadata" in body
 
 
+def test_decomposition_body_states_that_limitations_refuses_materialization(
+    decomposition_rig, decomposition_mission
+):
+    """A live decomposer filled `limitations` with scope notes and stopped the mission.
+
+    The manifest validator treats any non-empty `limitations` as a refusal, so the body has
+    to say that plainly: read as a note channel, the field silently blocks materialization.
+    """
+    body = render_decomposition_body(
+        decomposition_rig, decomposition_mission, decomposition_mission.slices[0]
+    )
+
+    assert "`limitations` is a refusal channel, not a note channel" in body
+    assert "any non-empty entry stops materialization" in body
+    assert "scope or design notes belong" not in body
+    assert "Scope or design notes belong in the packet text" in body
+
+
+def test_decomposition_body_states_the_acceptance_and_proof_anchoring_rules(
+    decomposition_rig, decomposition_mission
+):
+    """A live decomposer paraphrased acceptance and invented a proof base, as did the first.
+
+    The validator requires each covered source acceptance item word for word and anchors
+    every packet command in the source contract's own commands, so the body must teach
+    both, and its manifest example must show them instead of a bare criterion.
+    """
+    body = render_decomposition_body(
+        decomposition_rig, decomposition_mission, decomposition_mission.slices[0]
+    )
+
+    assert "word for word" in body
+    assert "never a different base" in body
+    assert "every declared source proof command must still appear exactly as declared" in body
+    assert '"<the covered source acceptance item, word for word>"' in body
+    assert '"a declared source proof command, narrowed if needed"' in body
+
+
 def test_decomposition_body_forbids_privileged_or_scope_changing_actions(
     decomposition_rig, decomposition_mission
 ):
@@ -409,6 +447,36 @@ def test_packet_implementation_body_never_relays_untrusted_decomposer_commands(
 
     with pytest.raises(SpecError, match="not authorized by the source slice"):
         render_packet_implementation_body(rig, mission, implement, packet)
+
+
+def test_packet_implementation_body_accepts_a_command_narrowing_the_slice_proof(
+    rig, mission, implement
+):
+    """The packet contract asks for a focused proof, so a narrower form is authorized.
+
+    A real slice declares a suite-wide command. Rendering must not force the packet to
+    repeat it verbatim, while still refusing anything not anchored in it.
+    """
+    packet = ExecutionPacketSpec(
+        id="focused-change",
+        title="Focused change",
+        goal="Deliver one observable behavior.",
+        depends_on=(),
+        acceptance=("Focused behavior passes.",),
+        source_acceptance_indexes=(0,),
+        likely_files=("src/hermes_factory/example.py",),
+        symbols=("example.change",),
+        first_artifact="Add the failing test.",
+        proof=DecompositionProofSpec(
+            commands=("uv run pytest -q tests/test_example.py",),
+            artifacts=(),
+            changed_files_required=True,
+        ),
+    )
+
+    body = render_packet_implementation_body(rig, mission, implement, packet)
+
+    assert "uv run pytest -q tests/test_example.py" in body
 
 
 def test_packet_implementation_body_preserves_validated_packet_proof_partition(

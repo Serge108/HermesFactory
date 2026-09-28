@@ -78,8 +78,16 @@ def _load_proof(value: Any, slice_id: str, rig: RigSpec) -> ProofSpec | None:
         return None
     proof = _mapping(value, f"slice {slice_id!r}.proof")
     _validate_keys(proof, _PROOF_KEYS, f"slice {slice_id!r}.proof")
+    commands = _string_list(proof["commands"], f"slice {slice_id!r}.proof.commands")
+    if not commands:
+        # A packet must carry a proof command anchored in the source contract, so an empty
+        # command list leaves the trust set empty and makes the mission unsolvable: refuse it
+        # here rather than at materialization.
+        raise SpecError(
+            f"slice {slice_id!r}.proof.commands must declare at least one command"
+        )
     return ProofSpec(
-        commands=_string_list(proof["commands"], f"slice {slice_id!r}.proof.commands"),
+        commands=commands,
         artifacts=_artifact_names(
             proof["artifacts"], f"slice {slice_id!r}.proof.artifacts"
         ),

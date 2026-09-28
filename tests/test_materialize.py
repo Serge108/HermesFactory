@@ -512,6 +512,104 @@ def test_malformed_manifest_rejects_the_whole_mission_before_any_execution_card(
     assert not any("hermes-factory:materialized:" in " ".join(call) for call in client.run_calls)
 
 
+def test_manifest_reads_through_hermes_run_envelope(valid_rig: Path, tmp_path: Path):
+    """Hermes stamps its own run envelope onto the completion a worker records.
+
+    `kanban_complete` merges `worker_session_id` into the run metadata it writes, so a
+    real decomposer's manifest always arrives inside that envelope. The envelope is the
+    runtime's, never decomposer drift, so it is removed before the manifest is validated
+    exactly; a genuinely unknown decomposer key must still reject the whole mission.
+    """
+    rig, mission = _rig_and_mission(valid_rig, tmp_path)
+    tasks, details = _decomposition_board(rig, mission, ("done", "done"))
+    for detail in details.values():
+        for run in detail["runs"]:
+            run["metadata"] = {**run["metadata"], "worker_session_id": "session-abc123"}
+    client = MaterializeClient(tasks, details)
+
+    result = materialize_completed_decompositions(client, rig)
+
+    assert result.rejected == {}
+    assert set(result.materialized["demo-mission"]) == {
+        "first:packet-1:implementation",
+        "first:packet-1:review",
+        "second:packet-2:implementation",
+        "second:packet-2:review",
+        "acceptance",
+    }
+
+
+def test_manifest_still_rejects_an_unknown_decomposer_key(valid_rig: Path, tmp_path: Path):
+    rig, mission = _rig_and_mission(valid_rig, tmp_path)
+    tasks, details = _decomposition_board(rig, mission, ("done", "done"))
+    for detail in details.values():
+        for run in detail["runs"]:
+            run["metadata"] = {**run["metadata"], "decomposer_note": "extra"}
+    client = MaterializeClient(tasks, details)
+
+    result = materialize_completed_decompositions(client, rig)
+
+    assert result.materialized == {}
+    assert "demo-mission" in result.rejected
+    assert "decomposer_note" in result.rejected["demo-mission"]
+    assert not any(call[3] == "create" for call in client.json_calls)
+
+
+def test_manifest_rejects_a_malformed_run_envelope(valid_rig: Path, tmp_path: Path):
+    rig, mission = _rig_and_mission(valid_rig, tmp_path)
+    tasks, details = _decomposition_board(rig, mission, ("done", "done"))
+    for detail in details.values():
+        for run in detail["runs"]:
+            run["metadata"] = {**run["metadata"], "worker_session_id": ""}
+    client = MaterializeClient(tasks, details)
+
+    result = materialize_completed_decompositions(client, rig)
+
+    assert result.materialized == {}
+    assert "demo-mission" in result.rejected
+    assert not any(call[3] == "create" for call in client.json_calls)
+
+
+def test_manifest_reads_through_hermes_runtime_artifacts_envelope(
+    valid_rig: Path, tmp_path: Path
+):
+    """Hermes writes attached artifacts into the completion metadata it records.
+
+    `_merge_artifacts` stores them as `metadata["artifacts"]` for `kanban_complete` and
+    `kanban_request_review`, and the decomposer body itself instructs a worker to attach its
+    plan, so an honest decomposer with attachments must not kill the whole mission with an
+    unknown-key rejection.
+    """
+    rig, mission = _rig_and_mission(valid_rig, tmp_path)
+    tasks, details = _decomposition_board(rig, mission, ("done", "done"))
+    for detail in details.values():
+        for run in detail["runs"]:
+            run["metadata"] = {**run["metadata"], "artifacts": ["decomposition-plan.md"]}
+    client = MaterializeClient(tasks, details)
+
+    result = materialize_completed_decompositions(client, rig)
+
+    assert result.rejected == {}
+    assert "demo-mission" in result.materialized
+
+
+def test_manifest_rejects_a_malformed_runtime_artifacts_envelope(
+    valid_rig: Path, tmp_path: Path
+):
+    rig, mission = _rig_and_mission(valid_rig, tmp_path)
+    tasks, details = _decomposition_board(rig, mission, ("done", "done"))
+    for detail in details.values():
+        for run in detail["runs"]:
+            run["metadata"] = {**run["metadata"], "artifacts": "not-a-list"}
+    client = MaterializeClient(tasks, details)
+
+    result = materialize_completed_decompositions(client, rig)
+
+    assert result.materialized == {}
+    assert "demo-mission" in result.rejected
+    assert not any(call[3] == "create" for call in client.json_calls)
+
+
 def test_active_execution_key_collision_is_rejected_before_any_create(
     valid_rig: Path, tmp_path: Path
 ):

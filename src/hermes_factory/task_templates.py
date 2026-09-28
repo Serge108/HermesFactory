@@ -5,6 +5,7 @@ import json
 from hermes_factory.decomposition import (
     ExecutionPacketSpec,
     canonical_source_contract_sha256,
+    is_trusted_proof_command,
 )
 from hermes_factory.errors import SpecError
 from hermes_factory.models import MissionSpec, ProofSpec, RigSpec, SliceSpec
@@ -85,13 +86,16 @@ def _completion_metadata_section(task_class: str, proof: ProofSpec | None) -> st
                     "title": "Concrete reviewable behavior",
                     "goal": "One observable outcome",
                     "depends_on": [],
-                    "acceptance": ["Observable packet-level criterion"],
+                    "acceptance": [
+                        "<the covered source acceptance item, word for word>",
+                        "Observable packet-level criterion",
+                    ],
                     "source_acceptance_indexes": [0],
                     "likely_files": ["relative/path.py"],
                     "symbols": ["module.symbol"],
                     "first_artifact": "Add a failing focused test for the behavior.",
                     "proof": {
-                        "commands": ["focused proof command"],
+                        "commands": ["a declared source proof command, narrowed if needed"],
                         "artifacts": [],
                         "changed_files_required": True,
                     },
@@ -405,13 +409,16 @@ def render_decomposition_body(
                 "title": "Concrete reviewable behavior",
                 "goal": "One observable outcome",
                 "depends_on": [],
-                "acceptance": ["Observable packet-level criterion"],
+                "acceptance": [
+                    "<the covered source acceptance item, word for word>",
+                    "Observable packet-level criterion",
+                ],
                 "source_acceptance_indexes": [0],
                 "likely_files": ["relative/path.py"],
                 "symbols": ["module.symbol"],
                 "first_artifact": "Add a failing focused test for the behavior.",
                 "proof": {
-                    "commands": ["focused proof command"],
+                    "commands": ["a declared source proof command, narrowed if needed"],
                     "artifacts": [],
                     "changed_files_required": True,
                 },
@@ -434,11 +441,20 @@ def render_decomposition_body(
         (
             "# Decomposition output\nReturn exactly one version-1 manifest with this JSON shape:\n"
             f"```json\n{json.dumps(manifest, indent=2)}\n```\n"
-            "Every source acceptance index must be covered by at least one packet. Preserve all "
+            "Every source acceptance index must be covered by at least one packet, and a packet's "
+            "`acceptance` list must carry each source acceptance item it declares by index word for "
+            "word. Preserve all "
             "architecture, goal, dependency, acceptance, and proof boundaries. Each packet must be a "
             "small vertical reviewable behavior with exact inspected likely files and symbols, one early "
-            "durable first artifact, and a narrow proof command. Record blocking uncertainty in "
-            "`limitations`; never silently revise the source contract."
+            "durable first artifact, and a narrow proof command: a packet command must be a declared "
+            "source proof command or that command with additional arguments, never a different base, "
+            "and every declared source proof command must still appear exactly as declared in at least "
+            "one packet - narrowing one packet never removes the slice's own command from the manifest. "
+            "`limitations` is a refusal channel, not "
+            "a note channel: keep it empty for every manifest you can materialize, because any non-empty "
+            "entry stops materialization and returns the decision to the coordinator. Use it only when "
+            "the architectural slice genuinely cannot be decomposed safely, and never silently revise the "
+            "source contract. Scope or design notes belong in the packet text, never in `limitations`."
         ),
         (
             "# Packet limits\n"
@@ -512,7 +528,10 @@ def render_packet_implementation_body(
         if packet.proof.commands or packet.proof.artifacts or packet.proof.changed_files_required:
             raise SpecError("packet proof is not authorized by the source slice")
     else:
-        if any(command not in trusted_proof.commands for command in packet.proof.commands):
+        if any(
+            not is_trusted_proof_command(command, set(trusted_proof.commands))
+            for command in packet.proof.commands
+        ):
             raise SpecError("packet proof command is not authorized by the source slice")
         if any(artifact not in trusted_proof.artifacts for artifact in packet.proof.artifacts):
             raise SpecError("packet proof artifact is not authorized by the source slice")

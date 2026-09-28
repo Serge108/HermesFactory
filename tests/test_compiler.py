@@ -2,9 +2,21 @@ from pathlib import Path
 
 import pytest
 
-from hermes_factory.compiler import MissionPlan, PlannedTask, compile_mission
+from hermes_factory.compiler import (
+    MissionPlan,
+    PlannedTask,
+    compile_materialized_execution_phase,
+    compile_mission,
+)
+from hermes_factory.decomposition import (
+    DecompositionManifest,
+    DecompositionProofSpec,
+    ExecutionPacketSpec,
+    canonical_source_contract_sha256,
+)
 from hermes_factory.mission_loader import load_mission
 from hermes_factory.rig_loader import load_rig
+from hermes_factory.task_templates import decomposition_source_contract
 
 _TWO_SLICES = """\
 version: 1
@@ -281,3 +293,122 @@ def test_coordinator_authority_adds_reviewed_commit_gate_and_removes_human_stop(
     assert "local git commit" in keys["implement:commit"].body.lower()
     assert "never push" in keys["implement:commit"].body.lower()
     assert "without waiting for the operator" in keys["acceptance"].body.lower()
+
+
+def _packet(packet_id: str, *, depends_on: tuple[str, ...] = ()) -> ExecutionPacketSpec:
+    return ExecutionPacketSpec(
+        id=packet_id,
+        title=f"Packet {packet_id}",
+        goal=f"Deliver {packet_id}.",
+        depends_on=depends_on,
+        acceptance=("A failing test was observed before implementation.",),
+        source_acceptance_indexes=(0,),
+        likely_files=(f"src/{packet_id}.py",),
+        symbols=(f"{packet_id}.run",),
+        first_artifact=f"Add the failing {packet_id} test.",
+        proof=DecompositionProofSpec(
+            commands=("uv run pytest -q",),
+            artifacts=(),
+            changed_files_required=True,
+        ),
+    )
+
+
+def _manifest(
+    rig,
+    mission,
+    slice_id: str,
+    packets: tuple[ExecutionPacketSpec, ...],
+) -> DecompositionManifest:
+    source_slice = next(item for item in mission.slices if item.id == slice_id)
+    return DecompositionManifest(
+        version=1,
+        project="demo",
+        mission="demo-mission",
+        source_slice=slice_id,
+        source_contract_sha256=canonical_source_contract_sha256(
+            decomposition_source_contract(rig, mission, source_slice)
+        ),
+        packets=packets,
+        limitations=(),
+    )
+
+
+def test_materialized_execution_plan_preserves_packet_and_cross_slice_dependencies(
+    valid_rig: Path, tmp_path: Path
+):
+    rig = _decomposer_rig(valid_rig, tmp_path)
+    mission_path = tmp_path / "mission-materialized.yaml"
+    mission_path.write_text(_TWO_SLICES, encoding="utf-8")
+    mission = load_mission(mission_path, rig)
+    manifests = {
+        "implement": _manifest(
+            rig,
+            mission,
+            "implement",
+            (_packet("red"), _packet("green", depends_on=("red",))),
+        ),
+        "polish": _manifest(rig, mission, "polish", (_packet("tidy"),)),
+    }
+
+    plan = compile_materialized_execution_phase(rig, mission, manifests)
+    tasks = {task.key: task for task in plan.tasks}
+
+    assert plan.phase == "execution"
+    assert plan.pending_materialization is False
+    assert tasks["implement:red:implementation"].parents == ()
+    assert tasks["implement:red:review"].parents == (
+        "implement:red:implementation",
+    )
+    assert tasks["implement:green:implementation"].parents == (
+        "implement:red:review",
+    )
+    assert tasks["polish:tidy:implementation"].parents == (
+        "implement:green:review",
+    )
+    assert tasks["acceptance"].parents == ("polish:tidy:review",)
+    assert tasks["implement:red:implementation"].idempotency_key == (
+        "factory:demo:demo-mission:implement:packet:red:implementation"
+    )
+    assert "Add the failing red test." in tasks["implement:red:implementation"].body
+
+
+def test_materialization_requires_exactly_one_manifest_per_architectural_slice(
+    valid_rig: Path, tmp_path: Path
+):
+    rig = _decomposer_rig(valid_rig, tmp_path)
+    mission_path = tmp_path / "mission-materialized.yaml"
+    mission_path.write_text(_TWO_SLICES, encoding="utf-8")
+    mission = load_mission(mission_path, rig)
+
+    with pytest.raises(ValueError, match="missing decomposition manifests.*polish"):
+        compile_materialized_execution_phase(
+            rig,
+            mission,
+            {"implement": _manifest(rig, mission, "implement", (_packet("red"),))},
+        )
+
+
+def test_materialization_rejects_a_manifest_bound_to_a_stale_source_contract(
+    valid_rig: Path, tmp_path: Path
+):
+    rig = _decomposer_rig(valid_rig, tmp_path)
+    mission_path = tmp_path / "mission-materialized.yaml"
+    mission_path.write_text(_TWO_SLICES, encoding="utf-8")
+    mission = load_mission(mission_path, rig)
+    manifests = {
+        "implement": _manifest(rig, mission, "implement", (_packet("red"),)),
+        "polish": _manifest(rig, mission, "polish", (_packet("tidy"),)),
+    }
+    manifests["implement"] = DecompositionManifest(
+        version=1,
+        project=manifests["implement"].project,
+        mission=manifests["implement"].mission,
+        source_slice=manifests["implement"].source_slice,
+        source_contract_sha256="a" * 64,
+        packets=manifests["implement"].packets,
+        limitations=(),
+    )
+
+    with pytest.raises(ValueError, match="source contract"):
+        compile_materialized_execution_phase(rig, mission, manifests)

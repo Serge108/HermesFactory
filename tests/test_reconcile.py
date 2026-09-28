@@ -1,10 +1,13 @@
+import copy
 import json
 from pathlib import Path
 
 import pytest
 
 from hermes_factory import reconcile as reconcile_module
+from hermes_factory.compiler import compile_decomposition_phase
 from hermes_factory.errors import HermesCommandError, SpecError
+from hermes_factory.mission_loader import load_mission
 from hermes_factory.reconcile import (
     RecoveryPlan,
     RecoveryRewire,
@@ -12,7 +15,14 @@ from hermes_factory.reconcile import (
     reconcile_board,
 )
 from hermes_factory.rig_loader import load_rig
-from hermes_factory.task_templates import REVIEW_REJECTION_PREFIX, parse_audit_contract
+from hermes_factory.task_templates import (
+    REVIEW_REJECTION_PREFIX,
+    decomposition_source_contract,
+    parse_audit_contract,
+)
+
+
+_CHECKPOINT_PREFIX = "Factory progress checkpoint:"
 
 
 def _audit_body(
@@ -369,6 +379,927 @@ def _timed_out_show(task_id: str = "task-1") -> dict[str, object]:
             }
         ],
     }
+
+
+def _checkpoint_show(*, reason: str | None = None, run_id: int = 7) -> dict[str, object]:
+    detail = _timed_out_show()
+    detail["events"] = [
+        {"kind": "created", "created_at": 90, "payload": {"creator_task_id": None}},
+        {"kind": "claimed", "created_at": 100, "run_id": run_id},
+        {
+            "kind": "blocked",
+            "created_at": 101,
+            "run_id": run_id,
+            "payload": {
+                "reason": reason
+                or _CHECKPOINT_PREFIX
+                + json.dumps(
+                    {
+                        "version": 1,
+                        "changed_files": ["src/demo.py"],
+                        "completed_acceptance_indexes": [0],
+                        "remaining": ["untrusted worker wording"],
+                        "commands": [{"command": "pytest focused", "exit_code": 1}],
+                        "next_action": "untrusted command text",
+                        "limitations": [],
+                    },
+                    separators=(",", ":"),
+                )
+            },
+        },
+    ]
+    detail["runs"] = [
+        {"id": run_id, "status": "blocked", "outcome": "blocked", "metadata": {}}
+    ]
+    detail["task"]["last_failure_error"] = None
+    return detail
+
+
+def test_exact_run_bound_checkpoint_outranks_unknown_stall(valid_rig: Path):
+    detail = _checkpoint_show()
+
+    classified = reconcile_module._classify_blocked_factory_task(
+        detail, load_rig(valid_rig)
+    )
+
+    assert classified is not None
+    assert classified[0] == "progress_checkpoint"
+
+
+@pytest.mark.parametrize(
+    "reason, mutate",
+    [
+        ("Worker says Factory progress checkpoint: soon", None),
+        (None, "stale"),
+    ],
+)
+def test_checkpoint_lookalike_malformed_stale_or_wrong_run_is_not_classified(
+    valid_rig: Path, reason: str | None, mutate: str | None
+):
+    detail = _checkpoint_show(reason=reason)
+    if mutate == "stale":
+        detail["events"].append(
+            {
+                "kind": "blocked",
+                "created_at": 102,
+                "run_id": 8,
+                "payload": {"reason": "newer incident"},
+            }
+        )
+    elif mutate == "wrong-run":
+        detail["runs"][0]["id"] = 8
+
+    classified = reconcile_module._classify_blocked_factory_task(
+        detail, load_rig(valid_rig)
+    )
+
+    assert classified is not None
+    assert classified[0] == "unknown_operational_stall"
+
+
+def test_malformed_exact_checkpoint_fails_closed(valid_rig: Path):
+    detail = _checkpoint_show(reason=_CHECKPOINT_PREFIX + "not-json")
+
+    with pytest.raises(HermesCommandError, match="malformed progress checkpoint"):
+        reconcile_module._classify_blocked_factory_task(detail, load_rig(valid_rig))
+
+
+def test_exact_checkpoint_with_wrong_run_binding_fails_closed(valid_rig: Path):
+    detail = _checkpoint_show()
+    detail["runs"][0]["id"] = 8
+
+    with pytest.raises(HermesCommandError, match="malformed progress checkpoint"):
+        reconcile_module._classify_blocked_factory_task(detail, load_rig(valid_rig))
+
+
+def test_timed_out_decomposition_classifies_separately(valid_rig: Path):
+    rig = load_rig(valid_rig)
+    detail = _timed_out_show("decomp-1")
+    detail["task"]["body"] = (
+        '<!-- hermes-factory:audit-contract -->\n'
+        'Factory audit contract: {"task_class":"decomposition","required_commands":[],'
+        '"required_artifacts":[],"changed_files_required":false,'
+        '"required_metadata":["version","project","mission","source_slice",'
+        '"source_contract_sha256","packets","limitations"]}\n'
+        '<!-- /hermes-factory:audit-contract -->'
+    )
+    detail["task"]["idempotency_key"] = (
+        "factory:demo:demo-mission:original:decomposition"
+    )
+
+    classified = reconcile_module._classify_blocked_factory_task(detail, rig)
+
+    assert classified is not None
+    assert classified[0] == "decomposer_timeout"
+
+
+class ProgressContinuationClient:
+    """The Kanban surface of the non-destructive checkpoint continuation.
+
+    A correct continuation never mutates the checkpointed source or its own review
+    child: it adds a keyed continuation behind the parked card and a fresh keyed review
+    behind the continuation. ``link``/``unlink``/``archive`` stay implemented so that a
+    regression which reintroduces the destructive rewire shows up as a recorded command
+    instead of crashing the fake client.
+    """
+
+    SOURCE_KEY = "factory:demo:demo-mission:original:implementation"
+    REVIEW_KEY = "factory:demo:demo-mission:original:review"
+
+    def __init__(self) -> None:
+        self.source = _checkpoint_show()
+        self.source["children"] = ["review-1"]
+        self.source["task"]["body"] = self.source["task"]["body"].replace(
+            "- replacement acceptance",
+            "- completed trusted acceptance\n- remaining trusted acceptance",
+        ).replace(
+            "# Handoff",
+            "# Execution packet\nDeclared first artifact: add focused test\n"
+            "Run the narrow baseline or reproduction command before broad analysis.\n"
+            "Reserve the final 25 percent of the runtime budget for proof and Kanban handoff.\n\n"
+            "# Handoff",
+        )
+        self.child = {
+            "task": {
+                "id": "review-1",
+                "title": "Review large behavior",
+                "body": _audit_body("review"),
+                "assignee": "reviewer",
+                "status": "todo",
+                "created_by": "hermes-factory",
+                "workspace_kind": "dir",
+                "workspace_path": "F:\\Project With Space",
+                "max_retries": 2,
+                "max_runtime_seconds": 1800,
+                "completion_contract": "local-only",
+                "skills": [],
+            },
+            "parents": ["task-1"],
+            "children": [],
+            "comments": [],
+            "events": [{"kind": "created", "payload": {"creator_task_id": None}}],
+            "runs": [],
+        }
+        # Hermes omits the idempotency key from show/list JSON by design: the
+        # authoritative record is the only surface that carries it.
+        self.records: dict[str, dict[str, object]] = {
+            "task-1": {**self.source["task"], "idempotency_key": self.SOURCE_KEY},
+            "review-1": {**self.child["task"], "idempotency_key": self.REVIEW_KEY},
+        }
+        self.created: dict[str, dict[str, object]] = {}
+        self.json_calls: list[list[str]] = []
+        self.run_calls: list[list[str]] = []
+        self.source_shows = 0
+        self.child_shows = 0
+        # Interleaving hooks. A read answers with the state as it was and the card moves
+        # immediately afterwards: that is the window no read can close.
+        self.flip_source_after_show: int | None = None
+        self.flip_source: dict[str, object] | None = None
+        self.flip_child_after_show: int | None = None
+        self.flip_child: dict[str, object] | None = None
+
+    def rekey(self, source_key: str, review_key: str) -> None:
+        # The source card's own show JSON carries its key here, so both the card and the
+        # authoritative record have to move; the review child's key only ever lives in
+        # the record, because Hermes omits the key from show JSON by design.
+        self.source["task"]["idempotency_key"] = source_key
+        self.records["task-1"]["idempotency_key"] = source_key
+        self.records["review-1"]["idempotency_key"] = review_key
+
+    def task_record(self, board_slug: str, task_id: str) -> dict[str, object]:
+        created = self.created.get(task_id)
+        if created is not None:
+            return {**created["task"], "idempotency_key": created["_key"]}
+        return self.records[task_id]
+
+    def run_json(self, args: list[str]) -> object:
+        self.json_calls.append(args)
+        tail = args[3:]
+        if tail == ["list", "--status", "blocked", "--json"]:
+            return [self.source["task"]] if self.source["task"]["status"] == "blocked" else []
+        if tail == ["list", "--status", "done", "--json"]:
+            return []
+        if tail == ["show", "task-1", "--json"]:
+            self.source_shows += 1
+            detail = copy.deepcopy(self.source)
+            if self.flip_source_after_show == self.source_shows:
+                flip, self.flip_source = self.flip_source, None
+                assert flip is not None
+                self.source["task"].update(flip)
+            return detail
+        if tail == ["show", "review-1", "--json"]:
+            self.child_shows += 1
+            detail = copy.deepcopy(self.child)
+            if self.flip_child_after_show == self.child_shows:
+                flip, self.flip_child = self.flip_child, None
+                assert flip is not None
+                self.child["task"].update(flip)
+            return detail
+        if tail[:1] == ["show"] and tail[-1] == "--json" and tail[1] in self.created:
+            return self.created[tail[1]]
+        if tail[:1] == ["create"]:
+            task_id = self._created_id(args)
+            self.created[task_id] = self._creation_detail(task_id, args)
+            return {"id": task_id, "status": "ready", "title": tail[1]}
+        raise AssertionError(args)
+
+    @staticmethod
+    def _created_id(args: list[str]) -> str:
+        key = _flag_value(args, "--idempotency-key")
+        return "continuation-1" if key.endswith(":implementation") else "review-2"
+
+    def _creation_detail(self, task_id: str, args: list[str]) -> dict[str, object]:
+        flags = [index for index, arg in enumerate(args) if arg in {"--skill", "--parent"}]
+        task = {
+            "id": task_id,
+            "title": args[4],
+            "body": _flag_value(args, "--body"),
+            "assignee": _flag_value(args, "--assignee"),
+            "status": "ready",
+            "created_by": _flag_value(args, "--created-by"),
+            "workspace_kind": _flag_value(args, "--workspace").split(":", 1)[0],
+            "workspace_path": _flag_value(args, "--workspace").split(":", 1)[1],
+            "max_retries": int(_flag_value(args, "--max-retries")),
+            "max_runtime_seconds": int(_flag_value(args, "--max-runtime").removesuffix("s")),
+            "completion_contract": _flag_value(args, "--completion-contract"),
+            "skills": [args[i + 1] for i in flags if args[i] == "--skill"],
+        }
+        return {
+            "task": task,
+            "parents": [args[i + 1] for i in flags if args[i] == "--parent"],
+            "children": [],
+            "comments": [],
+            "events": [{"kind": "created", "payload": {"creator_task_id": None}}],
+            "runs": [],
+            "_key": _flag_value(args, "--idempotency-key"),
+        }
+
+    def run(self, args: list[str]) -> str:
+        self.run_calls.append(args)
+        tail = args[3:]
+        if tail[:1] == ["link"]:
+            if tail[1] not in self.child["parents"]:
+                self.child["parents"].append(tail[1])
+        elif tail[:1] == ["unlink"]:
+            if tail[1] in self.child["parents"]:
+                self.child["parents"].remove(tail[1])
+        elif tail[:1] == ["archive"]:
+            self.source["task"]["status"] = "archived"
+        else:
+            raise AssertionError(args)
+        return ""
+
+    def destructive_calls(self) -> list[list[str]]:
+        """Every privileged graph mutation a continuation pass must never issue."""
+        return [call for call in self.run_calls if call[3] in {"link", "unlink", "archive"}]
+
+    def created_keys(self) -> list[str]:
+        return [
+            _flag_value(call, "--idempotency-key")
+            for call in self.json_calls
+            if call[3] == "create"
+        ]
+
+
+class ForgedContinuationClient(ProgressContinuationClient):
+    """Hermes returns any existing non-archived card for the requested key."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.forged = {
+            "task": {
+                "id": "forged-existing",
+                "title": "Worker-authored card",
+                "body": "worker-authored body",
+                "assignee": "builder",
+                "status": "ready",
+                "created_by": "builder",
+                "workspace_kind": "dir",
+                "workspace_path": "F:\\Project With Space",
+                "max_retries": 0,
+                "max_runtime_seconds": 60,
+                "completion_contract": "worker-chosen",
+                "skills": [],
+            },
+            "parents": [],
+            "children": [],
+            "comments": [],
+            "events": [{"kind": "created", "payload": {"creator_task_id": "worker-1"}}],
+            "runs": [],
+        }
+
+    def task_record(self, board_slug: str, task_id: str) -> dict[str, object]:
+        if task_id == "forged-existing":
+            return {**self.forged["task"], "idempotency_key": "worker:chosen"}
+        return super().task_record(board_slug, task_id)
+
+    def run_json(self, args: list[str]) -> object:
+        tail = args[3:]
+        if tail == ["show", "forged-existing", "--json"]:
+            self.json_calls.append(args)
+            return self.forged
+        if tail[:1] == ["create"]:
+            self.json_calls.append(args)
+            return {"id": "forged-existing", "status": "ready", "title": tail[1]}
+        return super().run_json(args)
+
+
+def _continuation_creates(client: ProgressContinuationClient) -> list[list[str]]:
+    return [call for call in client.json_calls if call[3] == "create"]
+
+
+def test_checkpoint_continuation_adds_a_fresh_review_without_rewiring(valid_rig: Path):
+    """A checkpoint is continued by addition: the parked card and its review stay put."""
+    client = ProgressContinuationClient()
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.recovery_task_ids == {"task-1": "continuation-1"}
+    continuation, review = _continuation_creates(client)
+    assert _flag_value(continuation, "--assignee") == "builder"
+    assert _flag_value(continuation, "--max-retries") == "2"
+    assert _flag_value(continuation, "--idempotency-key") == "factory:demo:demo-mission:original-checkpoint-101:implementation"
+    # The parked source is the continuation's prerequisite, never its parent.
+    assert _flag_value(continuation, "--parent") == "parent-1"
+    body = _flag_value(continuation, "--body")
+    assert "remaining trusted acceptance" in body
+    # The worker's completed index is evidence, not proof: the continuation keeps the
+    # full acceptance contract of the interrupted slice.
+    assert "completed trusted acceptance" in body
+    assert "untrusted worker wording" not in body
+    assert "untrusted command text" not in body
+    assert "Declared first artifact: add focused test" in body
+    assert "Reserve the final 25 percent" in body
+    assert "Slice id: original-checkpoint-101" in body
+    # The fresh review rides behind the continuation and reuses the packet's own review
+    # contract; the parked source keeps its status and its own review edge.
+    assert _flag_value(review, "--idempotency-key") == "factory:demo:demo-mission:original-checkpoint-101:review"
+    assert _flag_value(review, "--parent") == "continuation-1"
+    assert _flag_value(review, "--assignee") == "reviewer"
+    assert _flag_value(review, "--max-retries") == "2"
+    assert _flag_value(review, "--created-by") == "hermes-factory"
+    assert "# Progress continuation review" in _flag_value(review, "--body")
+    assert "replacement acceptance" in _flag_value(review, "--body")
+    assert client.created["review-2"]["parents"] == ["continuation-1"]
+    assert client.destructive_calls() == []
+    assert client.source["task"]["status"] == "blocked"
+    assert client.child["parents"] == ["task-1"]
+
+
+def test_checkpoint_continuation_later_passes_only_report_the_same_continuation(
+    valid_rig: Path,
+):
+    """The continuation is derived from the board, so a later pass adds nothing."""
+    client = ProgressContinuationClient()
+    first = reconcile_board(client, load_rig(valid_rig))
+    assert first.recovery_task_ids == {"task-1": "continuation-1"}
+
+    second = reconcile_board(client, load_rig(valid_rig))
+
+    assert second.recovery_task_ids == {"task-1": "continuation-1"}
+    assert client.destructive_calls() == []
+    # Same two keyed cards, no third card, no duplicate and no mutation of the rest.
+    assert set(client.created) == {"continuation-1", "review-2"}
+    assert client.created_keys() == [
+        "factory:demo:demo-mission:original-checkpoint-101:implementation",
+        "factory:demo:demo-mission:original-checkpoint-101:review",
+        "factory:demo:demo-mission:original-checkpoint-101:implementation",
+        "factory:demo:demo-mission:original-checkpoint-101:review",
+    ]
+    assert client.source["task"]["status"] == "blocked"
+    assert client.child["parents"] == ["task-1"]
+
+
+def test_checkpoint_continuation_uses_the_materialized_packet_key_shape(valid_rig: Path):
+    """A real packet card carries the seven-segment compiler key, not a slice key."""
+    client = ProgressContinuationClient()
+    client.rekey(
+        "factory:demo:demo-mission:original:packet:packet-a:implementation",
+        "factory:demo:demo-mission:original:packet:packet-a:review",
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.recovery_task_ids == {"task-1": "continuation-1"}
+    continuation, review = _continuation_creates(client)
+    assert _flag_value(continuation, "--idempotency-key") == "factory:demo:demo-mission:original:packet:packet-a-checkpoint-101:implementation"
+    assert _flag_value(review, "--idempotency-key") == "factory:demo:demo-mission:original:packet:packet-a-checkpoint-101:review"
+    assert _flag_value(review, "--parent") == "continuation-1"
+    assert "Slice id: packet-a-checkpoint-101" in _flag_value(continuation, "--body")
+    assert client.destructive_calls() == []
+    assert client.source["task"]["status"] == "blocked"
+
+
+def test_checkpoint_continuation_uses_the_legacy_packet_key_shape(valid_rig: Path):
+    """The six-segment packet key that report still parses is a trusted shape too."""
+    client = ProgressContinuationClient()
+    client.rekey(
+        "factory:demo:demo-mission:original:packet-a:implementation",
+        "factory:demo:demo-mission:original:packet-a:review",
+    )
+
+    reconcile_board(client, load_rig(valid_rig))
+
+    continuation, review = _continuation_creates(client)
+    assert _flag_value(continuation, "--idempotency-key") == "factory:demo:demo-mission:original:packet-a-checkpoint-101:implementation"
+    assert _flag_value(review, "--idempotency-key") == "factory:demo:demo-mission:original:packet-a-checkpoint-101:review"
+    assert client.destructive_calls() == []
+
+
+@pytest.mark.parametrize(
+    "source_key",
+    [
+        "factory:demo:demo-mission:original:review",
+        "factory:demo:demo-mission:original:decomposition",
+        "factory:demo:demo-mission:original:packet:packet-a:review",
+        "factory:demo:demo-mission:original:packet:packet-a:decomposition",
+        "factory:demo:demo-mission:original:packet:packet-a",
+        "factory:demo:demo-mission:original",
+        "factory:other:demo-mission:original:implementation",
+        "factory:demo:demo-mission:original:packet:packet-a:implementation:extra",
+    ],
+)
+def test_checkpoint_continuation_refuses_a_key_that_is_not_a_trusted_shape(
+    valid_rig: Path, source_key: str
+):
+    """Only the shapes the compiler emits can be continued from."""
+    client = ProgressContinuationClient()
+    client.rekey(source_key, client.REVIEW_KEY)
+
+    with pytest.raises(HermesCommandError, match="malformed Factory key"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert _continuation_creates(client) == []
+    assert client.destructive_calls() == []
+    assert client.source["task"]["status"] == "blocked"
+
+
+def test_checkpoint_continuation_refuses_a_key_whose_derived_segment_is_not_a_slug(
+    valid_rig: Path,
+):
+    """A derived continuation segment must stay a slug the rest of Factory can parse."""
+    packet_id = "p" * 64
+    client = ProgressContinuationClient()
+    client.rekey(
+        f"factory:demo:demo-mission:original:packet:{packet_id}:implementation",
+        f"factory:demo:demo-mission:original:packet:{packet_id}:review",
+    )
+
+    with pytest.raises(HermesCommandError, match="malformed Factory key"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert _continuation_creates(client) == []
+
+
+def test_checkpoint_continuation_keeps_a_review_child_that_completes_mid_pass(
+    valid_rig: Path,
+):
+    """Race the reviewer reproduced: the child finishes after its pending read.
+
+    The destructive rewire removed the finished child's recorded dependency edge and
+    mutated the completed card. A continuation must leave exactly what the race wrote.
+    """
+    client = ProgressContinuationClient()
+    client.flip_child_after_show = 1
+    client.flip_child = {"status": "done"}
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.recovery_task_ids == {"task-1": "continuation-1"}
+    assert client.destructive_calls() == []
+    assert client.child["task"]["status"] == "done"
+    assert client.child["parents"] == ["task-1"]
+    assert client.source["task"]["status"] == "blocked"
+
+
+def test_checkpoint_continuation_never_archives_a_source_that_moves_after_the_last_read(
+    valid_rig: Path,
+):
+    """Race the reviewer reproduced: the source completes after the last live read.
+
+    No read can close that window, so nothing may follow the read which could destroy a
+    resumed or completed source. The pass only ever adds cards.
+    """
+    client = ProgressContinuationClient()
+    client.flip_source_after_show = 3
+    client.flip_source = {"status": "done", "last_failure_error": None}
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.recovery_task_ids == {"task-1": "continuation-1"}
+    assert client.destructive_calls() == []
+    assert client.source["task"]["status"] == "done"
+
+
+def test_checkpoint_continuation_refuses_a_source_that_moves_between_its_own_creates(
+    valid_rig: Path,
+):
+    """A stale snapshot is refused before the pass adds anything but the continuation.
+
+    The pre-create re-read still refuses a source that already moved, and the refusal
+    itself issues no privileged graph mutation.
+    """
+    client = ProgressContinuationClient()
+    client.flip_source_after_show = 2
+    client.flip_source = {"status": "done", "last_failure_error": None}
+
+    with pytest.raises(HermesCommandError, match="progress checkpoint source"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert client.destructive_calls() == []
+    assert client.source["task"]["status"] == "done"
+    assert "review-2" not in client.created
+
+
+def test_checkpoint_continuation_keeps_acceptance_backed_only_by_failed_proof(
+    valid_rig: Path,
+):
+    """A worker's index claim is evidence, never proof of completion.
+
+    The reproduction records acceptance index 0 complete while the only recorded
+    command exited non-zero, so the continuation must still carry that acceptance.
+    """
+    client = ProgressContinuationClient()
+    checkpoint = json.loads(
+        client.source["events"][-1]["payload"]["reason"][len(_CHECKPOINT_PREFIX) :]
+    )
+    checkpoint["commands"] = [{"command": "pytest focused", "exit_code": 1}]
+    client.source["events"][-1]["payload"]["reason"] = _CHECKPOINT_PREFIX + json.dumps(
+        checkpoint, separators=(",", ":")
+    )
+
+    reconcile_board(client, load_rig(valid_rig))
+
+    create = _continuation_creates(client)[0]
+    body = _flag_value(create, "--body")
+    assert "completed trusted acceptance" in body
+    assert "remaining trusted acceptance" in body
+
+
+def test_checkpoint_continuation_refuses_forged_card_returned_for_its_key(
+    valid_rig: Path,
+):
+    """Creation returns any card already carrying the key, so Factory must read it back."""
+    client = ForgedContinuationClient()
+
+    with pytest.raises(HermesCommandError, match="progress continuation"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert client.destructive_calls() == []
+    assert client.created == {}
+    assert ["kanban", "--board", "demo-rig", "show", "forged-existing", "--json"] in (
+        client.json_calls
+    )
+
+
+@pytest.mark.parametrize("mutate", ["done", "wrong-class", "foreign-slice"])
+def test_checkpoint_continuation_refuses_a_child_that_is_not_the_pending_review(
+    valid_rig: Path, mutate: str
+):
+    """The review contract is cloned from the packet's own pending review child."""
+    client = ProgressContinuationClient()
+    if mutate == "done":
+        client.child["task"]["status"] = "done"
+    elif mutate == "wrong-class":
+        client.child["task"]["body"] = _audit_body("implementation")
+    else:
+        client.records["review-1"]["idempotency_key"] = (
+            "factory:demo:demo-mission:other-slice:review"
+        )
+
+    with pytest.raises(HermesCommandError, match="progress continuation"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert client.destructive_calls() == []
+    assert _continuation_creates(client) == []
+    assert client.source["task"]["status"] == "blocked"
+    assert client.child["parents"] == ["task-1"]
+
+
+def test_checkpoint_continuation_refuses_a_source_body_edited_after_creation(
+    valid_rig: Path,
+):
+    """The acceptance scope comes from the card body, so an edited body is not authority."""
+    client = ProgressContinuationClient()
+    client.source["events"].append(
+        {"kind": "edited", "created_at": 102, "payload": {"fields": ["body"]}}
+    )
+
+    with pytest.raises(HermesCommandError, match="progress checkpoint"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert _continuation_creates(client) == []
+    assert client.destructive_calls() == []
+
+
+_RECONCILE_MISSION = """\
+version: 1
+id: demo-mission
+title: Demo mission
+intent: Preserve the mission intent.
+workflow: delivery
+acceptance:
+- mission acceptance
+slices:
+- id: original
+  title: Original slice
+  goal: Preserve the mission intent.
+  depends_on: []
+  acceptance:
+  - slice acceptance
+  proof:
+    commands:
+    - uv run pytest
+    artifacts: []
+    changed_files_required: true
+"""
+
+
+def _reconcile_mission(rig_path: Path, rig) -> object:
+    """The mission whose compiled and rendered decomposition card is authoritative."""
+    path = rig_path.parent / "mission.yaml"
+    path.write_text(_RECONCILE_MISSION, encoding="utf-8")
+    return load_mission(path, rig)
+
+
+def _decomposition_detail(
+    rig,
+    mission,
+    *,
+    replacement: bool = False,
+    edited: bool = False,
+    tamper: str | None = None,
+) -> dict[str, object]:
+    """A blocked decomposition card exactly as Factory compiles and renders it."""
+    planned = compile_decomposition_phase(rig, mission).tasks[0]
+    body = planned.body
+    if tamper == "contract":
+        contract = decomposition_source_contract(rig, mission, mission.slices[0])
+        source = json.dumps(contract, indent=2, ensure_ascii=False)
+        contract["source_slice"]["title"] = "tampered slice title"
+        body = body.replace(source, json.dumps(contract, indent=2, ensure_ascii=False), 1)
+        assert body != planned.body
+    detail = _timed_out_show("decomp-1")
+    detail["parents"] = []
+    detail["children"] = []
+    detail["task"].update(
+        {
+            "title": planned.title,
+            "body": body,
+            "assignee": planned.profile,
+            "status": "blocked",
+            "created_by": "hermes-factory",
+            "idempotency_key": planned.idempotency_key + (":retry:1" if replacement else ""),
+            "workspace_kind": "dir",
+            "workspace_path": str(rig.project.cwd),
+            "max_retries": rig.policies.max_retries,
+            "max_runtime_seconds": 3600,
+            "completion_contract": rig.policies.completion_contract,
+            "skills": list(planned.skills),
+        }
+    )
+    events = [{"kind": "created", "created_at": 90, "payload": {"creator_task_id": None}}]
+    if edited:
+        events.append({"kind": "edited", "created_at": 95, "payload": {"fields": ["body"]}})
+    detail["events"] = [*events, *detail["events"]]
+    return detail
+
+
+class DecomposerTimeoutClient:
+    def __init__(
+        self,
+        rig,
+        mission,
+        *,
+        replacement: bool = False,
+        edited: bool = False,
+        tamper: str | None = None,
+    ) -> None:
+        self.detail = _decomposition_detail(
+            rig,
+            mission,
+            replacement=replacement,
+            edited=edited,
+            tamper=tamper,
+        )
+        self.json_calls: list[list[str]] = []
+        self.run_calls: list[list[str]] = []
+        self.replacement_detail: dict[str, object] | None = None
+        self.flip_source: dict[str, object] | None = None
+
+    def _flip_if_due(self) -> None:
+        if self.flip_source is not None:
+            self.detail["task"].update(self.flip_source)
+            self.flip_source = None
+
+    def task_record(self, board_slug: str, task_id: str) -> dict[str, object]:
+        if task_id == "decomp-retry-1":
+            assert self.replacement_detail is not None
+            return {
+                **self.replacement_detail["task"],
+                "idempotency_key": self.replacement_detail["_key"],
+            }
+        return {**self.records_for_source(), "idempotency_key": self.detail["task"]["idempotency_key"]}
+
+    def records_for_source(self) -> dict[str, object]:
+        return {key: value for key, value in self.detail["task"].items() if key != "_key"}
+
+    def run_json(self, args: list[str]) -> object:
+        self.json_calls.append(args)
+        tail = args[3:]
+        if tail == ["list", "--status", "blocked", "--json"]:
+            return [self.detail["task"]] if self.detail["task"]["status"] == "blocked" else []
+        if tail == ["show", "decomp-1", "--json"]:
+            return self.detail
+        if tail == ["show", "decomp-retry-1", "--json"]:
+            assert self.replacement_detail is not None
+            return self.replacement_detail
+        if tail[:1] == ["create"]:
+            self._flip_if_due()
+            self.replacement_detail = {
+                "task": {
+                    "id": "decomp-retry-1",
+                    "title": args[4],
+                    "body": _flag_value(args, "--body"),
+                    "assignee": _flag_value(args, "--assignee"),
+                    "status": "ready",
+                    "created_by": _flag_value(args, "--created-by"),
+                    "workspace_kind": _flag_value(args, "--workspace").split(":", 1)[0],
+                    "workspace_path": _flag_value(args, "--workspace").split(":", 1)[1],
+                    "max_retries": int(_flag_value(args, "--max-retries")),
+                    "max_runtime_seconds": _runtime_seconds(
+                        _flag_value(args, "--max-runtime")
+                    ),
+                    "completion_contract": _flag_value(args, "--completion-contract"),
+                    "skills": [
+                        args[index + 1]
+                        for index, arg in enumerate(args)
+                        if arg == "--skill"
+                    ],
+                },
+                "parents": [],
+                "children": [],
+                "comments": [],
+                "events": [{"kind": "created", "payload": {"creator_task_id": None}}],
+                "runs": [],
+                "_key": _flag_value(args, "--idempotency-key"),
+            }
+            return {"id": "decomp-retry-1", "status": "ready", "title": tail[1]}
+        if tail == ["list", "--status", "done", "--json"]:
+            return []
+        raise AssertionError(args)
+
+    def run(self, args: list[str]) -> str:
+        self.run_calls.append(args)
+        tail = args[3:]
+        if tail == ["archive", "decomp-1"]:
+            self._flip_if_due()
+            self.detail["task"]["status"] = "archived"
+        elif tail[:2] == ["comment", "decomp-1"]:
+            self.detail["comments"].append({"body": tail[2], "author": tail[4]})
+        else:
+            raise AssertionError(args)
+        return ""
+
+
+def _runtime_seconds(value: str) -> int:
+    return int(value[:-1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[value[-1]]
+
+
+def _load_v2_reconcile_rig(valid_rig: Path) -> object:
+    text = valid_rig.read_text(encoding="utf-8")
+    text = text.replace("version: 1", "version: 2", 1)
+    text = text.replace(
+        "  reviewer: {profile: reviewer, role: independent_review, skills: []}",
+        "  reviewer: {profile: reviewer, role: independent_review, skills: []}\n"
+        "  decomposer: {profile: decomposer, role: decomposition, skills: [decompose-skill]}",
+    )
+    text = text.replace(
+        "delivery: {implementation_seat: builder, review_seat: reviewer, acceptance_seat: builder}",
+        "delivery: {decomposition_seat: decomposer, implementation_seat: builder, "
+        "review_seat: reviewer, acceptance_seat: builder}",
+    )
+    text = text.replace(
+        "max_runtime: 30m, completion_contract",
+        "max_runtime: 30m, decomposer_runtime: 60m, max_packets_per_slice: 8, "
+        "max_packet_acceptance_items: 5, completion_contract",
+    )
+    valid_rig.write_text(text, encoding="utf-8")
+    return load_rig(valid_rig)
+
+
+def test_first_decomposer_timeout_creates_one_decomposer_replacement(
+    valid_rig: Path, monkeypatch
+):
+    rig = _load_v2_reconcile_rig(valid_rig)
+    monkeypatch.setattr(
+        reconcile_module,
+        "materialize_completed_decompositions",
+        lambda client, rig: type("Result", (), {"materialized": {}, "rejected": {}})(),
+    )
+    client = DecomposerTimeoutClient(rig, _reconcile_mission(valid_rig, rig))
+
+    result = reconcile_board(client, rig)
+
+    assert result.recovery_task_ids == {"decomp-1": "decomp-retry-1"}
+    creates = [call for call in client.json_calls if call[3] == "create"]
+    assert len(creates) == 1
+    create = creates[0]
+    assert _flag_value(create, "--assignee") == "decomposer"
+    assert _flag_value(create, "--max-runtime") == "60m"
+    assert _flag_value(create, "--body") == client.detail["task"]["body"]
+    assert ":decomposition:retry:1" in _flag_value(create, "--idempotency-key")
+    # No implementation/review graph is inferred: the replacement is a lone
+    # decomposition card with no dependency edges.
+    assert "--parent" not in create
+    assert (
+        parse_audit_contract(_flag_value(create, "--body")).get("task_class")
+        == "decomposition"
+    )
+    assert ["kanban", "--board", "demo-rig", "show", "decomp-retry-1", "--json"] in client.json_calls
+
+
+def test_second_decomposer_timeout_records_terminal_limitation_without_builders(
+    valid_rig: Path, monkeypatch
+):
+    rig = _load_v2_reconcile_rig(valid_rig)
+    monkeypatch.setattr(
+        reconcile_module,
+        "materialize_completed_decompositions",
+        lambda client, rig: type("Result", (), {"materialized": {}, "rejected": {}})(),
+    )
+    client = DecomposerTimeoutClient(rig, _reconcile_mission(valid_rig, rig), replacement=True)
+
+    result = reconcile_board(client, rig)
+
+    assert result.recovery_task_ids == {"decomp-1": "decomp-1"}
+    assert not any(call[3] == "create" for call in client.json_calls)
+    comment = next(call for call in client.run_calls if call[3] == "comment")
+    limitation = json.loads(comment[5])
+    assert limitation["reason_code"] == "decomposer_timeout"
+    assert limitation["terminal"] is True
+    assert limitation["builder_task_ids"] == []
+    assert client.detail["task"]["status"] == "archived"
+
+
+def test_decomposer_timeout_refuses_a_card_whose_contract_was_edited(
+    valid_rig: Path, monkeypatch
+):
+    """A mutable card body is not authority: an edited event proves it changed."""
+    rig = _load_v2_reconcile_rig(valid_rig)
+    monkeypatch.setattr(
+        reconcile_module,
+        "materialize_completed_decompositions",
+        lambda client, rig: type("Result", (), {"materialized": {}, "rejected": {}})(),
+    )
+    client = DecomposerTimeoutClient(rig, _reconcile_mission(valid_rig, rig), edited=True)
+
+    with pytest.raises(HermesCommandError, match="decomposition"):
+        reconcile_board(client, rig)
+
+    assert not any(call[3] == "create" for call in client.json_calls)
+    assert not [call for call in client.run_calls if call[3] == "archive"]
+
+
+def test_decomposer_timeout_refuses_a_tampered_contract_instead_of_cloning_it(
+    valid_rig: Path, monkeypatch
+):
+    """Factory rebuilds the contract from the rig-bound source, never from the card."""
+    rig = _load_v2_reconcile_rig(valid_rig)
+    monkeypatch.setattr(
+        reconcile_module,
+        "materialize_completed_decompositions",
+        lambda client, rig: type("Result", (), {"materialized": {}, "rejected": {}})(),
+    )
+    client = DecomposerTimeoutClient(
+        rig, _reconcile_mission(valid_rig, rig), tamper="contract"
+    )
+
+    with pytest.raises(HermesCommandError, match="decomposition"):
+        reconcile_board(client, rig)
+
+    assert not any(call[3] == "create" for call in client.json_calls)
+    assert not [call for call in client.run_calls if call[3] == "archive"]
+
+
+def test_decomposer_timeout_refuses_to_archive_a_source_that_moved(
+    valid_rig: Path, monkeypatch
+):
+    """A decomposition that completed during replacement creation is not superseded."""
+    rig = _load_v2_reconcile_rig(valid_rig)
+    monkeypatch.setattr(
+        reconcile_module,
+        "materialize_completed_decompositions",
+        lambda client, rig: type("Result", (), {"materialized": {}, "rejected": {}})(),
+    )
+    client = DecomposerTimeoutClient(rig, _reconcile_mission(valid_rig, rig))
+    client.flip_source = {"status": "done", "last_failure_error": None}
+
+    with pytest.raises(HermesCommandError, match="decomposition"):
+        reconcile_board(client, rig)
+
+    assert not [call for call in client.run_calls if call[3] == "archive"]
+    assert client.detail["task"]["status"] == "done"
 
 
 def _flag_value(args: list[str], flag: str) -> str:

@@ -64,6 +64,7 @@ Do not perform an unapproved destructive or irreversible external write; record 
 Record the decision as coordinator acceptance; do not represent it as human approval."""
 
 REVIEW_REJECTION_PREFIX = "Factory review rejected:"
+PROGRESS_CHECKPOINT_PREFIX = "Factory progress checkpoint:"
 HUMAN_GATE_MARKER = "<!-- hermes-factory:human-gate -->"
 
 KANBAN_HANDBOOK = """\
@@ -556,7 +557,7 @@ def render_packet_implementation_body(
         "provided. Reserve the final 25 percent of the runtime budget for proof and Kanban handoff.\n\n"
         "If the packet cannot be completed and verified safely inside the remaining budget, stop "
         "expanding scope, leave the repository syntactically valid where possible, run the narrowest "
-        "relevant check, and block with the exact prefix `Factory progress checkpoint:` followed by "
+        f"relevant check, and block with the exact prefix `{PROGRESS_CHECKPOINT_PREFIX}` followed by "
         "this exact JSON schema:\n"
         f"```json\n{json.dumps(checkpoint, indent=2)}\n```"
     )

@@ -149,6 +149,61 @@ policies:
   git_commit_policy: reviewed-slices
 ```
 
+### Миграция rig v1 на v2
+
+Версия 2 добавляет обязательный pre-builder этап. Создайте отдельный профиль decomposer, добавьте seat и укажите его в workflow. Builder и reviewer остаются отдельными профилями.
+
+Текущие команды Hermes для профиля DeepSeek через `opencode-go` с reasoning `medium`:
+
+```powershell
+hermes profile create decomposer `
+  --clone-from default `
+  --description "Partitions architectural slices into bounded implementation packets without mutating the Kanban graph."
+hermes -p decomposer config set model.default deepseek-v4.1-flash
+hermes -p decomposer config set model.provider opencode-go
+hermes -p decomposer config set agent.reasoning_effort medium --force
+hermes -p decomposer config get model.default
+hermes -p decomposer config get model.provider
+hermes -p decomposer config get agent.reasoning_effort
+hermes -p decomposer doctor
+```
+
+`--force` нужен текущему `config set`, потому что валидатор CLI ещё не перечисляет `agent.reasoning_effort`, хотя runtime читает это поле. Ожидаемые значения read-back: `deepseek-v4.1-flash`, `opencode-go`, `medium`.
+
+Измените rig:
+
+```yaml
+version: 2
+seats:
+  decomposer:
+    profile: decomposer
+    role: decomposition
+    skills: []
+  builder:
+    profile: builder
+    role: implementation
+    skills: []
+  reviewer:
+    profile: reviewer
+    role: independent_review
+    skills: []
+workflows:
+  delivery:
+    decomposition_seat: decomposer
+    implementation_seat: builder
+    review_seat: reviewer
+    acceptance_seat: coordinator
+policies:
+  max_runtime: 30m
+  decomposer_runtime: 60m
+  max_packets_per_slice: 8
+  max_packet_acceptance_items: 5
+```
+
+Остальные обязательные policies из v1 сохраните. После миграции выполните `validate`, затем `mission plan --json`. План v2 должен иметь `phase: decomposition`, `pending_materialization: true` и только decomposition-карточки. Не запускайте старый и новый rig для одной mission одновременно.
+
+Граница ответственности такая: decomposer возвращает только manifest, связанный с hash исходного контракта; trusted Factory reconciler проверяет все manifests, создаёт packet-граф через Hermes CLI и перечитывает его; builder не запускается до успешного read-back. Decomposer не вызывает `create`, `link`, `unlink`, `archive`, `purge` или `dispatch`.
+
 Что обычно нужно менять:
 
 - `project.slug`: короткий идентификатор проекта.
@@ -442,6 +497,14 @@ Incident имеет priority `100`, назначается coordinator profile, 
 
 При `max_retries: 1` первый неуспешный запуск переводит карточку в `blocked`. Hermes отвечает за остановку процесса и событие `gave_up`; Factory отвечает за следующую процессную реакцию:
 
+В rig v2 действуют два разных бюджета. `decomposer_runtime` ограничивает анализ архитектурного slice и выпуск manifest. `max_runtime` ограничивает builder/reviewer packet. Тайм-аут decomposer не создаёт частичный execution-граф. Тайм-аут builder относится только к уже материализованному packet и обрабатывается обычной recovery-политикой.
+
+Checkpoint и hard timeout не равнозначны. Builder должен сам остановить расширение scope до исчерпания бюджета, оставить репозиторий в проверяемом состоянии и заблокировать карточку с точным префиксом `Factory progress checkpoint:` и JSON по контракту карточки. Это наблюдаемый handoff для продолжения. Hard timeout означает, что Hermes принудительно завершил run с `status` или `outcome` `timed_out`; checkpoint из него не выводится автоматически. `report` считает эти показатели отдельно.
+
+Checkpoint — единственный recovery, который Factory применяет сам, и он только добавляет карточки. Заблокированная checkpoint-карточка остаётся на доске как есть: Hermes освобождает ребёнка только когда все прямые родители `done` или `archived`, поэтому собственный review этой карточки уже никогда не запустится. Reconciler не перепривязывает граф, а создаёт два новых ключа: continuation с полным acceptance-контрактом прерванного packet (его родители — собственные prerequisites источника, поэтому сама заблокированная карточка его не задерживает) и свежий review, который зависит от continuation и клонирует контракт review исходного packet без единого изменения acceptance или proof. Ключи выводятся из ключа источника в его же форме: пятисегментный slice unit, семисегментный материализованный packet `factory:<project>:<mission>:<slice>:packet:<packet id>:<class>`, который и несёт реальная checkpoint-карточка, и legacy-форма из шести сегментов, которую ещё понимает `report`; любая другая форма ключа отклоняется, потому что continuation неверной формы получил бы идентичность, которую остальной Factory не умеет читать. Ни `link`, ни `unlink`, ни `archive` из pre-read решения не выдаются: `unlink_tasks` удаляет ребро без проверки статуса, а `archive_task` не имеет предиката состояния, поэтому завершившийся review-ребёнок или возобновлённый источник в окне между чтением и командой был бы уничтожен, и лишнее чтение это окно не закрывает. Каждый следующий проход перечитывает те же две ключевые карточки с доски и сообщает тот же continuation, ничего не создавая и не перепривязывая.
+
+Принятая цена названа прямо: ребро собственного review заблокированной карточки и вся downstream-работа за ним остаются незапущенными навсегда. Checkpoint продолжает прерванный packet, но не освобождает цепочку за ним; переподключение цепочки — явное решение координатора (recovery-класс `unknown_operational_stall` или timeout), а не молчаливая разрушительная перепривязка внутри checkpoint-прохода.
+
 ```powershell
 uv run hermes-factory reconcile `
   --rig .hermes\rig.yaml `
@@ -724,7 +787,16 @@ Factory считает:
 - общее количество runs;
 - медианное и максимальное lead time;
 - открытую работу по seat;
-- возраст самой старой ready-задачи.
+- возраст самой старой ready-задачи;
+- медианное decomposition lead time;
+- число materialized packets по architectural slice;
+- долю builder packets, завершённых с первой попытки;
+- долю неуспешных builder packets с корректным progress checkpoint;
+- hard timeout rate по task class;
+- медианное packet lead time от создания implementation до завершения review/commit;
+- rework rate после `changes_requested` и более поздней builder-попытки.
+
+`time_to_first_command_minutes` и `time_to_first_file_mutation_minutes` сейчас равны `null`, а текстовый отчёт пишет `unavailable`. В доступном `runs --json` нет авторитетных action events, поэтому Factory не подменяет их пересказом агента.
 
 `report` всегда возвращает код `0`. Он показывает данные, но не принимает решение за оператора.
 
@@ -797,6 +869,27 @@ hermes kanban --board hermes-factory list --sort status
 - задача заблокирована;
 - исчерпан лимит повторов;
 - gateway не работает.
+
+### Decomposition завершена, но packets не материализованы
+
+Не изменяйте Kanban SQLite вручную. Сначала сохраните read-only снимок:
+
+```powershell
+hermes kanban --board hermes-factory list --json
+hermes kanban --board hermes-factory diagnostics --json
+hermes kanban --board hermes-factory show <decomposition-task-id> --json
+hermes kanban --board hermes-factory runs <decomposition-task-id> --json
+```
+
+В `show --json` проверьте единственное внешнее событие `created`, отсутствие `edited`, успешный run и ровно одно соответствующее событие `completed`. В metadata успешного run должны быть `version`, `project`, `mission`, `source_slice`, `source_contract_sha256`, непустой `packets` и пустой `limitations`. Для каждого packet проверьте `id`, `depends_on`, acceptance coverage, trusted proof commands и безопасные project-relative paths.
+
+Запустите trusted reconciler без ручных мутаций:
+
+```powershell
+uv run hermes-factory reconcile --rig .hermes/rig.yaml --json
+```
+
+Затем снова выполните `list --json`. Для каждого packet должны появиться implementation/review карточки со стабильными ключами `factory:<project>:<mission>:<slice>:<packet>:implementation` и `...:review`. Команда `show <task-id> --json` показывает `parents` и `children`; по ним проверяйте граф. Если materialization отклонена, исправьте rig/mission/profile output и повторите reconciler. Не используйте `sqlite3`, `unlink`, `archive` или `purge` для обхода проверки.
 
 ### Агент упал или превысил время
 

@@ -60,11 +60,15 @@ def _decomposition_identity(task: dict[str, Any], project: str) -> tuple[str, st
     if task.get("created_by") != "hermes-factory" or not isinstance(key, str):
         return None
     prefix = f"factory:{project}:"
-    suffix = ":decomposition"
-    if not key.startswith(prefix) or not key.endswith(suffix):
+    if not key.startswith(prefix):
         return None
-    parts = key[len(prefix) : -len(suffix)].split(":")
-    if len(parts) != 2 or not all(parts):
+    parts = key[len(prefix) :].split(":")
+    if (
+        len(parts) not in {3, 5}
+        or not all(parts)
+        or parts[2] != "decomposition"
+        or (len(parts) == 5 and parts[3:] != ["retry", "1"])
+    ):
         return None
     return parts[0], parts[1]
 
@@ -281,7 +285,6 @@ def _verify_decomposition_cards(
             "created_by": "hermes-factory",
             "workspace_kind": "dir",
             "workspace_path": str(rig.project.cwd),
-            "idempotency_key": planned.idempotency_key,
             "max_runtime_seconds": expected_runtime,
             "skills": list(planned.skills),
             "max_retries": rig.policies.max_retries,
@@ -289,6 +292,8 @@ def _verify_decomposition_cards(
         }
         if (
             any(listed.get(field) != value for field, value in expected_record.items())
+            or listed.get("idempotency_key")
+            not in {planned.idempotency_key, planned.idempotency_key + ":retry:1"}
             or detail["parents"]
         ):
             raise HermesCommandError(

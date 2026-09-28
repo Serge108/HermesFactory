@@ -853,6 +853,101 @@ _REPORT_RUNS = {
 _REPORT_STATS = {"by_status": {"done": 1, "ready": 1}, "now": 86_400}
 
 
+_KANBAN_LIST_FIELDS = (
+    "id",
+    "title",
+    "body",
+    "assignee",
+    "status",
+    "priority",
+    "tenant",
+    "workspace_kind",
+    "workspace_path",
+    "branch_name",
+    "project_id",
+    "created_by",
+    "created_at",
+    "started_at",
+    "completed_at",
+    "result",
+    "skills",
+    "max_runtime_seconds",
+    "max_retries",
+    "model_override",
+    "provider_override",
+    "session_id",
+    "workflow_template_id",
+    "current_step_key",
+    "completion_contract",
+    "last_failure_error",
+)
+_KANBAN_RECORD_FIELDS = (
+    "id",
+    "title",
+    "body",
+    "assignee",
+    "status",
+    "created_by",
+    "workspace_kind",
+    "workspace_path",
+    "idempotency_key",
+    "max_runtime_seconds",
+    "skills",
+    "max_retries",
+    "completion_contract",
+)
+_RUN_FIELDS = (
+    "id",
+    "profile",
+    "status",
+    "outcome",
+    "started_at",
+    "ended_at",
+    "summary",
+    "error",
+    "metadata",
+    "worker_pid",
+    "step_key",
+)
+
+
+def _installed_list_row(**fields: object) -> dict:
+    """One ``hermes kanban list --json`` row: the installed projection, nothing else."""
+    row: dict = dict.fromkeys(_KANBAN_LIST_FIELDS)
+    row["skills"] = []
+    row.update(fields)
+    return row
+
+
+def _authoritative_record(**fields: object) -> dict:
+    """One ``HermesClient.task_record`` row: the authoritative database projection."""
+    record: dict = dict.fromkeys(_KANBAN_RECORD_FIELDS)
+    record["skills"] = []
+    record.update(fields)
+    return record
+
+
+def _installed_run(**fields: object) -> dict:
+    """One ``hermes kanban runs <id> --json`` row: the installed run projection."""
+    run: dict = dict.fromkeys(_RUN_FIELDS)
+    run.update(fields)
+    return run
+
+
+def _audit_contract(task_class: str) -> str:
+    contract = {
+        "task_class": task_class,
+        "required_commands": [],
+        "required_artifacts": [],
+        "changed_files_required": False,
+    }
+    return (
+        "<!-- hermes-factory:audit-contract -->\n"
+        f"Factory audit contract: {json.dumps(contract)}\n"
+        "<!-- /hermes-factory:audit-contract -->\n"
+    )
+
+
 class ReportHermesClient:
     def __init__(
         self,
@@ -861,13 +956,20 @@ class ReportHermesClient:
         runs: dict[str, object],
         attachments: dict[str, object] | None = None,
         diagnostics: object | None = None,
+        records: dict[str, object] | None = None,
     ) -> None:
         self.stats = stats
         self.tasks = tasks
         self.runs = runs
         self.attachments = attachments or {}
         self.diagnostics = diagnostics if diagnostics is not None else []
+        self.records = records or {}
         self.command_calls: list[list[str]] = []
+        self.record_calls: list[str] = []
+
+    def task_record(self, board_slug: str, task_id: str) -> object:
+        self.record_calls.append(task_id)
+        return self.records.get(task_id, {"id": task_id})
 
     def run_json(self, args: list[str]) -> object:
         self.command_calls.append(args)
@@ -910,6 +1012,112 @@ def test_report_json_returns_metrics_and_never_fails(
         call for call in client.command_calls if call[3] == "attachments"
     ]
     assert [call[4] for call in attachment_calls] == ["t-1"]
+
+
+def test_report_hydrates_identity_fields_the_kanban_list_projection_omits(
+    valid_rig: Path, capsys
+):
+    tasks = [
+        _installed_list_row(
+            id="t-dec",
+            title="Decompose core",
+            status="done",
+            assignee="builder",
+            created_by="hermes-factory",
+            created_at=0,
+            completed_at=600,
+            result="manifest recorded",
+            body=_audit_contract("decomposition"),
+        ),
+        _installed_list_row(
+            id="t-i1",
+            title="Implement core packet p1",
+            status="done",
+            assignee="builder",
+            created_by="hermes-factory",
+            created_at=600,
+            completed_at=1_200,
+            result="packet implemented",
+            body=_audit_contract("implementation"),
+        ),
+        _installed_list_row(
+            id="t-r1",
+            title="Review core packet p1",
+            status="done",
+            assignee="reviewer",
+            created_by="hermes-factory",
+            created_at=600,
+            completed_at=1_500,
+            result="approved",
+            body=_audit_contract("review"),
+        ),
+        _installed_list_row(
+            id="t-i2",
+            title="Implement core packet p2",
+            status="blocked",
+            assignee="builder",
+            created_by="hermes-factory",
+            created_at=600,
+            completed_at=None,
+            body=_audit_contract("implementation"),
+        ),
+    ]
+    records = {
+        "t-dec": _authoritative_record(
+            id="t-dec",
+            status="done",
+            created_by="hermes-factory",
+            idempotency_key="factory:demo:demo-mission:core:decomposition",
+        ),
+        "t-i1": _authoritative_record(
+            id="t-i1",
+            status="done",
+            created_by="hermes-factory",
+            idempotency_key="factory:demo:demo-mission:core:packet:p1:implementation",
+        ),
+        "t-r1": _authoritative_record(
+            id="t-r1",
+            status="done",
+            created_by="hermes-factory",
+            idempotency_key="factory:demo:demo-mission:core:packet:p1:review",
+        ),
+        "t-i2": _authoritative_record(
+            id="t-i2",
+            status="blocked",
+            created_by="hermes-factory",
+            idempotency_key="factory:demo:demo-mission:core:packet:p2:implementation",
+        ),
+    }
+    runs = {
+        "t-dec": [_installed_run(id=1, status="done", outcome="completed", started_at=10, ended_at=600)],
+        "t-i1": [_installed_run(id=2, status="done", outcome="completed", started_at=610, ended_at=1_200)],
+        "t-r1": [_installed_run(id=3, status="done", outcome="completed", started_at=1_210, ended_at=1_500)],
+        "t-i2": [_installed_run(id=4, status="timed_out", outcome="timed_out", started_at=610, ended_at=900)],
+    }
+    client = ReportHermesClient(
+        {"now": 2_100, "by_status": {"done": 3, "blocked": 1}},
+        tasks,
+        runs,
+        records=records,
+    )
+
+    result = main(
+        ["report", "--rig", str(valid_rig), "--json"],
+        client_factory=lambda executable: client,
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    metrics = json.loads(captured.out)["metrics"]
+    assert client.record_calls == ["t-dec", "t-i1", "t-r1", "t-i2"]
+    assert metrics["decomposition_lead_time_minutes"] == 10.0
+    assert metrics["packets_per_architectural_slice"] == {"core": 2}
+    assert metrics["hard_timeout_rate_by_task_class"] == {
+        "decomposition": 0.0,
+        "implementation": 0.5,
+        "review": 0.0,
+    }
+    assert metrics["median_packet_lead_time_minutes"] == 15.0
 
 
 def test_report_proof_rate_requires_authoritative_artifact(valid_rig: Path, capsys):
@@ -1000,6 +1208,15 @@ def test_report_text_prints_operational_lines(valid_rig: Path, capsys):
     assert lines[0].startswith("done: 1")
     assert any("rework_rate=1.0" in line for line in lines)
     assert any("open work" in line and "builder: 1" in line for line in lines)
+    assert any("decomposition lead time:" in line for line in lines)
+    assert any("packets per architectural slice:" in line for line in lines)
+    assert any("builder first-attempt completion rate:" in line for line in lines)
+    assert any("progress checkpoint rate:" in line for line in lines)
+    assert any("hard timeout rate by task class:" in line for line in lines)
+    assert any("median packet lead time:" in line for line in lines)
+    assert any("rework rate after review:" in line for line in lines)
+    assert any("time to first command: unavailable" in line for line in lines)
+    assert any("time to first file mutation: unavailable" in line for line in lines)
 
 
 def test_custom_dashboard_command_is_not_part_of_factory_cli():

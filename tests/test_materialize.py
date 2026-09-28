@@ -296,6 +296,20 @@ def test_materialization_waits_until_every_decomposition_task_is_done(
     assert client.run_calls == []
 
 
+def test_completed_decomposer_replacement_materializes_from_original_contract(
+    valid_rig: Path, tmp_path: Path
+):
+    rig, mission = _rig_and_mission(valid_rig, tmp_path)
+    tasks, details = _decomposition_board(rig, mission, ("done", "done"))
+    tasks[0]["idempotency_key"] += ":retry:1"
+    client = MaterializeClient(tasks, details)
+
+    result = materialize_completed_decompositions(client, rig)
+
+    assert result.rejected == {}
+    assert "demo-mission" in result.materialized
+
+
 def test_missing_decomposition_card_cannot_materialize_a_partial_mission(
     valid_rig: Path, tmp_path: Path
 ):

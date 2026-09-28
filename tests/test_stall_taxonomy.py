@@ -31,6 +31,8 @@ def test_taxonomy_covers_timeout_capability_dispatch_dependency_and_human_classe
 
     assert set(classes) >= {
         "worker_timeout",
+        "progress_checkpoint",
+        "decomposer_timeout",
         "recovery_coordinator_insufficient_kanban_authority",
         "awaiting_dispatch",
         "normal_dependency_wait",
@@ -43,6 +45,8 @@ def test_taxonomy_covers_timeout_capability_dispatch_dependency_and_human_classe
         "unknown_operational_stall",
     }
     assert classes["worker_timeout"].automatic is True
+    assert classes["progress_checkpoint"].recovery_owner == "factory"
+    assert classes["decomposer_timeout"].recovery_owner == "factory"
     unknown = classes["unknown_operational_stall"]
     assert unknown.automatic is True
     assert unknown.recovery_owner == "coordinator"

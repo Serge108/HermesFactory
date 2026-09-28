@@ -311,6 +311,7 @@ def handle_reconcile(args: argparse.Namespace, client_factory: ClientFactory) ->
         "scanned": result.scanned,
         "eligible": result.eligible,
         "recovery_task_ids": result.recovery_task_ids,
+        "provider_reopened_task_ids": list(result.provider_reopened_task_ids),
         "finalized_recovery_task_ids": result.finalized_recovery_task_ids,
         "board_incident_task_id": result.board_incident_task_id,
         "dispatched": result.dispatched,
@@ -322,11 +323,14 @@ def handle_reconcile(args: argparse.Namespace, client_factory: ClientFactory) ->
             f"scanned {result.scanned} blocked tasks; "
             f"created or reused {len(result.recovery_task_ids)} recovery tasks; "
             f"board incident {result.board_incident_task_id or '-'}; "
+            f"reopened {len(result.provider_reopened_task_ids)} provider-parked tasks; "
             f"finalized {len(result.finalized_recovery_task_ids)} recovery plans; "
             f"dispatched {result.dispatched}"
         )
         for task_id, recovery_id in result.recovery_task_ids.items():
             print(f"{task_id} -> {recovery_id}")
+        for task_id in result.provider_reopened_task_ids:
+            print(f"provider park {task_id} -> reopened")
     return 0
 
 

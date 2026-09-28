@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -38,6 +39,8 @@ _REPLACEMENT_POLICY_END = "<!-- /hermes-factory:replacement-policy -->"
 _REPLACEMENT_POLICY_PREFIX = "Factory replacement policy: "
 _DURATION_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _REASON_CODE_PREFIX = "Reason code: "
+# Hermes's own exit code for a worker that died on a terminal provider error.
+_TERMINAL_PROVIDER_EXIT_CODE = 78
 
 # One stall class per registration: the detection signal, the recovery-card key token,
 # the Superseded-task class, and the replacement class of the recovery target.
@@ -45,6 +48,17 @@ _STALL_WORKER_TIMEOUT = "worker_timeout"
 _STALL_REVIEW_REJECTED = "review_rejected"
 _STALL_NO_AGENT_ACTIVITY = "no_agent_activity"
 _STALL_UNKNOWN_OPERATIONAL = "unknown_operational_stall"
+# Answers the park directly in the reconciler: no recovery card, so no key token.
+_STALL_TERMINAL_PROVIDER_PARK = "terminal_provider_park"
+# Retires a completed recovery card whose recorded plan can never be read, so its
+# idempotency key is freed for a fresh recovery of the same block.
+_STALL_UNPARSEABLE_RECOVERY_PLAN = "unparseable_recovery_plan"
+# Marks a recovery key that answers a decision whose earlier card moved before Factory
+# could act on it, so the new card cannot collide with the record it replaces.
+_GENERATION_TOKEN = "generation"
+# The card phase in which a worker holds the card right now: the only phase a create can
+# hand back for a key that is still in use by live work.
+_IN_FLIGHT_STATUSES = frozenset({"running"})
 _KEY_TOKENS = {
     _STALL_WORKER_TIMEOUT: "gave-up",
     _STALL_REVIEW_REJECTED: "review-rejected",
@@ -84,6 +98,22 @@ class ReconcileResult:
     finalized_recovery_task_ids: tuple[str, ...]
     dispatched: int
     board_incident_task_id: str | None = None
+    provider_reopened_task_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderParkResolution:
+    """What one pass did with a single provider-parked card.
+
+    Exactly one field is set. ``reopened`` names the card whose park the reconciler
+    cleared itself. ``regenerated`` names - as ``(target task id, fresh recovery card
+    id)`` - the block whose registered recovery card moved between the read this pass
+    validated and the mutation it was about to issue: that card is left untouched and
+    the block is answered by a new recovery generation instead.
+    """
+
+    reopened: str | None = None
+    regenerated: tuple[str, str] | None = None
 
 
 def _task_list(value: Any) -> list[dict[str, Any]]:
@@ -186,6 +216,275 @@ def _latest_terminal_event(detail: dict[str, Any]) -> dict[str, Any] | None:
             raise HermesCommandError("blocked Factory task has malformed terminal event")
         return event
     return None
+
+
+def _is_terminal_provider_payload(payload: object) -> bool:
+    """Hermes's own breaker marker for a worker killed by a terminal provider error.
+
+    The breaker stamps the marker on the ``gave_up`` record and leaves the numeric
+    ``exit_code`` on the run's own event, so an absent exit code is normal here while an
+    unexpected one belongs to no registered class.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("terminal_provider") is not True:
+        return False
+    if payload.get("trigger_outcome") != "crashed" or payload.get("sticky") is not True:
+        return False
+    exit_code = payload.get("exit_code")
+    return exit_code is None or exit_code == _TERMINAL_PROVIDER_EXIT_CODE
+
+
+def _provider_parked_event(detail: dict[str, Any]) -> dict[str, Any] | None:
+    """The newest terminal event, when Hermes recorded it as a terminal provider park.
+
+    Only the newest terminal event counts: an older provider park must not outrank a
+    newer incident, because the recovery answers the park that is live now.
+    """
+    event = _latest_terminal_event(detail)
+    if (
+        event is None
+        or event.get("kind") != "gave_up"
+        or not _is_terminal_provider_payload(event.get("payload"))
+    ):
+        return None
+    return event
+
+
+def _provider_park_event_times(detail: dict[str, Any]) -> tuple[int, ...]:
+    """Every terminal provider park Hermes recorded on a card, oldest first.
+
+    A parked card can only park again after something released it, so a second entry is
+    the authoritative record that the one bounded re-open already happened.
+    """
+    times: list[int] = []
+    for event in detail["events"]:
+        if event.get("kind") != "gave_up":
+            continue
+        if not _is_terminal_provider_payload(event.get("payload")):
+            continue
+        created_at = event.get("created_at")
+        if type(created_at) is not int:
+            # A provider mark without its own timestamp proves neither park's order.
+            raise HermesCommandError("blocked Factory task has malformed terminal event")
+        times.append(created_at)
+    return tuple(sorted(times))
+
+
+def _require_provider_parked_recovery_anchor(
+    client: HermesClient, rig: RigSpec, detail: dict[str, Any]
+) -> tuple[str, str, dict[str, Any], dict[str, Any]]:
+    """Re-derive that a provider-parked card is Factory's own recovery card, still live.
+
+    The card is re-opened because it is the registered recovery for its blocked target,
+    so the target is the anchor: Hermes must still show the exact terminal event the
+    recovery key names. Reconciler authorship is re-proven from Hermes's own records,
+    never from the free-form ``created_by`` flag alone.
+
+    The validated target detail and its live terminal event are returned because the
+    caller needs both to answer the same block with a fresh recovery generation when
+    this card moves before the re-open is issued.
+    """
+    board = ["kanban", "--board", rig.board.slug]
+    task = detail["task"]
+    task_id = task.get("id")
+    if task.get("created_by") != _RECOVERY_CREATOR:
+        raise HermesCommandError(
+            f"provider-parked recovery card {task_id} is not reconciler-authored"
+        )
+    _require_factory_authored(detail, f"provider-parked recovery card {task_id}")
+    target_task_id, stall_class = _recovery_target(task, rig)
+    target = _task_show(client.run_json(board + ["show", target_task_id, "--json"]))
+    if target["task"].get("id") != target_task_id:
+        raise HermesCommandError(
+            f"provider-parked recovery card {task_id} did not resolve its target exactly"
+        )
+    if target["task"].get("status") != "blocked" or any(
+        run.get("status") in {"running", "claimed"}
+        for run in target.get("runs", [])
+        if isinstance(run, dict)
+    ):
+        raise HermesCommandError(
+            f"provider-parked recovery card {task_id} no longer answers the live "
+            f"terminal event of {target_task_id}"
+        )
+    classified = _classify_blocked_factory_task(target, rig)
+    if classified is None:
+        raise HermesCommandError(
+            f"provider-parked recovery card {task_id} no longer answers the live "
+            f"terminal event of {target_task_id}"
+        )
+    live_stall_class, target_event = classified
+    if (
+        live_stall_class != stall_class
+        or target_event.get("created_at") != _key_trigger_time(task)
+    ):
+        raise HermesCommandError(
+            f"provider-parked recovery card {task_id} no longer answers the live "
+            f"terminal event of {target_task_id}"
+        )
+    return target_task_id, live_stall_class, target, target_event
+
+
+def _reopen_provider_parked_card(
+    client: HermesClient,
+    rig: RigSpec,
+    detail: dict[str, Any],
+    event: dict[str, Any],
+    *,
+    recovery_card: bool,
+    fixture_recovery: bool = False,
+    recovery_runtime: str | None = None,
+) -> ProviderParkResolution:
+    """Re-open a card the failure breaker parked on a terminal provider error, once.
+
+    Selection is Hermes's own breaker payload, never the free-form ``created_by`` flag. A
+    provider outage is an environment fault rather than a task-level failure, so one
+    bounded privileged re-open is the whole recovery; re-opening the same card again
+    would spin without changing the outcome, and the second park is reported instead.
+    Every precondition is re-derived from a fresh read immediately before the mutation.
+
+    For a recovery card that re-open answers its target's block, so when the card moves
+    during the anchor read the block is handed to a fresh recovery generation rather
+    than mutated from a snapshot the pass can no longer verify.
+    """
+    board = ["kanban", "--board", rig.board.slug]
+    task = detail["task"]
+    task_id = task.get("id")
+    if not isinstance(task_id, str) or not task_id:
+        raise HermesCommandError("Hermes returned malformed blocked task list JSON")
+    event_time = event.get("created_at")
+    if type(event_time) is not int:
+        raise HermesCommandError("blocked Factory task has malformed terminal event")
+    live = _authoritative_task_identity(
+        client,
+        rig.board.slug,
+        _task_show(client.run_json(board + ["show", task_id, "--json"])),
+    )
+    live_event = _provider_parked_event(live)
+    if (
+        live["task"].get("status") != "blocked"
+        or live_event is None
+        or live_event.get("created_at") != event_time
+    ):
+        raise HermesCommandError(
+            f"provider-parked Factory card {task_id} is no longer parked by the "
+            f"terminal provider event this recovery answers"
+        )
+    park_times = _provider_park_event_times(live)
+    if len(park_times) > 1:
+        raise HermesCommandError(
+            f"provider-parked Factory card {task_id} was already re-opened after its "
+            f"terminal provider park at {park_times[-2]}; the second park is reported, "
+            f"not re-opened"
+        )
+    if recovery_card:
+        target_task_id, stall_class, target, target_event = (
+            _require_provider_parked_recovery_anchor(client, rig, live)
+        )
+        # The anchor read is itself a board read, so the card this pass validated can
+        # move while the target is being re-derived. Re-read the card immediately before
+        # the mutation: a card that is no longer parked by the event this recovery
+        # answers must not be unblocked, and its block must not be left unanswered.
+        settled = _task_show(client.run_json(board + ["show", task_id, "--json"]))
+        if not _is_parked_by_event(settled, task_id, event_time):
+            return ProviderParkResolution(
+                regenerated=_regenerate_recovery(
+                    client,
+                    rig,
+                    settled,
+                    target,
+                    target_event,
+                    stall_class=stall_class,
+                    fixture_recovery=fixture_recovery,
+                    recovery_runtime=recovery_runtime,
+                )
+            )
+    decision = (
+        f"{_STALL_TERMINAL_PROVIDER_PARK}: re-opened once after the terminal provider "
+        f"park recorded at {event_time}; a second park of this card is reported instead "
+        f"of re-opened"
+    )
+    decision_time = int(time.time())
+    client.run(board + ["unblock", task_id, "--reason", decision])
+    after = _task_show(client.run_json(board + ["show", task_id, "--json"]))
+    # A cleared block leaves the parked status; only a parked status proves the unblock
+    # failed, and the dispatcher may already have claimed the released card.
+    if after["task"].get("status") in {"blocked", "scheduled", "archived"}:
+        raise HermesCommandError("provider-park re-open did not persist")
+    if not any(
+        item.get("kind") == "unblocked"
+        and type(item.get("created_at")) is int
+        and item["created_at"] >= decision_time
+        for item in after["events"]
+    ):
+        raise HermesCommandError(
+            "provider-park re-open has no authoritative unblocked event"
+        )
+    return ProviderParkResolution(reopened=task_id)
+
+
+def _is_parked_by_event(
+    detail: dict[str, Any], task_id: str, event_time: int
+) -> bool:
+    """Whether a card is still parked by the exact terminal provider event named.
+
+    A block, a re-open, or a second park all leave the card in a different state than the
+    one the pass decided on, so any of them means the mutation can no longer be issued
+    against this read.
+    """
+    if detail["task"].get("id") != task_id or detail["task"].get("status") != "blocked":
+        return False
+    live_event = _provider_parked_event(detail)
+    return live_event is not None and live_event.get("created_at") == event_time
+
+
+def _regenerate_recovery(
+    client: HermesClient,
+    rig: RigSpec,
+    moved_detail: dict[str, Any],
+    target: dict[str, Any],
+    target_event: dict[str, Any],
+    *,
+    stall_class: str,
+    fixture_recovery: bool = False,
+    recovery_runtime: str | None = None,
+) -> tuple[str, str]:
+    """Answer a block with a recovery the pass did not validate against a moved card.
+
+    The card this pass decided on stopped being the card it can mutate: it resumed,
+    finished, or parked again between the decision and the mutation. Mutating it would
+    act on a snapshot nobody can vouch for, and reusing its idempotency key would hand
+    the same stale record back to the next pass, because Hermes returns any existing
+    non-archived card carrying the requested key. The block therefore gets a new
+    recovery generation whose key names the card it answers, which is stable for as long
+    as that card exists, so a repeated pass finds the same generation instead of asking
+    for another one.
+    """
+    moved_task_id = moved_detail["task"].get("id")
+    if not isinstance(moved_task_id, str) or not moved_task_id:
+        raise HermesCommandError("Hermes returned malformed recovery task JSON")
+    target_task_id = target["task"].get("id")
+    if not isinstance(target_task_id, str) or not target_task_id:
+        raise HermesCommandError("Hermes returned malformed recovery target JSON")
+    identity = (
+        None
+        if target["task"].get("created_by") == "hermes-factory"
+        else _replacement_identity(client, rig, target)
+    )
+    recovery_id = _create_recovery_task(
+        client,
+        rig,
+        target,
+        target_event,
+        _coordinator_profile(rig),
+        stall_class=stall_class,
+        fixture_recovery=fixture_recovery,
+        recovery_runtime=recovery_runtime,
+        identity=identity,
+        generation_of=moved_task_id,
+    )
+    return target_task_id, recovery_id
 
 
 def _is_explicit_human_gate(detail: dict[str, Any], rig: RigSpec) -> bool:
@@ -768,7 +1067,15 @@ def _create_recovery_task(
     fixture_recovery: bool = False,
     recovery_runtime: str | None = None,
     identity: FactoryTaskIdentity | None = None,
+    generation_of: str | None = None,
 ) -> str:
+    """Create the one recovery card that answers a blocked card's live incident.
+
+    ``generation_of`` names the recovery card this decision answers when that card is
+    still live but is no longer the card the pass could vouch for. Hermes returns any
+    existing non-archived card carrying the requested idempotency key, so that
+    generation gets its own key instead of colliding with the card it replaces.
+    """
     task = detail["task"]
     task_id = task.get("id")
     title = task.get("title")
@@ -818,9 +1125,9 @@ def _create_recovery_task(
         "--skill",
         _RECOVERY_SKILL,
         "--idempotency-key",
-        (
-            f"factory:{rig.project.slug}:reconcile:{task_id}:"
-            f"{_KEY_TOKENS[stall_class]}:{event_time}"
+        _recovery_key(
+            rig, task_id, stall_class=stall_class, event_time=event_time,
+            generation_of=generation_of,
         ),
         "--max-retries",
         str(rig.policies.max_retries),
@@ -836,9 +1143,60 @@ def _create_recovery_task(
         "100",
         "--json",
     ]
-    recovery_id = _parse_task_creation(client.run_json(argv))
+    key_index = argv.index("--idempotency-key") + 1
+    created = client.run_json(argv)
+    recovery_id = _parse_task_creation(created)
+    if (
+        generation_of is None
+        and isinstance(created, dict)
+        and created.get("status") in _IN_FLIGHT_STATUSES
+    ):
+        # Hermes answers a create with any existing non-archived card carrying the key,
+        # so this can be a card that is already in flight for the same block.
+        reused = _reused_recovery_generation(client, rig, recovery_id, stall_class)
+        if reused is not None:
+            argv[key_index] = _recovery_key(
+                rig,
+                task_id,
+                stall_class=stall_class,
+                event_time=event_time,
+                generation_of=reused,
+            )
+            recovery_id = _parse_task_creation(client.run_json(argv))
     _subscribe_task(client, rig, recovery_id)
     return recovery_id
+
+
+def _reused_recovery_generation(
+    client: HermesClient, rig: RigSpec, recovery_id: str, stall_class: str
+) -> str | None:
+    """The card a reused recovery key answers, when that card is a record that moved.
+
+    A card already in flight is the normal answer while a recovery for the block runs, and
+    the pass reports it. It is not the normal answer when the card carries a completed run
+    whose recorded plan cannot be read: that card resumed after recording a decision which
+    can never be applied, so it is not a recovery this pass can report for the block, and
+    the block is answered by a generation keyed to it instead. The plan is re-read from the
+    card's own authoritative record, never from the create response.
+    """
+    board = ["kanban", "--board", rig.board.slug]
+    detail = _authoritative_task_identity(
+        client, rig.board.slug, _task_show(client.run_json(board + ["show", recovery_id, "--json"]))
+    )
+    if detail["task"].get("id") != recovery_id:
+        raise HermesCommandError(f"recovery card {recovery_id} did not resolve exactly")
+    if detail["task"].get("status") not in _IN_FLIGHT_STATUSES:
+        return None
+    if _successful_run_id(detail) is None:
+        return None
+    try:
+        if stall_class == _STALL_UNKNOWN_OPERATIONAL:
+            _unknown_recovery_plan(detail, rig)
+        else:
+            _recovery_plan(detail, rig)
+    except HermesCommandError:
+        return recovery_id
+    return None
 
 
 def _create_no_agent_incident_task(
@@ -987,6 +1345,11 @@ def _recovery_target(task: dict[str, Any], rig: RigSpec) -> tuple[str, str]:
     The key token and the body's reason code must agree; a card that claims one class
     in its body while carrying the other class's key is refused, so the destructive
     precondition of a plan can never be re-derived from a mismatched class.
+
+    A key may carry one trailing ``generation:<card id>`` segment: that is the mark of a
+    recovery registered because the card previously answering the same decision moved
+    before Factory could act on it. The decision itself is still named by the first six
+    segments, so a generation is readable evidence exactly like the card it answers.
     """
     key = task.get("idempotency_key")
     if not isinstance(key, str):
@@ -994,7 +1357,7 @@ def _recovery_target(task: dict[str, Any], rig: RigSpec) -> tuple[str, str]:
     parts = key.split(":")
     classes_by_token = {token: stall_class for stall_class, token in _KEY_TOKENS.items()}
     if (
-        len(parts) != 6
+        len(parts) not in {6, 8}
         or parts[:3] != ["factory", rig.project.slug, "reconcile"]
         or not parts[3]
         or parts[4] not in classes_by_token
@@ -1002,6 +1365,7 @@ def _recovery_target(task: dict[str, Any], rig: RigSpec) -> tuple[str, str]:
         # Factory-generated key can contain.
         or not parts[5]
         or any(character not in "0123456789" for character in parts[5])
+        or (len(parts) == 8 and (parts[6] != _GENERATION_TOKEN or not parts[7]))
     ):
         raise HermesCommandError("completed recovery task is not Factory-generated")
     return parts[3], classes_by_token[parts[4]]
@@ -1010,18 +1374,45 @@ def _recovery_target(task: dict[str, Any], rig: RigSpec) -> tuple[str, str]:
 def _key_trigger_time(task: dict[str, Any]) -> int:
     """The blocked-event time encoded in a Factory recovery key.
 
-    ``_recovery_target`` already proved the key is Factory-shaped and its trailing
-    segment is ASCII digits, so the value names the exact block transition the recovery
-    answers. Live revalidation compares it with the newest terminal event: a plan whose
-    incident is no longer the live one is stale, never silently reusable.
+    ``_recovery_target`` already proved the key is Factory-shaped, so the sixth segment is
+    ASCII digits and names the exact block transition the recovery answers. A trailing
+    generation segment is never the trigger time. Live revalidation compares the value
+    with the newest terminal event: a plan whose incident is no longer the live one is
+    stale, never silently reusable.
     """
     key = task.get("idempotency_key")
     if not isinstance(key, str) or not key:
         raise HermesCommandError("recovery task is not Factory-generated")
-    tail = key.rsplit(":", 1)[-1]
-    if not tail or any(character not in "0123456789" for character in tail):
+    parts = key.split(":")
+    if len(parts) not in {6, 8}:
         raise HermesCommandError("recovery task is not Factory-generated")
-    return int(tail)
+    if not parts[5] or any(character not in "0123456789" for character in parts[5]):
+        raise HermesCommandError("recovery task is not Factory-generated")
+    return int(parts[5])
+
+
+def _recovery_key(
+    rig: RigSpec,
+    task_id: str,
+    *,
+    stall_class: str,
+    event_time: int,
+    generation_of: str | None = None,
+) -> str:
+    """The idempotency key of the recovery card answering one block transition.
+
+    The first six segments name the project, the blocked card, the stall-class token and
+    the triggering event time, so the next pass finds this card instead of creating a
+    duplicate. ``generation_of`` appends the mark of a recovery that answers the same
+    transition after the card holding the plain key moved.
+    """
+    key = (
+        f"factory:{rig.project.slug}:reconcile:{task_id}:"
+        f"{_KEY_TOKENS[stall_class]}:{event_time}"
+    )
+    if generation_of is None:
+        return key
+    return f"{key}:{_GENERATION_TOKEN}:{generation_of}"
 
 
 def _require_factory_authored(detail: dict[str, Any], label: str) -> None:
@@ -1462,7 +1853,8 @@ def _unknown_recovery_plan(
     if stall_class != _STALL_UNKNOWN_OPERATIONAL:
         raise HermesCommandError("completed recovery task is not an unknown operational recovery")
     key = task["idempotency_key"]
-    triggering_event_time = int(key.rsplit(":", 1)[1])
+    # Never the trailing segment: a generation carries the card it answers there.
+    triggering_event_time = _key_trigger_time(task)
     body = task.get("body")
     if not isinstance(body, str):
         raise HermesCommandError("completed recovery task has no generated recovery body")
@@ -2439,7 +2831,7 @@ def _dispose_stale_recovery(
     rig: RigSpec,
     recovery_id: str,
     reason: str,
-    rewires: tuple[RecoveryRewire, ...] = (),
+    rewires: tuple[RecoveryRewire, ...] | None = (),
 ) -> None:
     """Close a decision that no longer matches live authoritative state.
 
@@ -2450,13 +2842,20 @@ def _dispose_stale_recovery(
 
     Disposal is also not allowed to imply the graph was untouched: when an interrupted
     earlier pass already applied one of the plan's rewires, the reason records that,
-    because the newer incident's recovery owns the remaining superseded cards.
+    because the newer incident's recovery owns the remaining superseded cards. A
+    ``rewires`` of ``None`` says the recorded plan itself cannot be read, so no rewire
+    state can be derived at all and the reason may claim neither outcome.
     """
-    state = _rewire_application_state(client, rig, rewires)
+    state = "unknown" if rewires is None else _rewire_application_state(client, rig, rewires)
     if state == "applied":
         reason = (
             f"{reason}; an interrupted earlier pass already applied a rewire of this "
             "plan, so the remaining superseded cards are left to the newer incident"
+        )
+    elif rewires is None:
+        reason = (
+            f"{reason}; the recorded plan cannot be read, so a partial application "
+            "cannot be excluded"
         )
     elif state == "unknown":
         reason = (
@@ -2478,6 +2877,228 @@ def _dispose_stale_recovery(
             _RECOVERY_CREATOR,
         ]
     )
+
+
+def _require_unparseable_recovery_anchor(
+    client: HermesClient, rig: RigSpec, detail: dict[str, Any]
+) -> tuple[str, str, int, dict[str, Any], dict[str, Any]]:
+    """Re-derive, from live records, that a broken decision still answers a live block.
+
+    Retiring a card frees its idempotency key, so the disposition may only run while the
+    target it names is still parked by the exact terminal event the key records, with no
+    live run of its own. A target that moved on, a run in flight, or an unreadable graph
+    means the disposition cannot be justified: it refuses and the pass reports the
+    failure instead of mutating anything.
+
+    The validated target detail and its live terminal event are returned because a card
+    that moved after this read still has to leave its block answered.
+    """
+    board = ["kanban", "--board", rig.board.slug]
+    task = detail["task"]
+    task_id = task.get("id")
+    if not isinstance(task_id, str) or not task_id:
+        raise HermesCommandError("Hermes returned malformed recovery task JSON")
+    if task.get("created_by") != _RECOVERY_CREATOR:
+        raise HermesCommandError(
+            f"unparseable recovery card {task_id} is not reconciler-authored"
+        )
+    _require_factory_authored(detail, f"unparseable recovery card {task_id}")
+    target_task_id, stall_class = _recovery_target(task, rig)
+    trigger_time = _key_trigger_time(task)
+    try:
+        target = _authoritative_task_identity(
+            client,
+            rig.board.slug,
+            _task_show(
+                client.run_json(board + ["show", target_task_id, "--json"])
+            ),
+        )
+    except HermesCommandError as exc:
+        raise HermesCommandError(
+            f"unparseable recovery card {task_id} cannot read its recovery target "
+            f"{target_task_id} back ({exc}), so a partial application cannot be excluded"
+        ) from exc
+    if target["task"].get("id") != target_task_id:
+        raise HermesCommandError(
+            f"unparseable recovery card {task_id} did not resolve its recovery target "
+            f"{target_task_id} exactly, so a partial application cannot be excluded"
+        )
+    # Parked, as this codebase defines it for a recoverable target: blocked, or archived
+    # once the incident was resolved by an earlier terminal outcome.
+    if target["task"].get("status") not in {"blocked", "archived"}:
+        raise HermesCommandError(
+            f"unparseable recovery card {task_id} answers a block of its recovery target "
+            f"{target_task_id} that is no longer parked "
+            f"({target['task'].get('status')})"
+        )
+    if any(
+        run.get("status") in {"running", "claimed"}
+        for run in target.get("runs", [])
+        if isinstance(run, dict)
+    ):
+        raise HermesCommandError(
+            f"unparseable recovery card {task_id} answers a live run of its recovery "
+            f"target {target_task_id}"
+        )
+    classified = _classify_blocked_factory_task(target, rig)
+    if classified is None:
+        raise HermesCommandError(
+            f"unparseable recovery card {task_id} no longer answers the live terminal "
+            f"event of its recovery target {target_task_id}"
+        )
+    live_stall_class, event = classified
+    if live_stall_class != stall_class or event.get("created_at") != trigger_time:
+        raise HermesCommandError(
+            f"unparseable recovery card {task_id} no longer answers the live terminal "
+            f"event of its recovery target {target_task_id}"
+        )
+    return target_task_id, live_stall_class, trigger_time, target, event
+
+
+def _successful_run_id(detail: dict[str, Any]) -> int | None:
+    """The id of the run that completed a card, as Hermes recorded it."""
+    runs = detail.get("runs")
+    if not isinstance(runs, list):
+        return None
+    successful = next(
+        (
+            run
+            for run in reversed(runs)
+            if isinstance(run, dict) and run_succeeded(run)
+        ),
+        None,
+    )
+    if successful is None:
+        return None
+    run_id = successful.get("id")
+    return run_id if type(run_id) is int else None
+
+
+def _recovery_card_moved(
+    client: HermesClient, rig: RigSpec, detail: dict[str, Any]
+) -> bool:
+    """Whether a card is still the completed record the disposition decided on.
+
+    The disposition archives the card, which is terminal and cannot be undone, so it may
+    only run while the card still is the one the pass read: same id, still completed, same
+    Factory key, and the same successful run as the completion record. A card that
+    resumed, was re-blocked, or was replaced between those reads proves nothing about the
+    decision, and archiving it would destroy live work.
+    """
+    board = ["kanban", "--board", rig.board.slug]
+    task = detail["task"]
+    task_id = task.get("id")
+    if not isinstance(task_id, str) or not task_id:
+        raise HermesCommandError("Hermes returned malformed recovery task JSON")
+    settled = _authoritative_task_identity(
+        client, rig.board.slug, _task_show(client.run_json(board + ["show", task_id, "--json"]))
+    )
+    if (
+        settled["task"].get("id") != task_id
+        or settled["task"].get("status") != "done"
+        or settled["task"].get("idempotency_key") != task.get("idempotency_key")
+    ):
+        return True
+    return _successful_run_id(settled) != _successful_run_id(detail)
+
+
+def _recovery_decision_already_disposed(
+    client: HermesClient, rig: RigSpec, detail: dict[str, Any]
+) -> bool:
+    """Whether Hermes already holds an archived card for this same decision.
+
+    The bound is read from the board, never from a marker this pass writes: Hermes
+    reuses one idempotency key per (target, class, trigger time) and its create path
+    ignores archived cards, so an archived card carrying the same Factory recovery key
+    can only be an earlier generation of the very decision under disposition - the one
+    a previous pass retired. Comment text cannot carry this bound, because a worker can
+    write comments, and a worker session can neither archive a card nor create one
+    outside a worker session.
+
+    A candidate that cannot be read back refuses the disposition instead of guessing:
+    an unreadable board proves neither that the decision was disposed nor that it was
+    not.
+    """
+    board = ["kanban", "--board", rig.board.slug]
+    task = detail["task"]
+    current_id = task.get("id")
+    key = task.get("idempotency_key")
+    if not isinstance(key, str) or not key:
+        raise HermesCommandError("recovery card is not Factory-generated")
+    listed = _task_list(client.run_json(board + ["list", "--archived", "--json"]))
+    for listed_task in listed:
+        task_id = listed_task.get("id")
+        if not isinstance(task_id, str) or not task_id or task_id == current_id:
+            continue
+        if (
+            listed_task.get("status") != "archived"
+            or listed_task.get("created_by") != _RECOVERY_CREATOR
+        ):
+            continue
+        candidate = _authoritative_task_identity(
+            client,
+            rig.board.slug,
+            _task_show(client.run_json(board + ["show", task_id, "--json"])),
+        )
+        if candidate["task"].get("id") != task_id:
+            raise HermesCommandError(
+                f"archived recovery card {task_id} could not be read back, so an earlier "
+                f"disposition of this decision cannot be excluded"
+            )
+        if candidate["task"].get("idempotency_key") == key:
+            return True
+    return False
+
+
+def _dispose_unparseable_recovery(
+    client: HermesClient,
+    rig: RigSpec,
+    detail: dict[str, Any],
+    error: Exception,
+) -> tuple[str, str] | None:
+    """Retire a completed recovery card whose recorded plan can never be read.
+
+    Plan validation stays strict - a malformed record is never repaired into a plan -
+    but a card that can never be applied must not fail every later pass either: that
+    would leave its blocked target permanently unrecoverable. Retiring the card frees
+    its idempotency key, so the next pass creates and dispatches a fresh recovery for
+    the same block.
+
+    The preconditions are re-derived from live records before the mutation, and the
+    card keeps its class token, so the disposition never stands in for a plan.
+
+    A card that moved after the decision - it resumed, was re-blocked, or was replaced -
+    is not retired: the disposition returns the ``(target, fresh recovery)`` pair that
+    answers its block instead, because that block is still parked and the record that was
+    supposed to answer it can no longer be archived.
+    """
+    task = detail["task"]
+    task_id = task.get("id")
+    if not isinstance(task_id, str) or not task_id:
+        raise HermesCommandError("Hermes returned malformed recovery task JSON")
+    target_task_id, stall_class = _recovery_target(task, rig)
+    trigger_time = _key_trigger_time(task)
+    if _recovery_decision_already_disposed(client, rig, detail):
+        raise HermesCommandError(
+            f"unparseable recovery card {task_id} answers the {stall_class} decision of "
+            f"target {target_task_id} at {trigger_time}, which was already disposed; the "
+            f"repeat is reported instead of archived again"
+        )
+    target_task_id, stall_class, trigger_time, target, event = (
+        _require_unparseable_recovery_anchor(client, rig, detail)
+    )
+    if _recovery_card_moved(client, rig, detail):
+        return _regenerate_recovery(
+            client, rig, detail, target, event, stall_class=stall_class
+        )
+    reason = (
+        f"{_STALL_UNPARSEABLE_RECOVERY_PLAN}: completed recovery card {task_id} for "
+        f"target {target_task_id} ({stall_class} at {trigger_time}) records a plan that "
+        f"cannot be read: {error}. The card is retired so its idempotency key is free for "
+        f"a fresh recovery of the same block; nothing else on the board is touched"
+    )
+    _dispose_stale_recovery(client, rig, task_id, reason, rewires=None)
+    return None
 
 
 def _finalize_unknown_recovery_plan(
@@ -2571,11 +3192,19 @@ def _finalize_unknown_recovery_plan(
 
 def _finalize_completed_recoveries(
     client: HermesClient, rig: RigSpec
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
+) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, str]]:
+    """Consume the completed recovery cards the pass took its terminal snapshot from.
+
+    Every candidate is re-read from live records and revalidated before its privileged
+    mutation, so a card that moved after that snapshot is never mutated. When a broken
+    record moved, the block it answers still needs a recovery: that decision is returned
+    as ``{target task id: fresh recovery card id}`` for the pass to report and dispatch.
+    """
     board = ["kanban", "--board", rig.board.slug]
     done = _task_list(client.run_json(board + ["list", "--status", "done", "--json"]))
     finalized: list[str] = []
     failures: list[str] = []
+    regenerated: dict[str, str] = {}
     for index, task in enumerate(done):
         if task.get("created_by") != _RECOVERY_CREATOR:
             continue
@@ -2596,7 +3225,15 @@ def _finalize_completed_recoveries(
             _require_factory_authored(detail, f"recovery card {task_id}")
             _, stall_class = _recovery_target(detail["task"], rig)
             if stall_class == _STALL_UNKNOWN_OPERATIONAL:
-                unknown_plan = _unknown_recovery_plan(detail, rig)
+                try:
+                    unknown_plan = _unknown_recovery_plan(detail, rig)
+                except HermesCommandError as exc:
+                    # The record itself cannot be read: retire the decision so its key is
+                    # free again instead of failing every later pass on it.
+                    replaced = _dispose_unparseable_recovery(client, rig, detail, exc)
+                    if replaced is not None:
+                        regenerated[replaced[0]] = replaced[1]
+                    continue
                 try:
                     _finalize_unknown_recovery_plan(client, rig, unknown_plan)
                 except StaleRecoveryDecision as exc:
@@ -2605,7 +3242,16 @@ def _finalize_completed_recoveries(
                     )
                     continue
             else:
-                plan = _recovery_plan(detail, rig)
+                try:
+                    plan = _recovery_plan(detail, rig)
+                except HermesCommandError as exc:
+                    # A refusal answers the block with a generation, and that card takes
+                    # the place of the moved one in everything the pass reports and
+                    # dispatches afterwards.
+                    replaced = _dispose_unparseable_recovery(client, rig, detail, exc)
+                    if replaced is not None:
+                        regenerated[replaced[0]] = replaced[1]
+                    continue
                 try:
                     _finalize_recovery_plan(client, rig, task_id, plan)
                 except StaleRecoveryDecision as exc:
@@ -2622,7 +3268,7 @@ def _finalize_completed_recoveries(
             failures.append(f"{label}: {exc}")
             continue
         finalized.append(task_id)
-    return tuple(finalized), tuple(failures)
+    return tuple(finalized), tuple(failures), regenerated
 
 
 def _dispatch_reconcile_tasks(
@@ -2743,21 +3389,26 @@ def reconcile_board(
                 classification_failures.append(
                     f"board incident {board_incident_task_id} is already {incident_status}"
                 )
+    reopened: list[str] = []
     for index, task in enumerate(blocked):
         created_by = task.get("created_by")
-        if created_by in {_RECOVERY_CREATOR, _NO_AGENT_INCIDENT_CREATOR}:
+        recovery_card = created_by == _RECOVERY_CREATOR
+        if created_by == _NO_AGENT_INCIDENT_CREATOR:
             task_id = task.get("id")
             label = (
                 task_id
                 if isinstance(task_id, str) and task_id
                 else f"blocked entry #{index}"
             )
-            # Factory's own coordinator cards cannot be answered by another task-scoped
+            # Factory's own board incident cannot be answered by another task-scoped
             # recovery without unbounded recursion. Report the stopped autonomy loop.
-            kind = "recovery card" if created_by == _RECOVERY_CREATOR else "board incident"
-            classification_failures.append(f"{kind} {label} is blocked")
+            classification_failures.append(f"board incident {label} is blocked")
             continue
-        if created_by != "hermes-factory" and created_by != coordinator_profile:
+        if (
+            not recovery_card
+            and created_by != "hermes-factory"
+            and created_by != coordinator_profile
+        ):
             continue
         task_id = task.get("id")
         label = (
@@ -2768,19 +3419,66 @@ def reconcile_board(
         try:
             if not isinstance(task_id, str) or not task_id:
                 raise HermesCommandError("Hermes returned malformed blocked task list JSON")
+            if task_id in recovery_task_ids:
+                # This block was already answered by the provider-park path above, which
+                # registered a fresh recovery generation for it because the card it was
+                # going to re-open moved. Asking Hermes for the same decision twice would
+                # create a second card for one block.
+                continue
             detail = _authoritative_task_identity(
                 client,
                 rig.board.slug,
                 _task_show(client.run_json(board + ["show", task_id, "--json"])),
             )
             identity = None
-            if created_by != "hermes-factory":
+            if not recovery_card and created_by != "hermes-factory":
                 # A card the coordinator profile owns is Factory work only when
                 # Hermes's own records prove a Factory recovery run created it: the
                 # free-form ``created_by`` flag alone never selects what is recovered.
                 identity = _replacement_identity(client, rig, detail)
                 if identity is None:
                     continue
+            if not recovery_card and _is_explicit_human_gate(detail, rig):
+                # The one intentional operator boundary outranks every recovery class,
+                # so a gate that a terminal provider failure also parked is never
+                # re-opened or dispatched by Factory.
+                human_gate_ids.add(task_id)
+                continue
+            provider_park = _provider_parked_event(detail)
+            if provider_park is not None:
+                if not recovery_card and created_by == "hermes-factory":
+                    identity = _require_proven_factory_identity(
+                        client,
+                        rig,
+                        detail,
+                        f"provider-recoverable Factory card {task_id}",
+                    )
+                # A provider park is an environment fault rather than task work, so the
+                # reconciler re-opens the parked card itself - once - instead of
+                # delegating to another coordinator card that the same outage kills.
+                resolution = _reopen_provider_parked_card(
+                    client,
+                    rig,
+                    detail,
+                    provider_park,
+                    recovery_card=recovery_card,
+                    fixture_recovery=fixture_recovery,
+                    recovery_runtime=recovery_runtime,
+                )
+                if resolution.reopened is not None:
+                    reopened.append(resolution.reopened)
+                elif resolution.regenerated is not None:
+                    recovery_task_ids[resolution.regenerated[0]] = (
+                        resolution.regenerated[1]
+                    )
+                eligible += 1
+                continue
+            if recovery_card:
+                # Factory's own coordinator cards cannot be answered by another
+                # task-scoped recovery without unbounded recursion. Report the stopped
+                # autonomy loop; a provider park is answered directly above.
+                classification_failures.append(f"recovery card {label} is blocked")
+                continue
             classified = _classify_blocked_factory_task(detail, rig)
             if classified is None:
                 human_gate_ids.add(task_id)
@@ -2803,9 +3501,14 @@ def reconcile_board(
             classification_failures.append(f"{label}: {exc}")
             continue
         eligible += 1
-    finalized_recovery_task_ids, finalization_failures = (
-        _finalize_completed_recoveries(client, rig)
-    )
+    (
+        finalized_recovery_task_ids,
+        finalization_failures,
+        regenerated_recoveries,
+    ) = _finalize_completed_recoveries(client, rig)
+    # A regeneration answers a block whose registered recovery card moved while this pass
+    # was reading the board, so it replaces whatever this pass reported for that block.
+    recovery_task_ids.update(regenerated_recoveries)
     board_incident_task_id: str | None = None
     activity_reader = getattr(client, "board_activity", None)
     if (
@@ -2814,6 +3517,7 @@ def reconcile_board(
         and not finalized_recovery_task_ids
         and not classification_failures
         and not finalization_failures
+        and not reopened
     ):
         incident = _no_agent_incident(
             activity_reader(
@@ -2850,6 +3554,7 @@ def reconcile_board(
     dispatch_candidates = list(recovery_task_ids.values())
     if board_incident_task_id is not None:
         dispatch_candidates.append(board_incident_task_id)
+    dispatch_candidates.extend(reopened)
     dispatched = (
         _dispatch_reconcile_tasks(
             client,
@@ -2880,4 +3585,5 @@ def reconcile_board(
         finalized_recovery_task_ids=finalized_recovery_task_ids,
         dispatched=dispatched,
         board_incident_task_id=board_incident_task_id,
+        provider_reopened_task_ids=tuple(reopened),
     )

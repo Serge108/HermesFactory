@@ -26,6 +26,24 @@ def test_every_stall_class_names_an_existing_regression_test():
     assert unresolved == {}
 
 
+def test_provider_park_class_is_the_code_the_reconciler_implements():
+    """A class is executable only while the reconciler actually selects its code."""
+    from hermes_factory import reconcile as reconcile_module
+
+    classes = {item.code for item in stall_taxonomy()}
+
+    assert reconcile_module._STALL_TERMINAL_PROVIDER_PARK in classes
+
+
+def test_unparseable_plan_class_is_the_code_the_reconciler_implements():
+    """A class is executable only while the reconciler actually selects its code."""
+    from hermes_factory import reconcile as reconcile_module
+
+    classes = {item.code for item in stall_taxonomy()}
+
+    assert reconcile_module._STALL_UNPARSEABLE_RECOVERY_PLAN in classes
+
+
 def test_taxonomy_covers_timeout_capability_dispatch_dependency_and_human_classes():
     classes = {item.code: item for item in stall_taxonomy()}
 
@@ -38,11 +56,26 @@ def test_taxonomy_covers_timeout_capability_dispatch_dependency_and_human_classe
         "stale_dependency_edge",
         "review_rejected",
         "no_agent_activity",
+        "terminal_provider_park",
+        "unparseable_recovery_plan",
         "human_gate",
         "corrupt_state",
         "unknown_operational_stall",
     }
     assert classes["worker_timeout"].automatic is True
+    provider_park = classes["terminal_provider_park"]
+    assert provider_park.automatic is True
+    assert provider_park.recovery_owner == "factory"
+    assert provider_park.regression_test == (
+        "test_reconcile_reopens_provider_parked_factory_card_once"
+    )
+    unparseable = classes["unparseable_recovery_plan"]
+    assert unparseable.automatic is True
+    assert unparseable.recovery_owner == "factory"
+    assert "operator" not in unparseable.fallback.lower()
+    assert unparseable.regression_test == (
+        "test_reconcile_disposes_an_unparseable_recovery_plan_once"
+    )
     unknown = classes["unknown_operational_stall"]
     assert unknown.automatic is True
     assert unknown.recovery_owner == "coordinator"

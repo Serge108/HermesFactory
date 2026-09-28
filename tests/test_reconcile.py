@@ -1,4 +1,5 @@
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -1273,6 +1274,33 @@ def test_unknown_recovery_resume_and_retry_unblock_target(
     assert client.target["task"]["status"] == "ready"
 
 
+def test_unknown_recovery_generation_reads_the_same_trigger_time(valid_rig: Path) -> None:
+    """A generation key parses exactly like the key it answers.
+
+    The pass registers a generation when the card it validated moved, and unknown
+    operational recoveries are no exception. Reading the trigger time from the trailing
+    segment would take the answered card's id instead, which turns an applicable plan into
+    an unreadable one: the block would never be released and every later pass would report
+    the same refusal.
+    """
+
+    class UnknownGenerationClient(UnknownResumeClient):
+        def __init__(self) -> None:
+            super().__init__("resume")
+            self.recovery["task"]["idempotency_key"] = (
+                "factory:demo:reconcile:unknown-1:unknown-stall:100:generation:recovery-0"
+            )
+
+    client = UnknownGenerationClient()
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ("unknown-recovery-1",)
+    assert ["kanban", "--board", "demo-rig", "unblock", "unknown-1", "--reason",
+            "Run the safe script and continue."] in client.run_calls
+    assert client.target["task"]["status"] == "ready"
+
+
 def test_unknown_recovery_termination_is_idempotent_for_archived_leaf(
     valid_rig: Path,
 ):
@@ -1695,24 +1723,26 @@ def test_reconcile_revalidates_finalized_state_without_duplicate_marker(valid_ri
     assert not any(call[3] in {"unlink", "archive"} for call in client.run_calls)
 
 
-def test_reconcile_rejects_recovery_plan_that_purges_unrelated_task(valid_rig: Path):
+def test_reconcile_retires_a_plan_that_names_an_unrelated_superseded_task(
+    valid_rig: Path,
+):
+    # The record names a card the target chain never contained, so no plan can ever be
+    # parsed from it: the card is retired with the parse error recorded, and the foreign
+    # card is never archived or purged.
     recovery, recovery_detail = _completed_recovery(
         replacements=["new-review"],
         rewires=[],
         superseded=["foreign-task"],
     )
-    client = FakeReconcileClient(
-        [
-            [],
-            [recovery],
-            recovery_detail,
-        ]
-    )
+    client = StatefulRecoveryClient(recovery, recovery_detail, [_blocked_target()])
 
-    with pytest.raises(HermesCommandError, match="recovery target old-impl"):
-        reconcile_board(client, load_rig(valid_rig))
+    result = reconcile_board(client, load_rig(valid_rig))
 
-    assert client.run_calls == []
+    assert result.finalized_recovery_task_ids == ()
+    assert client.recovery["status"] == "archived"
+    assert [call[3] for call in client.run_calls] == ["archive", "comment"]
+    assert client.run_calls[0][-1] == "recovery-1"
+    assert "is not included in superseded_task_ids" in client.run_calls[1][5]
 
 
 def test_reconcile_rejects_real_target_plus_unrelated_superseded_task_before_mutation(
@@ -2666,9 +2696,11 @@ def _downstream_detail(
     "completion_failure",
     ["duplicate_completed", "mismatched_run_id", "missing_run_id"],
 )
-def test_reconcile_rejects_unbound_recovery_completion(
+def test_reconcile_retires_a_recovery_plan_without_an_authoritative_completion(
     valid_rig: Path, completion_failure: str
 ):
+    # A completion record that does not bind to its own run makes the plan unreadable,
+    # so the card is retired with that parse error recorded and nothing is mutated.
     recovery, recovery_detail = _completed_recovery(
         replacements=["new-impl", "new-review"],
         rewires=[],
@@ -2683,16 +2715,14 @@ def test_reconcile_rejects_unbound_recovery_completion(
         completed[0]["run_id"] = 999
     else:
         del recovery_detail["runs"][0]["id"]
-    client = StatefulRecoveryClient(
-        recovery,
-        recovery_detail,
-        [*_replacement_pair(), *_superseded_pair()],
-    )
+    client = StatefulRecoveryClient(recovery, recovery_detail, [_blocked_target()])
 
-    with pytest.raises(HermesCommandError, match="authoritative"):
-        reconcile_board(client, load_rig(valid_rig))
+    result = reconcile_board(client, load_rig(valid_rig))
 
-    assert client.run_calls == []
+    assert result.finalized_recovery_task_ids == ()
+    assert client.recovery["status"] == "archived"
+    assert [call[3] for call in client.run_calls] == ["archive", "comment"]
+    assert "authoritative" in client.run_calls[1][5]
 
 
 def test_reconcile_rejects_archived_replacement_before_mutation(valid_rig: Path):
@@ -3213,7 +3243,9 @@ def test_reconcile_finalizes_other_recoveries_after_unexpected_error(
     assert "old-impl" not in client.details
 
 
-def test_reconcile_rejects_truncated_replacement_policy_contract(valid_rig: Path):
+def test_reconcile_retires_a_recovery_plan_with_a_truncated_policy_contract(
+    valid_rig: Path,
+):
     recovery, recovery_detail = _completed_recovery(
         replacements=["new-impl", "new-review"],
         rewires=[],
@@ -3231,14 +3263,14 @@ def test_reconcile_rejects_truncated_replacement_policy_contract(valid_rig: Path
         + newline
         + rest
     )
-    # Post-purge retry state: the target is gone and no superseded card survives, so
-    # the policy block is the only source the contract validation can read.
-    client = StatefulRecoveryClient(recovery, recovery_detail, _replacement_pair())
+    client = StatefulRecoveryClient(recovery, recovery_detail, [_blocked_target()])
 
-    with pytest.raises(HermesCommandError, match="malformed replacement policy"):
-        reconcile_board(client, load_rig(valid_rig))
+    result = reconcile_board(client, load_rig(valid_rig))
 
-    assert client.run_calls == []
+    assert result.finalized_recovery_task_ids == ()
+    assert client.recovery["status"] == "archived"
+    assert [call[3] for call in client.run_calls] == ["archive", "comment"]
+    assert "malformed replacement policy" in client.run_calls[1][5]
 
 
 def test_reconcile_rejects_recovery_card_created_inside_worker_session(
@@ -4005,19 +4037,24 @@ def test_reconcile_finalizes_unknown_decompose_recovery_plan(valid_rig: Path):
     assert "new-impl-2" in client.details["new-review-2"]["parents"]
 
 
-def test_unknown_recovery_rejects_graph_mutation_for_non_replacement_action(
+def test_unknown_recovery_retires_a_plan_that_mutates_the_graph_for_a_resume(
     valid_rig: Path,
 ):
+    # A `resume` outcome that declares graph mutation can never be parsed, so the card is
+    # retired with that parse error recorded and the blocked target is left alone.
     client = UnknownResumeClient()
     metadata = client.recovery["runs"][0]["metadata"]
     metadata["rewires"] = [
         {"old_parent": "unknown-1", "new_parent": "elsewhere", "child": "child-1"}
     ]
 
-    with pytest.raises(HermesCommandError, match="may not mutate the graph"):
-        reconcile_board(client, load_rig(valid_rig))
+    result = reconcile_board(client, load_rig(valid_rig))
 
-    assert client.run_calls == []
+    assert result.finalized_recovery_task_ids == ()
+    assert client.recovery["task"]["status"] == "archived"
+    assert [call[3] for call in client.run_calls] == ["archive", "comment"]
+    assert "may not mutate the graph" in client.run_calls[1][5]
+    assert client.target["task"]["status"] == "blocked"
 
 
 def test_reconcile_routes_breaker_parked_card_without_block_event_to_unknown(
@@ -4233,7 +4270,12 @@ def test_reconcile_disposes_stale_unknown_replace_without_mutation(valid_rig: Pa
     assert [call[3] for call in client.run_calls] == ["archive", "comment"]
 
 
-def test_unknown_replace_recovery_requires_verified_cards_manifest(valid_rig: Path):
+def test_unknown_replace_recovery_retires_a_plan_without_a_verified_cards_manifest(
+    valid_rig: Path,
+):
+    # The completion manifest no longer matches the declared replacements, so the plan is
+    # unreadable: the card is retired with that parse error and no card is archived,
+    # unlinked, or purged by the plan.
     recovery, detail = _completed_unknown_recovery(
         replacements=["new-impl", "new-review"],
         rewires=[
@@ -4255,10 +4297,13 @@ def test_unknown_replace_recovery_requires_verified_cards_manifest(valid_rig: Pa
         ),
     )
 
-    with pytest.raises(HermesCommandError, match="verified_cards"):
-        reconcile_board(client, load_rig(valid_rig))
+    result = reconcile_board(client, load_rig(valid_rig))
 
-    assert [call for call in client.run_calls if call[3] in {"unlink", "archive"}] == []
+    assert result.finalized_recovery_task_ids == ()
+    assert client.recovery["status"] == "archived"
+    assert [call[3] for call in client.run_calls] == ["archive", "comment"]
+    assert "verified_cards" in client.run_calls[1][5]
+    assert "old-impl" in client.details
 
 
 def test_unknown_recovery_resume_lands_review_status_and_finalizes(valid_rig: Path):
@@ -4300,6 +4345,21 @@ def test_reconcile_reports_blocked_recovery_card_without_creating_another(
     client = FakeReconcileClient(
         [
             [stuck, unknown],
+            {
+                "task": stuck,
+                "parents": [],
+                "children": [],
+                "comments": [],
+                "events": [
+                    {
+                        "kind": "blocked",
+                        "created_at": 50,
+                        "run_id": 7,
+                        "payload": {"reason": "the recovery worker parked itself"},
+                    }
+                ],
+                "runs": [],
+            },
             {
                 "task": unknown,
                 "parents": [],
@@ -5597,3 +5657,1088 @@ def test_reconcile_classifies_blocked_recovery_created_card_without_creator_key_
     assert result.eligible == 1
     assert result.recovery_task_ids == {"new-review": "recovery-2"}
     assert ("demo-rig", "seed-recovery") in client.task_record_calls
+
+
+# ---------------------------------------------------------------------------
+# A card parked by a terminal provider failure
+# ---------------------------------------------------------------------------
+
+
+def _created_event() -> dict[str, object]:
+    return {"kind": "created", "created_at": 100, "payload": {"creator_task_id": None}}
+
+
+def _provider_park_payload(
+    *, exit_code: int | None = None, terminal_provider: bool = True
+) -> dict[str, object]:
+    """Hermes's own breaker payload for a terminal provider failure.
+
+    The breaker writes the marker on the ``gave_up`` event; the ``exit_code`` lives on
+    the run's own record, so it is optional here.
+    """
+    payload: dict[str, object] = {
+        "failures": 1,
+        "effective_limit": 1,
+        "limit_source": "task",
+        "trigger_outcome": "crashed",
+        "retry_status": "ready",
+        "sticky": True,
+    }
+    if terminal_provider:
+        payload["terminal_provider"] = True
+    if exit_code is not None:
+        payload["exit_code"] = exit_code
+    return payload
+
+
+def _provider_park_event(
+    *,
+    event_time: int,
+    exit_code: int | None = None,
+    terminal_provider: bool = True,
+    kind: str = "gave_up",
+) -> dict[str, object]:
+    return {
+        "kind": kind,
+        "created_at": event_time,
+        "run_id": None,
+        "payload": _provider_park_payload(
+            exit_code=exit_code, terminal_provider=terminal_provider
+        ),
+    }
+
+
+def _provider_parked_factory_detail(
+    task_id: str = "task-1",
+    *,
+    events: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    task = _blocked_task(task_id)
+    return {
+        "task": task,
+        "parents": ["parent-1"],
+        "children": ["review-1"],
+        "comments": [],
+        "events": events
+        if events is not None
+        else [_created_event(), _provider_park_event(event_time=1780)],
+        "runs": [],
+    }
+
+
+def _provider_parked_recovery_detail(
+    *,
+    recovery_id: str = "recovery-provider-1",
+    target: str = "task-1",
+    key_time: int = 102,
+    event_time: int = 1780,
+) -> dict[str, object]:
+    return {
+        "task": {
+            "id": recovery_id,
+            "title": f"Decompose blocked task {target}",
+            "body": f"Superseded task: {target}\nReason code: worker_timeout",
+            "status": "blocked",
+            "assignee": "builder",
+            "created_by": "hermes-factory-reconciler",
+            "idempotency_key": f"factory:demo:reconcile:{target}:gave-up:{key_time}",
+        },
+        "parents": [],
+        "children": [],
+        "comments": [],
+        "events": [
+            {"kind": "created", "created_at": 150, "payload": {"creator_task_id": None}},
+            _provider_park_event(event_time=event_time),
+        ],
+        "runs": [],
+    }
+
+
+def _provider_anchor_target(
+    target: str = "task-1", *, event_time: int = 102
+) -> dict[str, object]:
+    """The blocked target a Factory recovery card was created for."""
+    task = _blocked_task(target)
+    return {
+        "task": task,
+        "parents": [],
+        "children": ["recovery-provider-1"],
+        "comments": [],
+        "events": [
+            _created_event(),
+            {
+                "kind": "gave_up",
+                "created_at": event_time,
+                "run_id": None,
+                "payload": {"trigger_outcome": "timed_out", "retry_status": "ready"},
+            },
+        ],
+        "runs": [],
+    }
+
+
+class ProviderParkClient:
+    """A board whose cards answer reads from live records instead of a queue."""
+
+    def __init__(
+        self,
+        details: list[dict[str, object]],
+        *,
+        reread: dict[str, dict[str, object]] | None = None,
+        landing_status: str = "ready",
+    ) -> None:
+        self.details = {detail["task"]["id"]: detail for detail in details}
+        self.reread = reread or {}
+        self.landing_status = landing_status
+        self.reads: dict[str, int] = {}
+        self.json_calls: list[list[str]] = []
+        self.run_calls: list[list[str]] = []
+
+    def run_json(self, args: list[str]) -> object:
+        self.json_calls.append(args)
+        tail = args[3:]
+        if tail == ["list", "--status", "blocked", "--json"]:
+            return [
+                detail["task"]
+                for detail in self.details.values()
+                if detail["task"]["status"] == "blocked"
+            ]
+        if tail == ["list", "--status", "done", "--json"]:
+            return []
+        if tail[:1] == ["show"]:
+            task_id = tail[1]
+            self.reads[task_id] = self.reads.get(task_id, 0) + 1
+            override = self.reread.get(task_id)
+            if override is not None and self.reads[task_id] > 1:
+                return override
+            return self.details[task_id]
+        if tail[:2] == ["dispatch", "--max"]:
+            return {"spawned": [{"task_id": "task-1"}]}
+        if tail[:1] == ["create"]:
+            # Hermes honours the idempotency key: a recovery re-requested for the still
+            # blocked target is the card that already exists.
+            return {"id": "recovery-provider-1", "status": "ready", "title": tail[1]}
+        raise AssertionError(args)
+
+    def run(self, args: list[str]) -> str:
+        self.run_calls.append(args)
+        tail = args[3:]
+        if tail[:1] == ["unblock"]:
+            detail = self.details[tail[1]]
+            detail["task"]["status"] = self.landing_status
+            detail["events"].append(
+                {
+                    "kind": "unblocked",
+                    "created_at": int(time.time()),
+                    "payload": {"status": self.landing_status, "reason": _flag_value(args, "--reason")},
+                }
+            )
+            return ""
+        raise AssertionError(args)
+
+
+def test_reconcile_reopens_provider_parked_factory_card_once(valid_rig: Path) -> None:
+    detail = _provider_parked_factory_detail()
+    client = ProviderParkClient([detail])
+
+    result = reconcile_board(client, load_rig(valid_rig), dispatch=True)
+
+    assert result.scanned == 1
+    assert result.eligible == 1
+    assert result.provider_reopened_task_ids == ("task-1",)
+    # The re-open is the recovery: it never delegates to another coordinator card.
+    assert [call for call in client.json_calls if call[3] == "create"] == []
+    unblock = next(call for call in client.run_calls if call[3] == "unblock")
+    assert unblock[:5] == ["kanban", "--board", "demo-rig", "unblock", "task-1"]
+    decision = _flag_value(unblock, "--reason")
+    assert reconcile_module._STALL_TERMINAL_PROVIDER_PARK in decision
+    assert "1780" in decision
+    assert detail["task"]["status"] == "ready"
+    dispatch = next(call for call in client.json_calls if call[3] == "dispatch")
+    assert _flag_value(dispatch, "--max") == "1"
+
+
+def test_reconcile_refuses_a_worker_authored_provider_parked_factory_lookalike(
+    valid_rig: Path,
+) -> None:
+    detail = _provider_parked_factory_detail()
+    detail["events"][0]["payload"]["creator_task_id"] = "worker-task-1"
+    client = ProviderParkClient([detail])
+
+    with pytest.raises(HermesCommandError, match="created inside a worker session"):
+        reconcile_board(client, load_rig(valid_rig), dispatch=True)
+
+    assert client.run_calls == []
+    assert detail["task"]["status"] == "blocked"
+
+
+def test_reconcile_does_not_treat_a_blocked_event_as_a_terminal_provider_park(
+    valid_rig: Path,
+) -> None:
+    detail = _provider_parked_factory_detail(
+        events=[_created_event(), _provider_park_event(event_time=1780, kind="blocked")]
+    )
+    client = ProviderParkClient([detail])
+
+    result = reconcile_board(client, load_rig(valid_rig), dispatch=False)
+
+    assert result.provider_reopened_task_ids == ()
+    assert result.recovery_task_ids == {"task-1": "recovery-provider-1"}
+    assert client.run_calls == []
+
+
+def test_reconcile_reports_a_second_provider_park_without_reopening(valid_rig: Path) -> None:
+    events = [
+        _created_event(),
+        _provider_park_event(event_time=100),
+        {
+            "kind": "unblocked",
+            "created_at": 120,
+            "payload": {"status": "ready", "reason": "first re-open"},
+        },
+        _provider_park_event(event_time=1780),
+    ]
+    detail = _provider_parked_factory_detail(events=events)
+    client = ProviderParkClient([detail])
+
+    with pytest.raises(HermesCommandError, match="already re-opened"):
+        reconcile_board(client, load_rig(valid_rig), dispatch=True)
+
+    assert client.run_calls == []
+    assert [call for call in client.json_calls if call[3] == "dispatch"] == []
+    assert detail["task"]["status"] == "blocked"
+
+
+def test_reconcile_reports_a_same_second_second_provider_park_without_reopening(
+    valid_rig: Path,
+) -> None:
+    events = [
+        _created_event(),
+        _provider_park_event(event_time=1780),
+        {
+            "kind": "unblocked",
+            "created_at": 1780,
+            "payload": {"status": "ready", "reason": "first re-open"},
+        },
+        _provider_park_event(event_time=1780),
+    ]
+    detail = _provider_parked_factory_detail(events=events)
+    client = ProviderParkClient([detail])
+
+    with pytest.raises(HermesCommandError, match="already re-opened"):
+        reconcile_board(client, load_rig(valid_rig), dispatch=True)
+
+    assert client.run_calls == []
+    assert [call for call in client.json_calls if call[3] == "dispatch"] == []
+    assert detail["task"]["status"] == "blocked"
+
+
+def test_reconcile_checks_the_live_provider_park_history_before_reopening(
+    valid_rig: Path,
+) -> None:
+    detail = _provider_parked_factory_detail()
+    reread = _provider_parked_factory_detail(
+        events=[
+            _created_event(),
+            _provider_park_event(event_time=1780),
+            _provider_park_event(event_time=1780),
+        ]
+    )
+    client = ProviderParkClient([detail], reread={"task-1": reread})
+
+    with pytest.raises(HermesCommandError, match="already re-opened"):
+        reconcile_board(client, load_rig(valid_rig), dispatch=True)
+
+    assert client.run_calls == []
+    assert detail["task"]["status"] == "blocked"
+
+
+def test_reconcile_keeps_a_providerless_crash_park_on_its_existing_class(
+    valid_rig: Path,
+) -> None:
+    unknown = _blocked_task("unknown-1")
+    unknown["last_failure_error"] = None
+    client = FakeReconcileClient(
+        [
+            [unknown],
+            {
+                "task": unknown,
+                "parents": [],
+                "children": [],
+                "comments": [],
+                "events": [
+                    _created_event(),
+                    {
+                        "kind": "crashed",
+                        "created_at": 99,
+                        "run_id": 9,
+                        "payload": {"exit_kind": "terminal_provider", "exit_code": 78},
+                    },
+                    _provider_park_event(event_time=100, terminal_provider=False),
+                ],
+                "runs": [],
+            },
+            {
+                "id": "unknown-recovery-1",
+                "status": "ready",
+                "title": "Resolve unknown blocked task unknown-1",
+            },
+            [],
+        ]
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.provider_reopened_task_ids == ()
+    assert result.recovery_task_ids == {"unknown-1": "unknown-recovery-1"}
+    assert client.run_calls == []
+
+
+def test_reconcile_keeps_an_unexpected_terminal_provider_exit_code_on_its_existing_class(
+    valid_rig: Path,
+) -> None:
+    unknown = _blocked_task("unknown-1")
+    unknown["last_failure_error"] = None
+    client = FakeReconcileClient(
+        [
+            [unknown],
+            {
+                "task": unknown,
+                "parents": [],
+                "children": [],
+                "comments": [],
+                "runs": [],
+                "events": [_created_event(), _provider_park_event(event_time=100, exit_code=79)],
+            },
+            {
+                "id": "unknown-recovery-1",
+                "status": "ready",
+                "title": "Resolve unknown blocked task unknown-1",
+            },
+            [],
+        ]
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.provider_reopened_task_ids == ()
+    assert result.recovery_task_ids == {"unknown-1": "unknown-recovery-1"}
+    assert client.run_calls == []
+
+
+def test_reconcile_reopens_provider_parked_recovery_card_from_its_target_anchor(
+    valid_rig: Path,
+) -> None:
+    recovery = _provider_parked_recovery_detail()
+    target = _provider_anchor_target()
+    client = ProviderParkClient([recovery, target])
+
+    result = reconcile_board(client, load_rig(valid_rig), dispatch=True)
+
+    assert result.provider_reopened_task_ids == ("recovery-provider-1",)
+    assert client.reads["task-1"] >= 1
+    unblock = next(call for call in client.run_calls if call[3] == "unblock")
+    assert unblock[4] == "recovery-provider-1"
+    assert recovery["task"]["status"] == "ready"
+    assert [call for call in client.json_calls if call[3] == "dispatch"] != []
+
+
+def test_reconcile_refuses_a_provider_parked_recovery_card_whose_anchor_moved(
+    valid_rig: Path,
+) -> None:
+    recovery = _provider_parked_recovery_detail(key_time=102)
+    target = _provider_anchor_target(event_time=999)
+    client = ProviderParkClient([recovery, target])
+
+    with pytest.raises(HermesCommandError, match="no longer answers"):
+        reconcile_board(client, load_rig(valid_rig), dispatch=True)
+
+    assert client.run_calls == []
+    assert recovery["task"]["status"] == "blocked"
+
+
+def test_reconcile_refuses_a_provider_parked_recovery_for_a_different_same_second_incident(
+    valid_rig: Path,
+) -> None:
+    recovery = _provider_parked_recovery_detail(key_time=102)
+    target = _provider_anchor_target(event_time=102)
+    target["events"].append(
+        {
+            "kind": "blocked",
+            "created_at": 102,
+            "run_id": 9,
+            "payload": {"reason": "different same-second incident"},
+        }
+    )
+    client = ProviderParkClient([recovery, target])
+
+    with pytest.raises(HermesCommandError, match="no longer answers"):
+        reconcile_board(client, load_rig(valid_rig), dispatch=True)
+
+    assert client.run_calls == []
+    assert recovery["task"]["status"] == "blocked"
+
+
+def test_reconcile_revalidates_the_recovery_target_after_rereading_the_parked_card(
+    valid_rig: Path,
+) -> None:
+    recovery = _provider_parked_recovery_detail(key_time=102)
+    target = _provider_anchor_target(event_time=102)
+
+    class TargetMovesDuringRecoveryReread(ProviderParkClient):
+        def run_json(self, args: list[str]) -> object:
+            result = super().run_json(args)
+            tail = args[3:]
+            if tail[:2] == ["show", "recovery-provider-1"] and self.reads[
+                "recovery-provider-1"
+            ] == 2:
+                self.details["task-1"]["events"].append(
+                    {
+                        "kind": "blocked",
+                        "created_at": 102,
+                        "run_id": 9,
+                        "payload": {"reason": "target moved during recovery reread"},
+                    }
+                )
+            return result
+
+    client = TargetMovesDuringRecoveryReread([recovery, target])
+
+    with pytest.raises(HermesCommandError, match="no longer answers"):
+        reconcile_board(client, load_rig(valid_rig), dispatch=True)
+
+    assert client.run_calls == []
+    assert recovery["task"]["status"] == "blocked"
+
+
+def test_reconcile_generates_a_fresh_recovery_if_the_provider_parked_card_finishes_during_anchor_read(
+    valid_rig: Path,
+) -> None:
+    recovery = _provider_parked_recovery_detail(key_time=102)
+    target = _provider_anchor_target(event_time=102)
+
+    class RecoveryFinishesDuringAnchorRead(ProviderParkClient):
+        def __init__(self, details: list[dict[str, object]]) -> None:
+            super().__init__(details)
+            self.created_keys: list[str] = []
+
+        def run_json(self, args: list[str]) -> object:
+            tail = args[3:]
+            if tail[:2] == ["show", "task-1"]:
+                self.details["recovery-provider-1"]["task"]["status"] = "done"
+            if tail[:1] == ["create"]:
+                key = _flag_value(args, "--idempotency-key")
+                self.created_keys.append(key)
+                return {"id": "fresh-recovery-1", "status": "ready", "title": tail[1]}
+            return super().run_json(args)
+
+        def run(self, args: list[str]) -> str:
+            tail = args[3:]
+            if tail[:1] == ["unblock"] and self.details[tail[1]]["task"]["status"] not in {
+                "blocked",
+                "scheduled",
+            }:
+                raise HermesCommandError("cannot unblock task (not blocked/scheduled?)")
+            return super().run(args)
+
+    client = RecoveryFinishesDuringAnchorRead([recovery, target])
+
+    result = reconcile_board(client, load_rig(valid_rig), dispatch=False)
+
+    assert result.recovery_task_ids == {"task-1": "fresh-recovery-1"}
+    assert len(client.created_keys) == 1
+    assert client.created_keys[0].split(":")[:6] == [
+        "factory",
+        "demo",
+        "reconcile",
+        "task-1",
+        "gave-up",
+        "102",
+    ]
+    assert len(client.created_keys[0].split(":")) > 6
+    assert client.run_calls == []
+    assert recovery["task"]["status"] == "done"
+
+
+def test_reconcile_refuses_a_provider_parked_recovery_card_whose_target_finished(
+    valid_rig: Path,
+) -> None:
+    recovery = _provider_parked_recovery_detail(key_time=102)
+    target = _provider_anchor_target(event_time=102)
+    target["task"]["status"] = "done"
+    target["runs"] = [
+        {
+            "id": 1,
+            "outcome": "completed",
+            "finished_at": 103,
+            "summary": "target completed",
+            "metadata": {},
+        }
+    ]
+    client = ProviderParkClient([recovery, target])
+
+    with pytest.raises(HermesCommandError, match="no longer answers"):
+        reconcile_board(client, load_rig(valid_rig), dispatch=True)
+
+    assert client.run_calls == []
+    assert recovery["task"]["status"] == "blocked"
+
+
+def test_reconcile_refuses_a_provider_park_that_stopped_being_the_live_terminal_event(
+    valid_rig: Path,
+) -> None:
+    detail = _provider_parked_factory_detail()
+    moved_on = {
+        **detail,
+        "events": [
+            _created_event(),
+            _provider_park_event(event_time=1780),
+            {
+                "kind": "blocked",
+                "created_at": 1790,
+                "run_id": 9,
+                "payload": {"reason": "a newer block replaced it"},
+            },
+        ],
+    }
+    client = ProviderParkClient([detail], reread={"task-1": moved_on})
+
+    with pytest.raises(HermesCommandError, match="no longer parked"):
+        reconcile_board(client, load_rig(valid_rig), dispatch=True)
+
+    assert client.run_calls == []
+    assert detail["task"]["status"] == "blocked"
+
+
+def test_reconcile_never_selects_a_provider_marker_outside_factory_work(
+    valid_rig: Path,
+) -> None:
+    detail = _provider_parked_factory_detail()
+    detail["task"]["created_by"] = "some-other-tool"
+    client = ProviderParkClient([detail])
+
+    result = reconcile_board(client, load_rig(valid_rig), dispatch=True)
+
+    assert result.scanned == 1
+    assert result.eligible == 0
+    assert result.provider_reopened_task_ids == ()
+    assert client.run_calls == []
+    assert [call for call in client.json_calls if call[3] in {"create", "dispatch"}] == []
+
+
+def test_reconcile_reopens_a_provider_parked_recovery_created_card(
+    valid_rig: Path,
+) -> None:
+    detail = _blocked_recovery_created_card(task_id="new-impl", task_class="implementation")
+    detail["events"] = [
+        event for event in detail["events"] if event.get("kind") != "gave_up"
+    ] + [_provider_park_event(event_time=1780)]
+    creator, creator_detail = _creator_recovery(created_cards=["new-impl", "new-review"])
+    # Hermes's ``show`` surface omits the idempotency key, so the creator card the
+    # provenance proof reads carries it the way the authoritative record does.
+    creator["idempotency_key"] = f"factory:demo:reconcile:{creator['id']}:gave-up:200"
+    client = ProviderParkClient([detail, creator_detail])
+
+    result = reconcile_board(client, load_rig(valid_rig), dispatch=True)
+
+    assert result.provider_reopened_task_ids == ("new-impl",)
+    # Factory provenance is still proven before anything is unblocked.
+    assert client.reads["seed-recovery"] >= 1
+    assert result.recovery_task_ids == {}
+    unblock = next(call for call in client.run_calls if call[3] == "unblock")
+    assert unblock[4] == "new-impl"
+    assert [call for call in client.json_calls if call[3] == "create"] == []
+
+
+def test_reconcile_never_reopens_a_provider_parked_human_acceptance_gate(
+    valid_rig: Path,
+) -> None:
+    valid_rig.write_text(
+        valid_rig.read_text(encoding="utf-8").replace(
+            "human_acceptance: false,",
+            "human_acceptance: true, decision_authority: human,",
+        ),
+        encoding="utf-8",
+    )
+    gate = {
+        **_blocked_task("gate-1"),
+        "title": "Accept demo mission",
+        "body": (
+            "# Project\nDemo\n\n# Mission\nDemo mission\n\n# Acceptance\n- approve\n\n"
+            "# Proof required\n- none\n\n"
+            "<!-- hermes-factory:audit-contract -->\n"
+            'Factory audit contract: {"task_class":"acceptance","required_commands":[],'
+            '"required_artifacts":[],"changed_files_required":false,"required_metadata":[]}\n'
+            "<!-- /hermes-factory:audit-contract -->\n\n"
+            "# Scope boundaries\nProject demo; mission demo-mission; workflow delivery.\n\n"
+            "<!-- hermes-factory:human-gate -->\n# Human gate\nExplicit acceptance.\n\n"
+            "# Handoff\nNext target: operator."
+        ),
+        "assignee": None,
+        "idempotency_key": "factory:demo:demo-mission:acceptance",
+        "last_failure_error": None,
+    }
+    detail = {
+        "task": gate,
+        "parents": ["review-1"],
+        "children": [],
+        "comments": [],
+        "events": [
+            {"kind": "created", "created_at": 90, "payload": {"creator_task_id": None}},
+            _provider_park_event(event_time=1780),
+        ],
+        "runs": [],
+    }
+    client = ProviderParkClient([detail])
+
+    result = reconcile_board(client, load_rig(valid_rig), dispatch=True)
+
+    assert result.eligible == 0
+    assert result.provider_reopened_task_ids == ()
+    assert client.run_calls == []
+    assert [call for call in client.json_calls if call[3] == "create"] == []
+
+
+# ---------------------------------------------------------------------------
+# A completed recovery card whose recorded plan cannot be parsed
+# ---------------------------------------------------------------------------
+
+
+def _recovery_card(
+    recovery_id: str = "recovery-1",
+    *,
+    target: str = "old-impl",
+    event_time: int = 200,
+    status: str = "done",
+    extra_metadata: dict[str, object] | None = None,
+    creator_task_id: str | None = None,
+    run_id: int = 200,
+) -> dict[str, object]:
+    """A Factory recovery card as Hermes records it, plus the plan it recorded."""
+    metadata: dict[str, object] = {
+        "replacement_task_ids": ["new-impl", "new-review"],
+        "rewires": [],
+        "superseded_task_ids": [target],
+        "limitations": [],
+    }
+    metadata.update(extra_metadata or {})
+    events: list[dict[str, object]] = [
+        {
+            "kind": "created",
+            "created_at": 100,
+            "payload": {"creator_task_id": creator_task_id},
+        }
+    ]
+    runs: list[dict[str, object]] = []
+    if status == "done":
+        events.append(
+            {
+                "kind": "completed",
+                "created_at": 250,
+                "run_id": run_id,
+                "payload": {"verified_cards": ["new-impl", "new-review"]},
+            }
+        )
+        runs.append(
+            {
+                "id": run_id,
+                "status": "done",
+                "outcome": "completed",
+                "metadata": metadata,
+            }
+        )
+    return {
+        "task": {
+            "id": recovery_id,
+            "title": f"Decompose blocked task {target}",
+            "body": (
+                f"Superseded task: {target}\nReason code: worker_timeout\n\n"
+                + _replacement_policy_body()
+            ),
+            "status": status,
+            "assignee": "builder",
+            "created_by": "hermes-factory-reconciler",
+            "idempotency_key": f"factory:demo:reconcile:{target}:gave-up:{event_time}",
+        },
+        "parents": [],
+        "children": [],
+        "comments": [],
+        "events": events,
+        "runs": runs,
+    }
+
+
+class RecoveryPlanBoardClient:
+    """A board whose reads see one live state that consecutive passes mutate."""
+
+    def __init__(
+        self,
+        details: list[dict[str, object]],
+        *,
+        unreadable: tuple[str, ...] = (),
+    ) -> None:
+        self.details = {detail["task"]["id"]: detail for detail in details}
+        self.unreadable = set(unreadable)
+        self.created_keys: list[str] = []
+        self.dispatches: list[list[str]] = []
+        self.json_calls: list[list[str]] = []
+        self.run_calls: list[list[str]] = []
+
+    def _cards(self, status: str) -> list[dict[str, object]]:
+        return [
+            detail["task"]
+            for detail in self.details.values()
+            if detail["task"]["status"] == status
+        ]
+
+    def _create(self, args: list[str]) -> dict[str, object]:
+        key = _flag_value(args, "--idempotency-key")
+        for detail in self.details.values():
+            task = detail["task"]
+            if task.get("idempotency_key") == key and task["status"] != "archived":
+                return {"id": task["id"], "status": task["status"], "title": task["title"]}
+        parts = key.split(":")
+        target = parts[3]
+        recovery_id = f"fresh-recovery-{len(self.created_keys) + 1}"
+        self.created_keys.append(key)
+        self.details[recovery_id] = _recovery_card(
+            recovery_id, target=target, event_time=int(parts[5]), status="ready"
+        )
+        self.details[recovery_id]["task"]["idempotency_key"] = key
+        return {"id": recovery_id, "status": "ready", "title": args[4]}
+
+    def run_json(self, args: list[str]) -> object:
+        self.json_calls.append(args)
+        tail = args[3:]
+        if tail == ["list", "--status", "blocked", "--json"]:
+            return self._cards("blocked")
+        if tail == ["list", "--status", "done", "--json"]:
+            return self._cards("done")
+        if tail == ["list", "--archived", "--json"]:
+            return [detail["task"] for detail in self.details.values()]
+        if tail[:1] == ["show"]:
+            if tail[1] in self.unreadable:
+                raise HermesCommandError("Hermes exited 1: task not found")
+            if tail[1] not in self.details:
+                raise HermesCommandError(f"Hermes exited 1: unknown task {tail[1]}")
+            return self.details[tail[1]]
+        if tail[:1] == ["create"]:
+            return self._create(args)
+        if tail[:2] == ["dispatch", "--max"]:
+            self.dispatches.append(args)
+            return {"spawned": [{"task_id": task_id} for task_id in self._cards("ready")]}
+        raise AssertionError(args)
+
+    def run(self, args: list[str]) -> str:
+        self.run_calls.append(args)
+        tail = args[3:]
+        if tail[:1] == ["archive"]:
+            if tail[1:2] == ["--rm"]:
+                for task_id in tail[2:]:
+                    self.details.pop(task_id, None)
+                return ""
+            for task_id in tail[1:]:
+                self.details[task_id]["task"]["status"] = "archived"
+            return ""
+        if tail[:1] == ["comment"]:
+            self.details[tail[1]]["comments"].append({"body": tail[2], "author": tail[4]})
+            return ""
+        if tail[:1] == ["unblock"]:
+            detail = self.details[tail[1]]
+            detail["task"]["status"] = "ready"
+            detail["events"].append(
+                {
+                    "kind": "unblocked",
+                    "created_at": int(time.time()),
+                    "payload": {"status": "ready", "reason": _flag_value(args, "--reason")},
+                }
+            )
+            return ""
+        raise AssertionError(args)
+
+
+def _blocked_target(task_id: str = "old-impl") -> dict[str, object]:
+    return _factory_detail(task_id, "implementation", "original", "builder", gave_up=True)
+
+
+def test_reconcile_disposes_an_unparseable_recovery_plan_once(valid_rig: Path) -> None:
+    client = RecoveryPlanBoardClient(
+        [
+            _recovery_card(extra_metadata={"artifacts": ["report.json"]}),
+            _blocked_target(),
+        ]
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.finalized_recovery_task_ids == ()
+    assert client.details["recovery-1"]["task"]["status"] == "archived"
+    # The disposition touches nothing else: the target keeps its block.
+    assert client.details["old-impl"]["task"]["status"] == "blocked"
+    assert [call[3] for call in client.run_calls] == ["archive", "comment"]
+    assert client.run_calls[0][-1] == "recovery-1"
+    reason = str(client.run_calls[1][5])
+    assert reason.startswith(reconcile_module._RECOVERY_REJECTED_MARKER)
+    assert reconcile_module._STALL_UNPARSEABLE_RECOVERY_PLAN in reason
+    assert "completed recovery task has malformed recovery metadata" in reason
+    assert "cannot be excluded" in reason
+
+
+def test_reconcile_generates_a_fresh_recovery_if_an_unparseable_card_resumes_during_target_read(
+    valid_rig: Path,
+) -> None:
+    recovery = _recovery_card(extra_metadata={"artifacts": ["report.json"]})
+    target = _blocked_target()
+
+    class RecoveryResumesDuringTargetRead(RecoveryPlanBoardClient):
+        def __init__(self, details: list[dict[str, object]]) -> None:
+            super().__init__(details)
+            self.terminated_running_recovery = False
+
+        def run_json(self, args: list[str]) -> object:
+            tail = args[3:]
+            if tail[:2] == ["show", "old-impl"]:
+                self.details["recovery-1"]["task"]["status"] = "running"
+                self.details["recovery-1"]["runs"].append(
+                    {"id": 201, "status": "running", "outcome": None}
+                )
+            return super().run_json(args)
+
+        def run(self, args: list[str]) -> str:
+            tail = args[3:]
+            if tail[:1] == ["archive"]:
+                self.terminated_running_recovery = any(
+                    self.details[task_id]["task"]["status"] == "running"
+                    for task_id in tail[1:]
+                )
+            return super().run(args)
+
+    client = RecoveryResumesDuringTargetRead([recovery, target])
+
+    result = reconcile_board(client, load_rig(valid_rig), dispatch=False)
+
+    assert result.recovery_task_ids == {"old-impl": "fresh-recovery-1"}
+    assert len(client.created_keys) == 1
+    assert client.created_keys[0].split(":")[:6] == [
+        "factory",
+        "demo",
+        "reconcile",
+        "old-impl",
+        "gave-up",
+        "200",
+    ]
+    assert len(client.created_keys[0].split(":")) > 6
+    assert client.details["recovery-1"]["task"]["status"] == "running"
+    assert client.terminated_running_recovery is False
+    assert [call for call in client.run_calls if call[3] == "archive"] == []
+
+
+def test_reconcile_reports_the_generation_a_refused_disposal_registers(
+    valid_rig: Path,
+) -> None:
+    """Answering a block with a generation must be reported like any other recovery.
+
+    The pass parses the completed card, then re-reads it immediately before the archival
+    and finds it resumed. The archival is refused and the block is answered by a fresh
+    generation. Dropping that pair would report the block as answered by the very card
+    that moved: two live recoveries for one block, with only the moved one known to the
+    pass, undispatched and unreported.
+    """
+    recovery = _recovery_card(extra_metadata={"artifacts": ["report.json"]})
+    target = _blocked_target()
+
+    class RecoveryResumesBeforeDisposalMutation(RecoveryPlanBoardClient):
+        def __init__(self, details: list[dict[str, object]]) -> None:
+            super().__init__(details)
+            self.card_reads = 0
+
+        def run_json(self, args: list[str]) -> object:
+            if args[3:5] == ["show", "recovery-1"]:
+                self.card_reads += 1
+                if self.card_reads > 1:
+                    self.details["recovery-1"]["task"]["status"] = "running"
+                    self.details["recovery-1"]["runs"].append(
+                        {"id": 201, "status": "running", "outcome": None}
+                    )
+            return super().run_json(args)
+
+    client = RecoveryResumesBeforeDisposalMutation([recovery, target])
+
+    result = reconcile_board(client, load_rig(valid_rig), dispatch=True)
+
+    assert result.recovery_task_ids == {"old-impl": "fresh-recovery-1"}
+    assert result.finalized_recovery_task_ids == ()
+    assert result.dispatched == 1
+    assert client.created_keys == [
+        "factory:demo:reconcile:old-impl:gave-up:200:generation:recovery-1"
+    ]
+    assert client.details["recovery-1"]["task"]["status"] == "running"
+    assert [call for call in client.run_calls if call[3] == "archive"] == []
+
+
+def test_reconcile_creates_a_fresh_recovery_after_a_disposed_unparseable_plan(
+    valid_rig: Path,
+) -> None:
+    client = RecoveryPlanBoardClient(
+        [
+            _recovery_card(extra_metadata={"artifacts": ["report.json"]}),
+            _blocked_target(),
+        ]
+    )
+
+    reconcile_board(client, load_rig(valid_rig))
+    result = reconcile_board(client, load_rig(valid_rig), dispatch=True)
+
+    # The archived card no longer holds the key, so the same block gets one fresh
+    # recovery card, dispatched by the same pass that created it.
+    assert result.recovery_task_ids == {"old-impl": "fresh-recovery-1"}
+    assert result.dispatched == 1
+    assert client.created_keys == ["factory:demo:reconcile:old-impl:gave-up:200"]
+    assert [call[3] for call in client.run_calls if call[3] == "archive"] == ["archive"]
+    assert client.details["fresh-recovery-1"]["task"]["status"] == "ready"
+
+
+def test_reconcile_reports_a_second_unparseable_generation_without_archiving_it(
+    valid_rig: Path,
+) -> None:
+    # The generation archived earlier is the authoritative record that this decision
+    # was already disposed once, so a repeat is reported instead of archived again.
+    client = RecoveryPlanBoardClient(
+        [
+            _recovery_card("recovery-old", status="archived"),
+            _recovery_card("recovery-2", extra_metadata={"artifacts": ["report.json"]}),
+            _blocked_target(),
+        ]
+    )
+
+    with pytest.raises(HermesCommandError, match="already disposed"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert client.details["recovery-2"]["task"]["status"] == "done"
+    assert client.details["recovery-old"]["task"]["status"] == "archived"
+    assert [call for call in client.run_calls if call[3] in {"archive", "comment"}] == []
+
+
+@pytest.mark.parametrize(
+    ("target_state", "expected"),
+    [
+        ("resolved", "no longer parked"),
+        ("live-run", "live run"),
+        ("newer-incident", "no longer answers the live terminal event"),
+    ],
+)
+def test_reconcile_refuses_to_dispose_an_unparseable_plan_without_its_anchor(
+    valid_rig: Path, target_state: str, expected: str
+) -> None:
+    target = _blocked_target()
+    if target_state == "resolved":
+        target["task"]["status"] = "ready"
+    elif target_state == "live-run":
+        target["runs"] = [{"id": 9, "status": "running"}]
+    else:
+        target["events"].append(
+            {
+                "kind": "blocked",
+                "created_at": 900,
+                "run_id": 13,
+                "payload": {"reason": "newer incident"},
+            }
+        )
+    client = RecoveryPlanBoardClient(
+        [_recovery_card(extra_metadata={"artifacts": ["report.json"]}), target]
+    )
+
+    with pytest.raises(HermesCommandError, match=expected) as error:
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert "recovery-1" in str(error.value)
+    assert client.details["recovery-1"]["task"]["status"] == "done"
+    assert [call for call in client.run_calls if call[3] in {"archive", "comment"}] == []
+
+
+def test_reconcile_refuses_to_dispose_an_unparseable_plan_for_a_different_same_second_incident(
+    valid_rig: Path,
+) -> None:
+    target = _blocked_target()
+    target["events"].append(
+        {
+            "kind": "blocked",
+            "created_at": 200,
+            "run_id": 13,
+            "payload": {"reason": "different same-second incident"},
+        }
+    )
+    client = RecoveryPlanBoardClient(
+        [_recovery_card(extra_metadata={"artifacts": ["report.json"]}), target]
+    )
+
+    with pytest.raises(HermesCommandError, match="no longer answers"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert client.details["recovery-1"]["task"]["status"] == "done"
+    assert [call for call in client.run_calls if call[3] in {"archive", "comment"}] == []
+
+
+def test_reconcile_revalidates_the_target_after_checking_prior_disposals(
+    valid_rig: Path,
+) -> None:
+    target = _blocked_target()
+
+    class TargetMovesDuringDisposalCheck(RecoveryPlanBoardClient):
+        def run_json(self, args: list[str]) -> object:
+            tail = args[3:]
+            if tail == ["list", "--archived", "--json"]:
+                self.details["old-impl"]["events"].append(
+                    {
+                        "kind": "blocked",
+                        "created_at": 200,
+                        "run_id": 13,
+                        "payload": {"reason": "target moved during disposal check"},
+                    }
+                )
+            return super().run_json(args)
+
+    client = TargetMovesDuringDisposalCheck(
+        [_recovery_card(extra_metadata={"artifacts": ["report.json"]}), target]
+    )
+
+    with pytest.raises(HermesCommandError, match="no longer answers"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert client.details["recovery-1"]["task"]["status"] == "done"
+    assert [call for call in client.run_calls if call[3] in {"archive", "comment"}] == []
+
+
+def test_reconcile_reports_an_unreadable_target_instead_of_disposing(valid_rig: Path) -> None:
+    client = RecoveryPlanBoardClient(
+        [
+            _recovery_card(extra_metadata={"artifacts": ["report.json"]}),
+            _blocked_target(),
+        ],
+        unreadable=("old-impl",),
+    )
+
+    with pytest.raises(HermesCommandError, match="cannot be excluded"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert client.details["recovery-1"]["task"]["status"] == "done"
+    assert [call for call in client.run_calls if call[3] in {"archive", "comment"}] == []
+
+
+def test_reconcile_never_disposes_a_worker_authored_unparseable_lookalike(
+    valid_rig: Path,
+) -> None:
+    client = RecoveryPlanBoardClient(
+        [
+            _recovery_card(
+                creator_task_id="t_worker", extra_metadata={"artifacts": ["report.json"]}
+            ),
+            _blocked_target(),
+        ]
+    )
+
+    with pytest.raises(HermesCommandError, match="created inside a worker session"):
+        reconcile_board(client, load_rig(valid_rig))
+
+    assert client.details["recovery-1"]["task"]["status"] == "done"
+    assert [call for call in client.run_calls if call[3] in {"archive", "comment"}] == []

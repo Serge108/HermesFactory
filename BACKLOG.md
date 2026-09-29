@@ -153,3 +153,32 @@ from cron evidence and starts a bounded repair session. Recorded limits, not que
   second rig waiting for that lock to age out before its own session can start.
 - The `unregistered` verdict is only made loud by the observer script, not by the Factory, so a
   supervisor launched without its observer reports `unregistered` and exits zero.
+
+## 17. Packets of one slice write the same files, so a slice has one writer
+
+Evidence: `docs/slice-packet-file-overlap.md` (branch `operator/slice-packet-file-overlap`, commit
+`3f8a433`), measured on 2026-09-30 against `57a0806`.
+
+- Of the nine slices with two or more packet cards, none is provably disjoint, three overlap in actual
+  effect and six are unproven. Declared file sets cannot certify disjointness: the only slice that ran
+  two packets concurrently (`occupancy-signals`, declared as two independent roots) had both builders
+  write `src/psyche/tick2d.rs` for eleven minutes, and neither card declares that file.
+- `src/psyche/tick2d.rs` is written by 22 of the 25 packet cards with measured `changed_files`, across
+  twelve slices, so a per-slice width above one puts two writers on that file in one checkout.
+
+Decision (owner, 2026-09-30): take the free evidence first, and fix the cause before the mission
+reaches the parallelism it declares. Let the already materialized work run so the six unproven slices
+become measured, and implement per-packet worktrees with a merge step before the packet's review and
+commit contract before `end-to-end-acceptance` starts, where the declared width is three and three
+packets share `tests/psyche_active_perception.rs`.
+
+Rejected: chaining every packet in the compiler (it contradicts the declared partition, and because
+this mission's slices form a strict chain it collapses the board to one writer, leaving
+`MAX_CONCURRENT` = 3 unreachable, and landing it fails the authoritative read-back of the live board,
+so the board has to be replaced); requiring the decomposer to declare a linear chain per slice (it
+would remove the ability to declare genuine parallelism, and the existing manifests already violate
+it).
+
+Until per-packet worktrees land, `MAX_CONCURRENT` = 3 bounds the board rather than the intra-slice
+width, so two packets of one slice can still run concurrently in one checkout, and the only reason
+this has not corrupted a slice is that this mission's slices happen to be chained.

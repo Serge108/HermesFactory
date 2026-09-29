@@ -4723,8 +4723,96 @@ def test_reconcile_still_refuses_a_packet_key_with_an_unknown_class(valid_rig: P
         ]
     )
 
-    with pytest.raises(HermesCommandError, match="invalid audit contract|invalid provenance"):
+    with pytest.raises(HermesCommandError, match="invalid audit contract"):
         reconcile_board(client, load_rig(valid_rig))
+
+
+def test_reconcile_refuses_a_six_segment_key_that_names_a_recovery_card(
+    valid_rig: Path,
+) -> None:
+    """The six-segment branch must stay narrow.
+
+    Nothing deployed writes the six-segment form any more, and the reconciler's own
+    recovery keys (``factory:<board>:reconcile:<task>:<outcome>:<epoch>``) parse as six
+    segments. Without a slug check on the branch, a key like the one below reads as a
+    Factory card with mission ``reconcile`` and slice ``core``.
+    """
+    detail = _factory_detail(
+        "forged-impl",
+        "implementation",
+        "core",
+        "builder",
+        gave_up=True,
+        key="factory:demo:reconcile:t_abc123:gave-up:implementation",
+    )
+    client = FakeReconcileClient(
+        [
+            [
+                {
+                    "id": "forged-impl",
+                    "title": "Implement forged slice",
+                    "status": "blocked",
+                    "assignee": "builder",
+                    "created_by": "hermes-factory",
+                }
+            ],
+            detail,
+            [],
+        ]
+    )
+
+    with pytest.raises(HermesCommandError, match="invalid provenance"):
+        reconcile_board(client, load_rig(valid_rig))
+
+
+def test_fixture_recovery_units_distinguish_two_packets_of_one_slice(
+    valid_rig: Path,
+) -> None:
+    """Two packets of one slice can time out inside the same second.
+
+    The replacement unit has to stay unique per source card. Slice plus event second
+    alone would hand both recoveries the same replacement key, so the second idempotent
+    create would return the first recovery's cards and its own provenance revalidation
+    would then fail.
+    """
+    rig = load_rig(valid_rig)
+    event = {
+        "kind": "gave_up",
+        "created_at": 200,
+        "payload": {"trigger_outcome": "timed_out"},
+    }
+    titles = []
+    for task_id in ("packet-one-impl", "packet-two-impl"):
+        detail = _factory_detail(
+            task_id,
+            "implementation",
+            "config-recovery",
+            "builder",
+            parents=["decomposition"],
+            children=["packet-one-review"],
+            gave_up=True,
+            key=f"factory:demo:demo-mission:config-recovery:packet:{task_id}:implementation",
+        )
+        review = _factory_detail(
+            "packet-one-review",
+            "review",
+            "config-recovery",
+            "reviewer",
+            parents=[task_id],
+            key=f"factory:demo:demo-mission:config-recovery:packet:{task_id}:review",
+        )
+        package = reconcile_module._fixture_recovery_package(
+            FakeReconcileClient([review]),
+            rig,
+            detail,
+            event,
+            stall_class=reconcile_module._STALL_WORKER_TIMEOUT,
+        )
+        titles.append(package["implementation"]["title"])
+
+    assert titles[0] != titles[1]
+    assert "packet-one-impl" in titles[0]
+    assert "packet-two-impl" in titles[1]
 
 
 def _rejected_review_recovery_details() -> list[dict[str, object]]:

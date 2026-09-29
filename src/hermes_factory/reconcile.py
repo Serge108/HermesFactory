@@ -711,7 +711,12 @@ def _fixture_recovery_package(
     event_time = event.get("created_at")
     if type(event_time) is not int:
         raise HermesCommandError("Hermes returned malformed recovery event JSON")
-    slice_id = f"{source_identity.slice_id}-recovery-{event_time}"
+    # The unit carries the source card, not just the slice and the second: two packets of
+    # one slice can time out inside the same second, and a slice+second unit would hand
+    # both recoveries the same replacement key, so the second idempotent create would
+    # return the first recovery's cards and then fail its own provenance revalidation.
+    source_token = str(task_id).replace("_", "-")
+    slice_id = f"{source_identity.slice_id}-recovery-{event_time}-{source_token}"
     key_prefix = f"factory:{policy['project']}:{policy['mission']}:{slice_id}"
     common = {
         "board": rig.board.slug,
@@ -1931,19 +1936,26 @@ def _factory_identity(
     elif task.get("created_by") != "hermes-factory":
         raise HermesCommandError(f"{prefix} task {task_id} has invalid provenance")
     parts = key.split(":")
-    # Three key shapes are trusted, because the compiler and the decomposer materializer
-    # both write Factory cards and this reader has to read what they wrote: the
-    # five-segment slice unit ``factory:<project>:<mission>:<slice>:<class>``, the legacy
-    # six-segment packet form ``factory:<project>:<mission>:<slice>:<unit>:<class>``, and
-    # the seven-segment materialized packet
-    # ``factory:<project>:<mission>:<slice>:packet:<packet>:<class>``. A live builder
-    # timeout carries the packet shape, so a slice-only reader makes worker-timeout
-    # recovery unreachable on a real board.
+    # Three key shapes are trusted, because this reader has to read what the deployed
+    # writers emitted: the five-segment slice unit
+    # ``factory:<project>:<mission>:<slice>:<class>`` and the seven-segment materialized
+    # packet ``factory:<project>:<mission>:<slice>:packet:<packet>:<class>`` are both
+    # written by the compiler and the decomposer materializer, while the six-segment
+    # ``factory:<project>:<mission>:<slice>:<unit>:<class>`` is a legacy packet form that
+    # only ``metrics._key_identity`` still parses. A live builder timeout carries the
+    # packet shape, so a slice-only reader makes worker-timeout recovery unreachable on a
+    # real board.
     if (
         len(parts) not in {5, 6, 7}
         or parts[0] != "factory"
         or parts[1] != rig.project.slug
         or (len(parts) == 7 and (parts[4] != "packet" or not parts[5]))
+        # Every remaining segment has to be a slug. The six-segment branch is otherwise
+        # unconstrained, and the reconciler's own recovery keys
+        # (``factory:<board>:reconcile:<task>:<outcome>:<epoch>``) parse as six segments
+        # with a task id that is not a slug, so a card carrying one would read as Factory
+        # work with mission ``reconcile``.
+        or not all(_is_key_slug(part) for part in (*parts[1:4], parts[-2], parts[-1]))
     ):
         raise HermesCommandError(f"{prefix} task {task_id} has invalid provenance")
     identity = FactoryTaskIdentity(parts[1], parts[2], parts[3], parts[-1])

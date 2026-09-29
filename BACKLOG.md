@@ -104,3 +104,13 @@ nothing has run inside `policies.no_agent_grace`. Recovery classes are therefore
 idle board unless the rig sets a wide grace (the acceptance runs used `30m`). This is correct
 production behaviour; it is recorded so a future acceptance run does not mistake the preflight for a
 recovery defect.
+
+## 14. Three key-shape readers disagree about what a Factory key is
+
+`reconcile._factory_identity` (5/6/7 segments, now slug-checked), `reconcile._checkpoint_continuation_keys`
+(4/5/7), `reconcile._recovery_target` (6) and `metrics._key_identity` (4/5/6/7) each re-derive the
+shape, and they already disagree: `_factory_identity` accepts keys metrics calls non-Factory, and
+metrics reads a recovery-shaped six-segment key as a packet card. `FactoryTaskIdentity` also drops
+the packet id, so identity comparisons cannot tell two packets of one slice apart. The fix is one
+shared `factory_key_shape()` that every reader and the report use; until then, any grammar change has
+to be repeated in four places.

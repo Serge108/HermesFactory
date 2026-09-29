@@ -564,8 +564,15 @@ def test_maximal_manifest_fits_the_recorded_completion_metadata_budget():
     The worst case a rig allows is `max_packets_per_slice` packets of
     `max_packet_acceptance_items` acceptance items each. This test parses that maximal manifest
     (proving the limits accept it) and asserts its canonical encoding stays inside the byte budget
-    measured on the installed CLI, so a Hermes upgrade that lowers the budget fails here instead of
-    silently truncating a live decomposition.
+    recorded in COMPLETION_METADATA_ROUND_TRIP_BYTES, measured on the installed CLI.
+
+    Two caveats the constant cannot cover. It is a recorded conservative upper bound, not a live
+    read of Hermes, so a Hermes release that lowers the real budget will not fail this test: the
+    probe has to be re-run. And the measurement went through `hermes kanban complete --metadata`,
+    while a live decomposer completes through the MCP `kanban_complete` tool with the envelope keys
+    the materializer strips, so the two payloads are not byte-identical. The assertion still bites
+    in the direction it can: the maximal manifest is 4095 bytes, so shrinking the recorded budget
+    below that, or letting the manifest grow past it, fails here.
     """
     criteria = MAX_PACKETS * MAX_PACKET_ACCEPTANCE_ITEMS
     source_contract = _maximal_source_contract(criteria)

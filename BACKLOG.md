@@ -182,3 +182,31 @@ it).
 Until per-packet worktrees land, `MAX_CONCURRENT` = 3 bounds the board rather than the intra-slice
 width, so two packets of one slice can still run concurrently in one checkout, and the only reason
 this has not corrupted a slice is that this mission's slices happen to be chained.
+
+## 18. The no-agent preflight's early return makes per-card recovery unreachable on a backlogged board
+
+`reconcile_board` runs its early `no_agent_activity` preflight (`reconcile.py:4231-4282`) before the
+blocked-card classification loop (`reconcile.py:4303`) and returns as soon as it registers or reuses a
+live incident. The preflight's running check excludes incident-creator cards (`reconcile.py:758-762`),
+so while the incident it just created is the only card running, the following pass finds "no agent
+activity" again, generates another incident generation (`...:after:<previous incident>:<terminal_at>`)
+and returns before any per-card recovery. On a board whose `todo` backlog is parked behind one card
+that needs task recovery, the incident generations advance and the recovery is never created. Item 13
+records the opposite direction (a wide grace leaves the loop reachable); this is the narrow-grace case
+with a non-empty backlog, where the incident path replaces the recovery instead of complementing it.
+
+Measured live on mechanoids-simulator: the head card `t_da5fc5b9` was parked `blocked` after `gave_up`
+(`trigger_outcome: timed_out`, `max_retries: 1`) at 01:55:25, the watchdog registered the board
+incident at 01:59:20, and the pass that started 02:01:18 ran 34 minutes against 114 `todo` cards with
+no recovery card for the target. Workaround used live, by the incident coordinator rather than the
+engine: keep one bounded non-incident card `running` through a pass. The pass then passed the
+preflight and created the worker_timeout recovery card
+`factory:mechanoids-simulator:reconcile:t_da5fc5b9:gave-up:1790722525` at 02:34:15, which carries the
+decomposition mandate for a coordinator session. Fix direction: after registering or reusing an
+incident, still continue into the blocked-card classification loop in the same pass, or stop letting
+the incident's own live card satisfy the idle predicate while the recovery path is skipped.
+
+Related, unproven here: the same early return is reached while an *unrelated* running card exists only
+because the preflight's predicate is "no card running"; the incident is then suppressed and the pass
+does reach the loop (observed 02:34:15). The two behaviours therefore differ by which card happens to
+be running, which is exactly the lever the workaround uses.

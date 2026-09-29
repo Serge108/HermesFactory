@@ -114,3 +114,14 @@ metrics reads a recovery-shaped six-segment key as a packet card. `FactoryTaskId
 the packet id, so identity comparisons cannot tell two packets of one slice apart. The fix is one
 shared `factory_key_shape()` that every reader and the report use; until then, any grammar change has
 to be repeated in four places.
+
+## 15. A materialized mission suppresses the late no-agent preflight
+
+`reconcile` skips its late `no_agent_activity` preflight whenever `materialized_missions` is
+non-empty, but `materialize_completed_decompositions` records a mission for every decomposition group
+whose cards are `done`, including the idempotent path that creates nothing (`materialize.py:427-431`).
+On a rig-version-2 board the guard is therefore on for every pass after the first materialization, so
+a blocked non-Factory card never raises the board incident. The early preflight and the loop's own
+conditions still cover most idle cases, which keeps the gap narrow. The fix is to guard on the work
+released this pass: have `_materialize_group` report whether it created cards and set the mission key
+only when it did.

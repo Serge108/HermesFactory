@@ -92,6 +92,167 @@ def replace_in_rig(spec: Path, old: str, new: str) -> None:
     spec.write_text(spec.read_text(encoding="utf-8").replace(old, new), encoding="utf-8")
 
 
+def upgrade_to_v2(spec: Path) -> None:
+    replace_in_rig(spec, "version: 1", "version: 2")
+    replace_in_rig(
+        spec,
+        "  builder: {profile: builder, role: implementation, skills: []}",
+        "  decomposer: {profile: decomposer, role: decomposition, skills: []}\n"
+        "  builder: {profile: builder, role: implementation, skills: []}",
+    )
+    replace_in_rig(
+        spec,
+        "delivery: {implementation_seat: builder",
+        "delivery: {decomposition_seat: decomposer, implementation_seat: builder",
+    )
+
+
+def test_load_rig_v2_reads_decomposer_configuration(tmp_path: Path):
+    spec = write_rig(tmp_path, cwd=".")
+    upgrade_to_v2(spec)
+    replace_in_rig(
+        spec,
+        "max_runtime: 30m, completion_contract",
+        "max_runtime: 30m, decomposer_runtime: 60m, max_packets_per_slice: 8, "
+        "max_packet_acceptance_items: 5, completion_contract",
+    )
+
+    rig = load_rig(spec)
+
+    assert rig.workflows["delivery"].decomposition_seat == "decomposer"
+    assert rig.policies.decomposer_runtime == "60m"
+    assert rig.policies.max_packets_per_slice == 8
+    assert rig.policies.max_packet_acceptance_items == 5
+
+
+def test_load_rig_v1_preserves_direct_builder_configuration(tmp_path: Path):
+    rig = load_rig(write_rig(tmp_path, cwd="."))
+
+    assert rig.workflows["delivery"].decomposition_seat is None
+    assert rig.policies.decomposer_runtime is None
+    assert rig.policies.max_packets_per_slice is None
+    assert rig.policies.max_packet_acceptance_items is None
+
+
+def test_load_rig_v2_requires_decomposition_seat(tmp_path: Path):
+    spec = write_rig(tmp_path, cwd=".")
+    upgrade_to_v2(spec)
+    replace_in_rig(spec, "decomposition_seat: decomposer, ", "")
+
+    with pytest.raises(SpecError, match="workflow 'delivery'.*decomposition_seat"):
+        load_rig(spec)
+
+
+def test_load_rig_v2_rejects_unknown_decomposition_seat(tmp_path: Path):
+    spec = write_rig(tmp_path, cwd=".")
+    upgrade_to_v2(spec)
+    replace_in_rig(spec, "decomposition_seat: decomposer", "decomposition_seat: missing")
+
+    with pytest.raises(SpecError, match="unknown seat 'missing'"):
+        load_rig(spec)
+
+
+def test_load_rig_v2_defaults_decomposer_policy(tmp_path: Path):
+    spec = write_rig(tmp_path, cwd=".")
+    upgrade_to_v2(spec)
+    replace_in_rig(
+        spec,
+        "max_runtime: 30m, completion_contract",
+        "max_runtime: 30m, coordinator_runtime: 45m, completion_contract",
+    )
+
+    rig = load_rig(spec)
+
+    assert rig.policies.decomposer_runtime == "45m"
+    assert rig.policies.max_packets_per_slice == 8
+    assert rig.policies.max_packet_acceptance_items == 5
+
+
+def test_load_rig_v2_rejects_invalid_decomposer_runtime(tmp_path: Path):
+    spec = write_rig(tmp_path, cwd=".")
+    upgrade_to_v2(spec)
+    replace_in_rig(
+        spec,
+        "completion_contract: local-only}",
+        "completion_contract: local-only, decomposer_runtime: soon}",
+    )
+
+    with pytest.raises(SpecError, match="invalid duration"):
+        load_rig(spec)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_packets_per_slice", "0"),
+        ("max_packets_per_slice", "true"),
+        ("max_packets_per_slice", "'1'"),
+        ("max_packet_acceptance_items", "0"),
+        ("max_packet_acceptance_items", "true"),
+        ("max_packet_acceptance_items", "'1'"),
+    ],
+)
+def test_load_rig_v2_rejects_invalid_packet_limits(
+    tmp_path: Path, field: str, value: str
+):
+    spec = write_rig(tmp_path, cwd=".")
+    upgrade_to_v2(spec)
+    replace_in_rig(
+        spec,
+        "completion_contract: local-only}",
+        f"completion_contract: local-only, {field}: {value}}}",
+    )
+
+    with pytest.raises(SpecError, match=rf"{field}.*integer of at least 1"):
+        load_rig(spec)
+
+
+def test_loaded_v2_rig_workflows_mapping_is_read_only(tmp_path: Path):
+    spec = write_rig(tmp_path, cwd=".")
+    upgrade_to_v2(spec)
+    rig = load_rig(spec)
+
+    with pytest.raises(TypeError):
+        rig.workflows["replacement"] = rig.workflows["delivery"]
+
+
+def test_loaded_v2_decomposer_configuration_is_frozen(tmp_path: Path):
+    spec = write_rig(tmp_path, cwd=".")
+    upgrade_to_v2(spec)
+    rig = load_rig(spec)
+
+    with pytest.raises(FrozenInstanceError):
+        rig.workflows["delivery"].decomposition_seat = "replacement"
+    with pytest.raises(FrozenInstanceError):
+        rig.policies.max_packets_per_slice = 10
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "field"),
+    [
+        (
+            "acceptance_seat: builder}",
+            "acceptance_seat: builder, extra: value}",
+            "workflow 'delivery'",
+        ),
+        (
+            "completion_contract: local-only}",
+            "completion_contract: local-only, extra: value}",
+            "policies",
+        ),
+    ],
+)
+def test_load_rig_v2_rejects_unknown_decomposer_configuration_keys(
+    tmp_path: Path, old: str, new: str, field: str
+):
+    spec = write_rig(tmp_path, cwd=".")
+    upgrade_to_v2(spec)
+    replace_in_rig(spec, old, new)
+
+    with pytest.raises(SpecError, match=rf"{field}.*unknown key 'extra'"):
+        load_rig(spec)
+
+
 @pytest.mark.parametrize(
     ("old", "new", "field"),
     [
@@ -192,9 +353,9 @@ def test_load_rig_rejects_empty_role(tmp_path: Path):
 
 def test_load_rig_rejects_unsupported_version(tmp_path: Path):
     spec = write_rig(tmp_path, cwd=".")
-    replace_in_rig(spec, "version: 1", "version: 2")
+    replace_in_rig(spec, "version: 1", "version: 3")
 
-    with pytest.raises(SpecError, match="unsupported version 2"):
+    with pytest.raises(SpecError, match="unsupported version 3"):
         load_rig(spec)
 
 

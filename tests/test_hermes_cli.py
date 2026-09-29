@@ -49,14 +49,42 @@ def test_task_record_reads_authoritative_fields_from_board_database(tmp_path: Pa
     db_path.parent.mkdir()
     connection = sqlite3.connect(db_path)
     connection.execute(
-        "create table tasks (id text primary key, idempotency_key text, created_by text)"
+        """create table tasks (
+            id text primary key,
+            title text,
+            body text,
+            assignee text,
+            status text,
+            created_by text,
+            workspace_kind text,
+            workspace_path text,
+            idempotency_key text,
+            max_runtime_seconds integer,
+            skills text,
+            max_retries integer,
+            completion_contract text
+        )"""
     )
     connection.execute(
-        "insert into tasks (id, idempotency_key, created_by) values (?, ?, ?)",
+        """insert into tasks (
+            id, title, body, assignee, status, created_by, workspace_kind,
+            workspace_path, idempotency_key, max_runtime_seconds, skills,
+            max_retries, completion_contract
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             "task-1",
-            "factory:demo:mission:slice:implementation",
+            "Implement slice",
+            "immutable body",
+            "builder",
+            "ready",
             "hermes-factory",
+            "dir",
+            "F:/Project With Spaces",
+            "factory:demo:mission:slice:implementation",
+            1800,
+            '["github-code-review", "test-driven-development"]',
+            3,
+            "pr",
         ),
     )
     connection.commit()
@@ -76,9 +104,55 @@ def test_task_record_reads_authoritative_fields_from_board_database(tmp_path: Pa
 
     assert record == {
         "id": "task-1",
-        "idempotency_key": "factory:demo:mission:slice:implementation",
+        "title": "Implement slice",
+        "body": "immutable body",
+        "assignee": "builder",
+        "status": "ready",
         "created_by": "hermes-factory",
+        "workspace_kind": "dir",
+        "workspace_path": "F:/Project With Spaces",
+        "idempotency_key": "factory:demo:mission:slice:implementation",
+        "max_runtime_seconds": 1800,
+        "skills": ["github-code-review", "test-driven-development"],
+        "max_retries": 3,
+        "completion_contract": "pr",
     }
+
+
+def test_task_record_normalizes_null_skills_to_the_runtime_empty_list(tmp_path: Path):
+    import sqlite3
+
+    db_path = tmp_path / "Board With Spaces" / "kanban.db"
+    db_path.parent.mkdir()
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        """create table tasks (
+            id text primary key, title text, body text, assignee text, status text,
+            created_by text, workspace_kind text, workspace_path text,
+            idempotency_key text, max_runtime_seconds integer, skills text,
+            max_retries integer, completion_contract text
+        )"""
+    )
+    connection.execute(
+        "insert into tasks values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "task-empty-skills", "Task", "Body", "builder", "ready",
+            "hermes-factory", "dir", "F:/Project With Spaces", "factory:key",
+            1800, None, 3, "pr",
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    def fake_run(argv, **kwargs):
+        payload = [{"slug": "demo-rig", "archived": False, "db_path": str(db_path)}]
+        return CompletedProcess(argv, 0, __import__("json").dumps(payload), "")
+
+    record = HermesClient(runner=fake_run).task_record(
+        "demo-rig", "task-empty-skills"
+    )
+
+    assert record["skills"] == []
 
 
 def test_board_activity_reads_authoritative_state_and_excludes_incident_events(

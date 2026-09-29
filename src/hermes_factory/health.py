@@ -15,6 +15,8 @@ from hermes_factory.task_templates import (
 
 _SEVERITY_RANK = {"critical": 0, "error": 1, "warning": 2}
 _GIT_OBJECT_ID = re.compile(r"^[0-9a-f]{40,64}$")
+_FACTORY_SLUG = re.compile(r"^(?:[a-z0-9]|[a-z0-9][a-z0-9-]{0,62}[a-z0-9])$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 CommitVerifier = Callable[[str], bool]
 
 
@@ -130,11 +132,67 @@ def _is_rewire_list(value: object) -> bool:
     )
 
 
+def _is_decomposition_packet_list(value: object) -> bool:
+    packet_keys = {
+        "id",
+        "title",
+        "goal",
+        "depends_on",
+        "acceptance",
+        "source_acceptance_indexes",
+        "likely_files",
+        "symbols",
+        "first_artifact",
+        "proof",
+    }
+    proof_keys = {"commands", "artifacts", "changed_files_required"}
+    if not isinstance(value, list) or not value:
+        return False
+    for packet in value:
+        if not isinstance(packet, dict) or set(packet) != packet_keys:
+            return False
+        if not isinstance(packet.get("id"), str) or not _FACTORY_SLUG.fullmatch(packet["id"]):
+            return False
+        if not all(
+            isinstance(packet.get(field), str) and bool(packet[field].strip())
+            for field in ("title", "goal", "first_artifact")
+        ):
+            return False
+        if not all(
+            _is_string_list(packet.get(field))
+            for field in ("depends_on", "acceptance", "likely_files", "symbols")
+        ):
+            return False
+        indexes = packet.get("source_acceptance_indexes")
+        if not isinstance(indexes, list) or not all(
+            type(index) is int and index >= 0 for index in indexes
+        ):
+            return False
+        proof = packet.get("proof")
+        if not isinstance(proof, dict) or set(proof) != proof_keys:
+            return False
+        if not _is_string_list(proof.get("commands")):
+            return False
+        if not _is_string_list(proof.get("artifacts")):
+            return False
+        if type(proof.get("changed_files_required")) is not bool:
+            return False
+    return True
+
+
 def _valid_required_metadata_field(
     field: str, value: object, commit_verifier: CommitVerifier | None
 ) -> bool:
     if field == "commands":
         return _is_command_record_list(value)
+    if field == "version":
+        return type(value) is int and value == 1
+    if field in {"project", "mission", "source_slice"}:
+        return isinstance(value, str) and _FACTORY_SLUG.fullmatch(value) is not None
+    if field == "source_contract_sha256":
+        return isinstance(value, str) and _SHA256.fullmatch(value) is not None
+    if field == "packets":
+        return _is_decomposition_packet_list(value)
     if field in {
         "changed_files",
         "decision_log",

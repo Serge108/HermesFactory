@@ -412,3 +412,36 @@ policies: {{require_proof: true, human_acceptance: false, max_retries: 2, max_ru
     assert [
         _flag_values(call, "--max-runtime")[0] for call in client.json_calls
     ] == ["30m", "30m", "45m", "45m"]
+
+
+def test_decomposition_tasks_use_the_decomposer_runtime(tmp_path: Path):
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    rig_path = tmp_path / "rig-v2.yaml"
+    rig_path.write_text(
+        f"""
+version: 2
+project: {{slug: demo, name: Demo, cwd: '{cwd.as_posix()}'}}
+board: {{slug: demo-rig, name: Demo Rig}}
+seats:
+  builder: {{profile: builder, role: implementation, skills: []}}
+  reviewer: {{profile: reviewer, role: independent_review, skills: []}}
+  decomposer: {{profile: decomposer-seat, role: decomposition, skills: []}}
+workflows:
+  delivery: {{decomposition_seat: decomposer, implementation_seat: builder, review_seat: reviewer, acceptance_seat: builder}}
+policies: {{require_proof: true, human_acceptance: false, max_retries: 2, max_runtime: 30m, decomposer_runtime: 60m, completion_contract: local-only}}
+""",
+        encoding="utf-8",
+    )
+    rig = load_rig(rig_path)
+    mission_path = tmp_path / "mission.yaml"
+    mission_path.write_text(_MISSION, encoding="utf-8")
+    mission_plan = compile_mission(rig, load_mission(mission_path, rig))
+    client = FakeTaskClient(
+        [{"id": "task-1", "status": "ready", "title": "Decompose behavior"}]
+    )
+
+    apply_mission(client, rig, mission_plan)
+
+    assert len(client.json_calls) == 1
+    assert _flag_values(client.json_calls[0], "--max-runtime") == ["60m"]

@@ -1,3 +1,25 @@
+"""Deterministic recovery reactions over authoritative Hermes Kanban state.
+
+The reconciler decides only from Hermes's own records, and it prefers mutation shapes
+whose own predicates prove that nothing live is destroyed.
+
+A worker progress checkpoint is the one recovery that continues live work instead of
+delegating a decision, so it is the one place where a destructive rewire is tempting:
+the parked card's review child can never be released while that parent stays ``blocked``,
+so an earlier design unlinked the review edge and archived the parked card. Both commands
+are unconditional in Hermes - ``unlink_tasks`` deletes an edge with no status guard and
+``archive_task`` has no status predicate beyond "not already archived" - so a review child
+that finished, or a source that resumed, between the last read and the command was
+destroyed anyway. No additional read can close that window.
+
+Factory therefore adds instead of rewiring: a keyed, idempotent continuation behind the
+parked source and a fresh keyed review that depends on the continuation, leaving the
+parked source and its original review child exactly as Hermes wrote them. Every later
+pass derives the same continuation from the board and reports it without adding a card or
+moving an edge. The accepted cost is that the parked source's review edge - and anything
+downstream of it - stays gated for good; DESIGN.md and OPERATIONS.md state that trade-off.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -7,14 +29,18 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from hermes_factory.board import _parse_task_creation, _subscribe_task
+from hermes_factory.compiler import compile_decomposition_phase
 from hermes_factory.errors import HermesCommandError, SpecError, StaleRecoveryDecision
 from hermes_factory.health import run_succeeded
 from hermes_factory.hermes_cli import HermesClient
-from hermes_factory.models import ProofSpec, RigSpec
+from hermes_factory.materialize import materialize_completed_decompositions
+from hermes_factory.models import MissionSpec, ProofSpec, RigSpec, SliceSpec
+from hermes_factory.rig_loader import validate_slug
 from hermes_factory.task_templates import (
     AUDIT_CONTRACT_START,
     HUMAN_GATE_MARKER,
     KANBAN_HANDBOOK,
+    PROGRESS_CHECKPOINT_PREFIX,
     REVIEW_REJECTION_PREFIX,
     WORKER_PROTOCOL,
     parse_audit_contract,
@@ -41,10 +67,22 @@ _DURATION_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _REASON_CODE_PREFIX = "Reason code: "
 # Hermes's own exit code for a worker that died on a terminal provider error.
 _TERMINAL_PROVIDER_EXIT_CODE = 78
+# Kanban lifecycle statuses a created card can be read back in. ``archived`` is absent
+# on purpose: an archived card is no longer a dependency gate, so a continuation that
+# came back archived can never hold the review behind it and must be refused.
+_KANBAN_STATUSES = frozenset(
+    {"todo", "ready", "running", "review", "blocked", "scheduled", "done"}
+)
+# A child may only be re-gated while it is still waiting: linking a parent demotes a
+# ``ready`` child and does nothing at all to a child that already ran, reviewed, or
+# finished, so a moved child must be refused rather than silently left behind.
+_PENDING_STATUSES = frozenset({"todo", "ready"})
 
 # One stall class per registration: the detection signal, the recovery-card key token,
 # the Superseded-task class, and the replacement class of the recovery target.
 _STALL_WORKER_TIMEOUT = "worker_timeout"
+_STALL_PROGRESS_CHECKPOINT = "progress_checkpoint"
+_STALL_DECOMPOSER_TIMEOUT = "decomposer_timeout"
 _STALL_REVIEW_REJECTED = "review_rejected"
 _STALL_NO_AGENT_ACTIVITY = "no_agent_activity"
 _STALL_UNKNOWN_OPERATIONAL = "unknown_operational_stall"
@@ -198,6 +236,66 @@ def _review_rejected_block(detail: dict[str, Any]) -> dict[str, Any] | None:
     if type(event.get("run_id")) is not int:
         return None
     return event
+
+
+def _progress_checkpoint_block(detail: dict[str, Any]) -> dict[str, Any] | None:
+    if parse_audit_contract(detail["task"].get("body")).get("task_class") != "implementation":
+        return None
+    event = _latest_terminal_event(detail)
+    if event is None or event.get("kind") != "blocked":
+        return None
+    payload = event.get("payload")
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    if not isinstance(reason, str) or not reason.startswith(PROGRESS_CHECKPOINT_PREFIX):
+        return None
+    run_id = event.get("run_id")
+    runs = detail.get("runs")
+    if type(run_id) is not int or not isinstance(runs, list):
+        raise HermesCommandError("malformed progress checkpoint")
+    matching = [run for run in runs if isinstance(run, dict) and run.get("id") == run_id]
+    if len(matching) != 1 or matching[0].get("outcome") != "blocked":
+        raise HermesCommandError("malformed progress checkpoint")
+    try:
+        checkpoint = json.loads(reason[len(PROGRESS_CHECKPOINT_PREFIX) :])
+    except json.JSONDecodeError as exc:
+        raise HermesCommandError("malformed progress checkpoint") from exc
+    required = {
+        "version",
+        "changed_files",
+        "completed_acceptance_indexes",
+        "remaining",
+        "commands",
+        "next_action",
+        "limitations",
+    }
+    indexes = checkpoint.get("completed_acceptance_indexes") if isinstance(checkpoint, dict) else None
+    commands = checkpoint.get("commands") if isinstance(checkpoint, dict) else None
+    if (
+        not isinstance(checkpoint, dict)
+        or set(checkpoint) != required
+        or checkpoint["version"] != 1
+        or any(
+            not isinstance(checkpoint[name], list)
+            or any(not isinstance(item, str) or not item for item in checkpoint[name])
+            for name in ("changed_files", "remaining", "limitations")
+        )
+        or not isinstance(indexes, list)
+        or any(type(index) is not int or index < 0 for index in indexes)
+        or len(set(indexes)) != len(indexes)
+        or not isinstance(commands, list)
+        or any(
+            not isinstance(command, dict)
+            or set(command) != {"command", "exit_code"}
+            or not isinstance(command["command"], str)
+            or not command["command"]
+            or type(command["exit_code"]) is not int
+            for command in commands
+        )
+        or not isinstance(checkpoint["next_action"], str)
+        or not checkpoint["next_action"]
+    ):
+        raise HermesCommandError("malformed progress checkpoint")
+    return {**event, "checkpoint": checkpoint}
 
 
 def _latest_terminal_event(detail: dict[str, Any]) -> dict[str, Any] | None:
@@ -520,7 +618,12 @@ def _classify_blocked_factory_task(
         return None
     gave_up = _timeout_gave_up_event(detail)
     if gave_up is not None:
+        if parse_audit_contract(detail["task"].get("body")).get("task_class") == "decomposition":
+            return _STALL_DECOMPOSER_TIMEOUT, gave_up
         return _STALL_WORKER_TIMEOUT, gave_up
+    checkpoint = _progress_checkpoint_block(detail)
+    if checkpoint is not None:
+        return _STALL_PROGRESS_CHECKPOINT, checkpoint
     rejected = _review_rejected_block(detail)
     if rejected is not None:
         return _STALL_REVIEW_REJECTED, rejected
@@ -530,6 +633,74 @@ def _classify_blocked_factory_task(
             "blocked Factory task has no authoritative terminal event"
         )
     return _STALL_UNKNOWN_OPERATIONAL, event
+
+
+def _event_identity(event: dict[str, Any]) -> tuple[Any, Any, Any]:
+    return (event.get("kind"), event.get("created_at"), event.get("run_id"))
+
+
+def _require_unedited_contract_body(detail: dict[str, Any], label: str) -> None:
+    """Reject a card whose recorded body changed after Hermes created it.
+
+    A progress checkpoint's acceptance scope is read from the card body, so a body edited
+    outside Factory's creation path can no longer speak for that scope. Hermes records
+    which fields changed, so contract-free edits (a completed card's result backfill) stay
+    recoverable while an unreadable edit record fails closed.
+    """
+    for event in detail["events"]:
+        if event.get("kind") != "edited":
+            continue
+        payload = event.get("payload")
+        fields = payload.get("fields") if isinstance(payload, dict) else None
+        if (
+            not isinstance(fields, list)
+            or not fields
+            or any(not isinstance(field, str) for field in fields)
+            or "body" in fields
+        ):
+            raise HermesCommandError(f"{label} has an edited contract body")
+
+
+def _require_live_recovery_source(
+    client: HermesClient,
+    rig: RigSpec,
+    board: list[str],
+    detail: dict[str, Any],
+    event: dict[str, Any],
+    stall_class: str,
+    label: str,
+) -> None:
+    """Re-derive the source card immediately before a privileged mutation.
+
+    Every recovery here decides from a snapshot taken before it created anything, and
+    Hermes offers no native mutation whose own status predicate could make the source
+    check and the mutation one step, so this read narrows the window without closing it.
+    What it does guarantee is that a card which has already moved is never acted on: the
+    recovery refuses instead of rewiring or archiving a different card, a card that is no
+    longer blocked, or one whose newest terminal event is no longer the incident it
+    answers.
+    """
+    task = detail["task"]
+    task_id = task.get("id")
+    live = _authoritative_task_identity(
+        client,
+        rig.board.slug,
+        _task_show(client.run_json(board + ["show", task_id, "--json"])),
+    )
+    live_task = live["task"]
+    if (
+        live_task.get("id") != task_id
+        or live_task.get("idempotency_key") != task.get("idempotency_key")
+        or live_task.get("status") != "blocked"
+    ):
+        raise HermesCommandError(f"{label} moved before its privileged mutation")
+    classified = _classify_blocked_factory_task(live, rig)
+    if (
+        classified is None
+        or classified[0] != stall_class
+        or _event_identity(classified[1]) != _event_identity(event)
+    ):
+        raise HermesCommandError(f"{label} is no longer the incident it answers")
 
 
 def _coordinator_profile(rig: RigSpec) -> str:
@@ -839,7 +1010,19 @@ def _fixture_recovery_package(
     event_time = event.get("created_at")
     if type(event_time) is not int:
         raise HermesCommandError("Hermes returned malformed recovery event JSON")
-    slice_id = f"{source_identity.slice_id}-recovery-{event_time}"
+    # The unit carries the source card, not just the slice and the second: two packets of
+    # one slice can time out inside the same second, and a slice+second unit would hand
+    # both recoveries the same replacement key, so the second idempotent create would
+    # return the first recovery's cards and then fail its own provenance revalidation.
+    # The token is a digest rather than the task id itself, so the composed unit stays
+    # inside the slug length the key reader enforces; the checkpoint derivation next door
+    # validates the same way.
+    source_token = hashlib.sha256(str(task_id).encode("utf-8")).hexdigest()[:8]
+    slice_id = f"{source_identity.slice_id}-recovery-{event_time}-{source_token}"
+    if not _is_key_slug(slice_id):
+        raise HermesCommandError(
+            f"recovery unit {slice_id!r} for task {task_id} is not a valid slug"
+        )
     key_prefix = f"factory:{policy['project']}:{policy['mission']}:{slice_id}"
     common = {
         "board": rig.board.slug,
@@ -1054,6 +1237,685 @@ Project directory: {rig.project.cwd}
 
 Use Hermes Kanban as the only task-state store. Do not edit its SQLite database directly.
 <!-- /hermes-factory:recovery -->"""
+
+
+def _fail_closed_continuation_body(
+    body: str, claimed_completed_indexes: list[int], continuation_slice: str
+) -> str:
+    """The continuation body for a worker's progress checkpoint.
+
+    A checkpoint is worker-authored free text, so its ``completed_acceptance_indexes``
+    are evidence of what the worker believed it finished, never authoritative proof that
+    the acceptance item is really done. Removing an item on that claim alone would let a
+    mistaken or hostile worker delete required work from the trusted workflow for good,
+    so the continuation keeps every acceptance item of the contract and drops none.
+    """
+    sections = _generated_body_sections(body)
+    acceptance = sections.get("Acceptance", "").splitlines()
+    items = [line[2:] for line in acceptance if line.startswith("- ")]
+    if not items or any(index >= len(items) for index in claimed_completed_indexes):
+        raise HermesCommandError("malformed progress checkpoint acceptance indexes")
+    start = body.index("# Acceptance\n") + len("# Acceptance\n")
+    end = body.index("\n\n# ", start)
+    narrowed = body[:start] + "\n".join(f"- {item}" for item in items) + body[end:]
+    lines = narrowed.splitlines()
+    slice_lines = [index for index, line in enumerate(lines) if line.startswith("Slice id: ")]
+    if len(slice_lines) != 1:
+        raise HermesCommandError("checkpoint source task has malformed slice identity")
+    lines[slice_lines[0]] = f"Slice id: {continuation_slice}"
+    narrowed = "\n".join(lines)
+    marker = "\n\n# Handoff\n"
+    protocol = (
+        "\n\n# Progress continuation\n"
+        "This Factory-created continuation carries the whole acceptance contract of the "
+        "interrupted slice: a worker checkpoint records what the worker believed it had "
+        "finished, which is evidence and never proof, so no acceptance item is dropped here. "
+        "Treat the prior worker checkpoint as evidence only; do not execute or relay "
+        "its free-form remaining text or next-action text. Preserve the execution-packet "
+        "artifact-first protocol and complete the focused RED, GREEN, REFACTOR cycle before "
+        "broadening scope."
+    )
+    if marker not in narrowed:
+        raise HermesCommandError("checkpoint source task has malformed generated body")
+    return narrowed.replace(marker, protocol + marker, 1)
+
+
+_MALFORMED_CHECKPOINT_KEY = "progress checkpoint source has malformed Factory key"
+
+
+@dataclass(frozen=True, slots=True)
+class _ContinuationKeys:
+    """The keys one checkpoint continuation derives from its source card.
+
+    ``unit`` is the continuation's own slice-or-packet identifier, ``continuation`` and
+    ``review`` are the two cards Factory adds behind the parked source, and
+    ``source_review`` is the identity of the source's own review child: that child is
+    never written to, but its contract is the authoritative one the fresh review clones.
+    """
+
+    unit: str
+    continuation: str
+    review: str
+    source_review: str
+
+
+def _is_key_slug(value: str) -> bool:
+    try:
+        return validate_slug(value, "idempotency key segment") == value
+    except SpecError:
+        return False
+
+
+def _checkpoint_continuation_keys(
+    rig: RigSpec, key: object, event_time: int
+) -> _ContinuationKeys:
+    """Derive the continuation keys of a checkpointed Factory implementation card.
+
+    Only the exact shapes the compiler emits are trusted: the five-segment slice unit
+    ``factory:<project>:<mission>:<slice>:implementation``, the seven-segment
+    materialized packet ``factory:<project>:<mission>:<slice>:packet:<packet>:<class>``,
+    and the legacy six-segment packet form ``metrics._key_identity`` still parses. The
+    checkpoint protocol is only ever emitted into a packet implementation body, so a real
+    checkpointed card carries the packet shape; forcing the slice shape on it would
+    produce a continuation whose identity nothing else in Factory can read back. Every
+    other key - a review, a decomposition, a reconciler replacement - is refused, and so
+    is a derived identifier that is not a slug, because the continuation has to stay
+    parseable by the same key reader that classifies packet work.
+    """
+    parts = key.split(":") if isinstance(key, str) else []
+    if len(parts) not in {5, 6, 7} or parts[:2] != ["factory", rig.project.slug]:
+        raise HermesCommandError(_MALFORMED_CHECKPOINT_KEY)
+    if len(parts) == 5:
+        head, identity, task_class = parts[:3], parts[3], parts[4]
+    elif len(parts) == 6:
+        head, identity, task_class = parts[:4], parts[4], parts[5]
+    else:
+        if parts[4] != "packet":
+            raise HermesCommandError(_MALFORMED_CHECKPOINT_KEY)
+        head, identity, task_class = parts[:5], parts[5], parts[6]
+    if task_class != "implementation" or any(
+        not _is_key_slug(part) for part in [*parts[1:4], identity]
+    ):
+        raise HermesCommandError(_MALFORMED_CHECKPOINT_KEY)
+    unit = f"{identity}-checkpoint-{event_time}"
+    if not _is_key_slug(unit):
+        raise HermesCommandError(_MALFORMED_CHECKPOINT_KEY)
+    base = [*head, unit]
+    return _ContinuationKeys(
+        unit=unit,
+        continuation=":".join([*base, "implementation"]),
+        review=":".join([*base, "review"]),
+        source_review=":".join([*head, identity, "review"]),
+    )
+
+
+def _checkpoint_review_child(
+    client: HermesClient,
+    rig: RigSpec,
+    board: list[str],
+    detail: dict[str, Any],
+    keys: _ContinuationKeys,
+) -> dict[str, Any]:
+    """The source's own pending review child, the contract the fresh review clones.
+
+    The child is read through the authoritative surfaces and accepted only when it is
+    exactly this Factory key's review child: Factory-authored, carrying the review audit
+    contract, still waiting, and with a body Hermes never recorded as edited. Nothing is
+    written to the child, so one that finishes just after this read loses nothing - the
+    read only decides whether the packet has a review contract to clone at all. Every
+    other child is read for its identity and then left untouched: only a child carrying
+    this key's own review key can be the contract, and a mismatch is skipped rather than
+    refused, because the source may legitimately have unrelated children.
+    """
+    review_child: dict[str, Any] | None = None
+    for child_id in detail["children"]:
+        child = _authoritative_task_identity(
+            client,
+            rig.board.slug,
+            _task_show(client.run_json(board + ["show", child_id, "--json"])),
+        )
+        if child["task"].get("idempotency_key") != keys.source_review:
+            continue
+        review_task = child["task"]
+        if (
+            review_task.get("id") != child_id
+            or review_task.get("created_by") != "hermes-factory"
+            or parse_audit_contract(review_task.get("body")).get("task_class")
+            != "review"
+            or review_task.get("status") not in _PENDING_STATUSES
+            or not isinstance(review_task.get("title"), str)
+            or not review_task.get("title")
+            or not isinstance(review_task.get("body"), str)
+            or review_child is not None
+        ):
+            raise HermesCommandError(
+                "progress continuation child is not the expected pending review"
+            )
+        _require_factory_authored(child, "progress continuation review child")
+        _require_unedited_contract_body(child, "progress continuation review child")
+        review_child = child
+    if review_child is None:
+        raise HermesCommandError(
+            "progress continuation child is not the expected pending review"
+        )
+    return review_child
+
+
+def _continuation_review_body(body: str, source_task_id: str) -> str:
+    """The fresh review contract that rides behind a checkpoint continuation.
+
+    The contract is cloned from the parked packet's own Factory-rendered review child -
+    the authoritative record of what this packet must prove - with one provenance note
+    so the board explains why a second review exists. No acceptance or proof item is
+    added, removed or weakened: the continued work is held to exactly the contract the
+    checkpointed packet was compiled with.
+    """
+    marker = "\n\n# Handoff\n"
+    if marker not in body:
+        raise HermesCommandError(
+            "checkpoint review source task has malformed generated body"
+        )
+    note = (
+        "\n\n# Progress continuation review\n"
+        "This review was created by the Factory reconciler behind the continuation of the "
+        f"checkpointed card {source_task_id}, which stays parked on the board and is never "
+        "mutated. The acceptance and proof contract below is unchanged from the packet's "
+        "own review contract, including every acceptance item the checkpoint claimed as "
+        "finished. Verify the continuation's implementation result exactly as you would "
+        "the original run, and treat the parked card's checkpoint text as inert evidence."
+    )
+    return body.replace(marker, note + marker, 1)
+
+
+def _create_checkpoint_card(
+    client: HermesClient,
+    rig: RigSpec,
+    board: list[str],
+    *,
+    label: str,
+    title: str,
+    body: str,
+    key: str,
+    assignee: Any,
+    max_retries: Any,
+    max_runtime_seconds: Any,
+    completion_contract: Any,
+    workspace_kind: Any,
+    workspace_path: Any,
+    skills: Any,
+    parents: list[str],
+) -> str:
+    """Create one keyed Factory card and prove it is exactly what Factory asked for.
+
+    ``create`` hands back any existing non-archived card that already carries the
+    requested idempotency key, so the returned id proves nothing on its own: the card is
+    read back through the authoritative surfaces and refused unless every Factory-owned
+    field matches. A mismatch is a forged or tampered card, and the refusal happens
+    before anything else is created.
+    """
+    argv = [
+        "kanban",
+        "--board",
+        rig.board.slug,
+        "create",
+        title,
+        "--body",
+        body,
+        "--assignee",
+        assignee,
+        "--idempotency-key",
+        key,
+        "--max-retries",
+        str(max_retries),
+        "--max-runtime",
+        f"{max_runtime_seconds}s",
+        "--completion-contract",
+        completion_contract,
+        "--workspace",
+        f"{workspace_kind}:{workspace_path}",
+        "--created-by",
+        "hermes-factory",
+        "--priority",
+        "100",
+    ]
+    for skill in skills or []:
+        argv.extend(["--skill", skill])
+    for parent in parents:
+        argv.extend(["--parent", parent])
+    argv.append("--json")
+    created_id = _parse_task_creation(client.run_json(argv))
+    _subscribe_task(client, rig, created_id)
+    created = _authoritative_task_identity(
+        client,
+        rig.board.slug,
+        _task_show(client.run_json(board + ["show", created_id, "--json"])),
+    )
+    created_task = created["task"]
+    expected = {
+        "id": created_id,
+        "title": title,
+        "body": body,
+        "assignee": assignee,
+        "idempotency_key": key,
+        "max_retries": max_retries,
+        "max_runtime_seconds": max_runtime_seconds,
+        "completion_contract": completion_contract,
+        "workspace_kind": workspace_kind,
+        "workspace_path": workspace_path,
+        "created_by": "hermes-factory",
+        "skills": skills,
+    }
+    if (
+        any(created_task.get(field) != value for field, value in expected.items())
+        or created_task.get("status") not in _KANBAN_STATUSES
+        or set(created["parents"]) != set(parents)
+    ):
+        raise HermesCommandError(f"{label} failed authoritative read-back")
+    _require_factory_authored(created, label)
+    return created_id
+
+
+def _create_progress_continuation(
+    client: HermesClient,
+    rig: RigSpec,
+    detail: dict[str, Any],
+    event: dict[str, Any],
+) -> str:
+    """Continue a worker-checkpointed card without ever destroying board state.
+
+    A checkpoint parks an implementation card as ``blocked``, and Hermes releases a child
+    only when every direct parent is ``done`` or ``archived``, so the parked card's own
+    review child can never run again. The earlier remedy - link the continuation to that
+    review, unlink the parked source from it, then archive the source - issued two
+    unconditional commands from a pre-read decision: ``unlink_tasks`` deletes an edge with
+    no status guard and ``archive_task`` has no state predicate, so a review that finished
+    or a source that resumed inside that window was destroyed anyway, and no extra read
+    can close the window.
+
+    Factory therefore adds instead of rewiring: a keyed, idempotent continuation behind
+    the parked source (parented on the source's own prerequisites, so it does not itself
+    wait on the parked card) plus a fresh keyed review that depends on the continuation
+    and clones the packet's own review contract. The parked source and its original
+    review child are never written to, so every later pass re-reads the same two keyed
+    cards and reports the same continuation without adding a card or moving an edge. The
+    accepted cost is that the parked source's review edge - and the downstream work
+    behind it - stays gated for good; see DESIGN.md and OPERATIONS.md.
+    """
+    task = detail["task"]
+    task_id = task.get("id")
+    event_time = event.get("created_at")
+    checkpoint = event.get("checkpoint")
+    if (
+        not isinstance(task_id, str)
+        or type(event_time) is not int
+        or not isinstance(checkpoint, dict)
+    ):
+        raise HermesCommandError("malformed progress checkpoint")
+    _require_factory_authored(detail, "progress checkpoint source")
+    _require_unedited_contract_body(detail, "progress checkpoint source")
+    keys = _checkpoint_continuation_keys(rig, task.get("idempotency_key"), event_time)
+    body = _fail_closed_continuation_body(
+        task.get("body") if isinstance(task.get("body"), str) else "",
+        checkpoint["completed_acceptance_indexes"],
+        keys.unit,
+    )
+    board = ["kanban", "--board", rig.board.slug]
+    review_child = _checkpoint_review_child(client, rig, board, detail, keys)
+    source_label = f"progress checkpoint source {task_id}"
+    _require_live_recovery_source(
+        client, rig, board, detail, event, _STALL_PROGRESS_CHECKPOINT, source_label
+    )
+    continuation_id = _create_checkpoint_card(
+        client,
+        rig,
+        board,
+        label="progress continuation",
+        title=f"Continue {task.get('title', task_id)}",
+        body=body,
+        key=keys.continuation,
+        assignee=task.get("assignee"),
+        max_retries=task.get("max_retries"),
+        max_runtime_seconds=task.get("max_runtime_seconds"),
+        completion_contract=task.get("completion_contract"),
+        workspace_kind=task.get("workspace_kind"),
+        workspace_path=task.get("workspace_path"),
+        skills=task.get("skills"),
+        parents=list(detail["parents"]),
+    )
+    _require_live_recovery_source(
+        client, rig, board, detail, event, _STALL_PROGRESS_CHECKPOINT, source_label
+    )
+    review_task = review_child["task"]
+    _create_checkpoint_card(
+        client,
+        rig,
+        board,
+        label="progress continuation review",
+        title=review_task["title"],
+        body=_continuation_review_body(review_task["body"], task_id),
+        key=keys.review,
+        assignee=review_task.get("assignee"),
+        max_retries=review_task.get("max_retries"),
+        max_runtime_seconds=review_task.get("max_runtime_seconds"),
+        completion_contract=review_task.get("completion_contract"),
+        workspace_kind=review_task.get("workspace_kind"),
+        workspace_path=review_task.get("workspace_path"),
+        skills=review_task.get("skills"),
+        parents=[continuation_id],
+    )
+    return continuation_id
+
+
+def _decomposition_source_contract(body: str, label: str) -> dict[str, Any]:
+    """The immutable Factory-owned source contract embedded in a decomposition body."""
+    heading = body.find("# Immutable source contract")
+    fence = body.find("```json", heading)
+    if heading < 0 or fence < 0:
+        raise HermesCommandError(f"{label} has no immutable source contract")
+    start = fence + len("```json")
+    end = body.find("```", start)
+    if end < 0:
+        raise HermesCommandError(f"{label} has a malformed immutable source contract")
+    try:
+        value = json.loads(body[start:end])
+    except json.JSONDecodeError as exc:
+        raise HermesCommandError(
+            f"{label} has a malformed immutable source contract"
+        ) from exc
+    if not isinstance(value, dict):
+        raise HermesCommandError(f"{label} has a malformed immutable source contract")
+    return value
+
+
+def _mission_from_decomposition_contract(
+    rig: RigSpec, mission_id: str, slice_id: str, contract: dict[str, Any], label: str
+) -> MissionSpec:
+    """Rebuild the mission a decomposition contract claims, anchored on the rig.
+
+    The card's own body is mutable, so it never speaks for its own scope: the contract
+    must describe this rig's project and this Factory key's mission and slice, and every
+    mission-level field is re-derived here rather than copied from the card. Sibling
+    slices only contribute their ids, because a rendered decomposition body repeats the
+    mission's slice id list and no more.
+    """
+    project = contract.get("project")
+    mission = contract.get("mission")
+    source_slice = contract.get("source_slice")
+    if (
+        not isinstance(project, dict)
+        or project.get("slug") != rig.project.slug
+        or project.get("name") != rig.project.name
+        or project.get("cwd") != str(rig.project.cwd)
+        or not isinstance(mission, dict)
+        or not isinstance(source_slice, dict)
+        or mission.get("id") != mission_id
+        or source_slice.get("id") != slice_id
+    ):
+        raise HermesCommandError(f"{label} does not describe this rig and Factory key")
+    slice_ids = mission.get("slice_ids")
+    if (
+        not isinstance(slice_ids, list)
+        or not slice_ids
+        or any(not isinstance(item, str) or not item for item in slice_ids)
+        or len(set(slice_ids)) != len(slice_ids)
+        or slice_id not in slice_ids
+    ):
+        raise HermesCommandError(f"{label} has malformed mission slice ids")
+    workflow = mission.get("workflow")
+    version = mission.get("version")
+    human_acceptance = mission.get("human_acceptance")
+    acceptance = mission.get("acceptance")
+    goal = source_slice.get("goal")
+    title = source_slice.get("title")
+    slice_acceptance = source_slice.get("acceptance")
+    depends_on = source_slice.get("depends_on")
+    proof_data = source_slice.get("proof")
+    if (
+        not isinstance(workflow, str)
+        or workflow not in rig.workflows
+        or type(version) is not int
+        or type(human_acceptance) is not bool
+        or not isinstance(mission.get("title"), str)
+        or not isinstance(mission.get("intent"), str)
+        or not isinstance(acceptance, list)
+        or any(not isinstance(item, str) for item in acceptance)
+        or not isinstance(title, str)
+        or not isinstance(goal, str)
+        or not isinstance(slice_acceptance, list)
+        or any(not isinstance(item, str) for item in slice_acceptance)
+        or not isinstance(depends_on, list)
+        or any(not isinstance(item, str) for item in depends_on)
+        or not isinstance(proof_data, dict)
+        or not isinstance(proof_data.get("commands"), list)
+        or any(not isinstance(item, str) for item in proof_data["commands"])
+        or not isinstance(proof_data.get("artifacts"), list)
+        or any(not isinstance(item, str) for item in proof_data["artifacts"])
+        or type(proof_data.get("changed_files_required")) is not bool
+    ):
+        raise HermesCommandError(f"{label} has a malformed immutable source contract")
+    target = SliceSpec(
+        id=slice_id,
+        title=title,
+        goal=goal,
+        depends_on=tuple(depends_on),
+        acceptance=tuple(slice_acceptance),
+        proof=ProofSpec(
+            commands=tuple(proof_data["commands"]),
+            artifacts=tuple(proof_data["artifacts"]),
+            changed_files_required=proof_data["changed_files_required"],
+        ),
+    )
+    siblings = tuple(
+        SliceSpec(
+            id=sibling,
+            title=f"slice {sibling}",
+            goal=f"slice {sibling}",
+            depends_on=(),
+            acceptance=(),
+            proof=ProofSpec(commands=(), artifacts=(), changed_files_required=False),
+        )
+        for sibling in slice_ids
+        if sibling != slice_id
+    )
+    return MissionSpec(
+        version=version,
+        id=mission_id,
+        title=mission["title"],
+        intent=mission["intent"],
+        workflow=workflow,
+        human_acceptance=human_acceptance,
+        acceptance=tuple(acceptance),
+        slices=(target, *siblings),
+    )
+
+
+def _authoritative_decomposition_card(
+    rig: RigSpec, key: str, body: str, label: str
+):
+    """The decomposition card Factory would compile for this key, or ``None``.
+
+    A decomposition card's immutable contract is Factory-owned and rig-bound, so the
+    replacement is always rebuilt from the rig and mission source. A card whose body
+    does not match that rendering - including one whose contract block was edited while
+    the rest of the body stayed intact - has drifted and must not be cloned.
+    """
+    parts = key.split(":")
+    contract = _decomposition_source_contract(body, label)
+    mission = _mission_from_decomposition_contract(rig, parts[2], parts[3], contract, label)
+    canonical_key = ":".join([*parts[:4], "decomposition"])
+    planned = next(
+        (
+            task
+            for task in compile_decomposition_phase(rig, mission).tasks
+            if task.idempotency_key == canonical_key
+        ),
+        None,
+    )
+    if planned is None or planned.body != body:
+        raise HermesCommandError(
+            f"{label} does not match the authoritative Factory decomposition contract"
+        )
+    return planned
+
+
+def _recover_decomposer_timeout(
+    client: HermesClient,
+    rig: RigSpec,
+    detail: dict[str, Any],
+    event: dict[str, Any],
+) -> str:
+    task = detail["task"]
+    task_id = task.get("id")
+    body = task.get("body")
+    key = task.get("idempotency_key")
+    if (
+        not isinstance(task_id, str)
+        or not isinstance(body, str)
+        or parse_audit_contract(body).get("task_class") != "decomposition"
+        or not isinstance(key, str)
+    ):
+        raise HermesCommandError("decomposer timeout target is malformed")
+    _require_factory_authored(detail, "decomposer timeout target")
+    label = f"decomposition task {task_id}"
+    if any(card_event.get("kind") == "edited" for card_event in detail["events"]):
+        # Hermes records an ``edited`` event whenever the card's fields change outside
+        # its creation path, so the body and the immutable contract inside it can no
+        # longer be treated as the Factory-authored contract.
+        raise HermesCommandError(f"{label} has edited Factory contract fields")
+    parts = key.split(":")
+    canonical = (
+        len(parts) == 5
+        and parts[:2] == ["factory", rig.project.slug]
+        and parts[-1] == "decomposition"
+    )
+    replacement = (
+        len(parts) == 7
+        and parts[:2] == ["factory", rig.project.slug]
+        and parts[-3:] == ["decomposition", "retry", "1"]
+    )
+    if not canonical and not replacement:
+        raise HermesCommandError("decomposer timeout target has malformed Factory key")
+    workflow_profiles = {
+        rig.seats[workflow.decomposition_seat].profile
+        for workflow in rig.workflows.values()
+        if workflow.decomposition_seat is not None
+    }
+    if task.get("assignee") not in workflow_profiles:
+        raise HermesCommandError("decomposer timeout target has unexpected assignee")
+    if rig.policies.decomposer_runtime is None:
+        raise HermesCommandError("decomposer timeout target has no configured runtime")
+    planned = _authoritative_decomposition_card(rig, key, body, label)
+    expected_runtime = _runtime_seconds(rig.policies.decomposer_runtime)
+    expected_record = {
+        "title": planned.title,
+        "body": planned.body,
+        "assignee": planned.profile,
+        "created_by": "hermes-factory",
+        "workspace_kind": "dir",
+        "workspace_path": str(rig.project.cwd),
+        "max_runtime_seconds": expected_runtime,
+        "skills": list(planned.skills),
+        "max_retries": rig.policies.max_retries,
+        "completion_contract": rig.policies.completion_contract,
+    }
+    if any(task.get(field) != value for field, value in expected_record.items()):
+        raise HermesCommandError(
+            f"{label} drifted from the authoritative Factory decomposition contract"
+        )
+    board = ["kanban", "--board", rig.board.slug]
+    if replacement:
+        limitation = json.dumps(
+            {
+                "version": 1,
+                "reason_code": _STALL_DECOMPOSER_TIMEOUT,
+                "terminal": True,
+                "target_task_id": task_id,
+                "limitation": "Decomposition exceeded its bounded runtime twice; materialization stopped.",
+                "builder_task_ids": [],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if not any(comment.get("body") == limitation for comment in detail.get("comments", [])):
+            client.run(board + ["comment", task_id, limitation, "--author", "hermes-factory"])
+        _require_live_recovery_source(
+            client, rig, board, detail, event, _STALL_DECOMPOSER_TIMEOUT, label
+        )
+        client.run(board + ["archive", task_id])
+        archived = _task_show(client.run_json(board + ["show", task_id, "--json"]))
+        if archived["task"].get("status") != "archived":
+            raise HermesCommandError("terminal decomposer limitation was not recorded")
+        return task_id
+    _require_live_recovery_source(
+        client, rig, board, detail, event, _STALL_DECOMPOSER_TIMEOUT, label
+    )
+    argv = [
+        *board,
+        "create",
+        planned.title,
+        "--body",
+        planned.body,
+        "--assignee",
+        planned.profile,
+        "--idempotency-key",
+        key + ":retry:1",
+        "--max-retries",
+        str(rig.policies.max_retries),
+        "--max-runtime",
+        rig.policies.decomposer_runtime or "",
+        "--completion-contract",
+        rig.policies.completion_contract,
+        "--workspace",
+        f"dir:{rig.project.cwd}",
+        "--created-by",
+        "hermes-factory",
+        "--priority",
+        "100",
+    ]
+    for skill in planned.skills:
+        argv.extend(["--skill", skill])
+    argv.append("--json")
+    replacement_id = _parse_task_creation(client.run_json(argv))
+    _subscribe_task(client, rig, replacement_id)
+    # The key makes creation idempotent, so the returned id may be a card that already
+    # existed. Read it back through the authoritative surfaces, which are the only ones
+    # that carry the idempotency key, before this recovery touches the source card.
+    created = _authoritative_task_identity(
+        client,
+        rig.board.slug,
+        _task_show(client.run_json(board + ["show", replacement_id, "--json"])),
+    )
+    created_task = created["task"]
+    expected = {
+        "id": replacement_id,
+        "title": planned.title,
+        "body": planned.body,
+        "assignee": planned.profile,
+        "idempotency_key": key + ":retry:1",
+        "max_runtime_seconds": expected_runtime,
+        "skills": list(planned.skills),
+        "max_retries": rig.policies.max_retries,
+        "completion_contract": rig.policies.completion_contract,
+        "created_by": "hermes-factory",
+        "workspace_kind": "dir",
+        "workspace_path": str(rig.project.cwd),
+    }
+    if (
+        any(created_task.get(field) != value for field, value in expected.items())
+        or created_task.get("status") not in _KANBAN_STATUSES
+        or created["parents"]
+        or created["children"]
+    ):
+        raise HermesCommandError("decomposer replacement failed authoritative read-back")
+    _require_factory_authored(created, "decomposer replacement")
+    _require_live_recovery_source(
+        client, rig, board, detail, event, _STALL_DECOMPOSER_TIMEOUT, label
+    )
+    client.run(board + ["archive", task_id])
+    archived = _task_show(client.run_json(board + ["show", task_id, "--json"]))
+    if archived["task"].get("status") != "archived":
+        raise HermesCommandError("superseded decomposition task was not archived")
+    return replacement_id
 
 
 def _create_recovery_task(
@@ -1472,9 +2334,31 @@ def _factory_identity(
     elif task.get("created_by") != "hermes-factory":
         raise HermesCommandError(f"{prefix} task {task_id} has invalid provenance")
     parts = key.split(":")
-    if len(parts) != 5 or parts[0] != "factory" or parts[1] != rig.project.slug:
+    # Three key shapes are trusted, because this reader has to read what the deployed
+    # writers emitted: the five-segment slice unit
+    # ``factory:<project>:<mission>:<slice>:<class>`` and the seven-segment materialized
+    # packet ``factory:<project>:<mission>:<slice>:packet:<packet>:<class>`` are both
+    # written by the compiler and the decomposer materializer, while the six-segment
+    # ``factory:<project>:<mission>:<slice>:<unit>:<class>`` is a legacy packet form that
+    # only ``metrics._key_identity`` still parses. A live builder timeout carries the
+    # packet shape, so a slice-only reader makes worker-timeout recovery unreachable on a
+    # real board.
+    if (
+        len(parts) not in {5, 6, 7}
+        or parts[0] != "factory"
+        or parts[1] != rig.project.slug
+        or (len(parts) == 7 and (parts[4] != "packet" or not parts[5]))
+        # Every remaining segment has to be a slug. The six-segment branch is otherwise
+        # unconstrained, and the reconciler's own recovery keys
+        # (``factory:<board>:reconcile:<task>:<outcome>:<epoch>``) parse as six segments
+        # with a Hermes-generated task id, which is not a slug, so a card carrying such a
+        # key would read as Factory work with mission ``reconcile``. A hand-written key
+        # can still spell that shape with a hyphen instead of an underscore; this guard
+        # only excludes what Hermes itself writes.
+        or not all(_is_key_slug(part) for part in (*parts[1:4], parts[-2], parts[-1]))
+    ):
         raise HermesCommandError(f"{prefix} task {task_id} has invalid provenance")
-    identity = FactoryTaskIdentity(parts[1], parts[2], parts[3], parts[4])
+    identity = FactoryTaskIdentity(parts[1], parts[2], parts[3], parts[-1])
     contract = parse_audit_contract(task.get("body"))
     if contract.get("task_class") != identity.task_class:
         raise HermesCommandError(f"{prefix} task {task_id} has invalid audit contract")
@@ -3325,6 +4209,17 @@ def reconcile_board(
     classification_failures: list[str] = []
     human_gate_ids: set[str] = set()
     eligible = 0
+    materialized_missions: dict[str, dict[str, str]] = {}
+    materialization_failures: dict[str, str] = {}
+    if rig.version >= 2 and any(
+        workflow.decomposition_seat is not None for workflow in rig.workflows.values()
+    ):
+        try:
+            materialization = materialize_completed_decompositions(client, rig)
+            materialized_missions = materialization.materialized
+            materialization_failures = materialization.rejected
+        except Exception as exc:  # noqa: BLE001 - recovery must still dispatch
+            materialization_failures = {"board": str(exc)}
     activity_reader = getattr(client, "board_activity", None)
     if callable(activity_reader):
         preflight_incident = _no_agent_incident(
@@ -3358,10 +4253,19 @@ def reconcile_board(
                         client,
                         rig,
                         [board_incident_task_id],
+                        released_work=bool(materialized_missions),
                     )
                     if dispatch
                     else 0
                 )
+                if materialization_failures:
+                    raise HermesCommandError(
+                        "materialization failed for: "
+                        + "; ".join(
+                            f"{mission}: {reason}"
+                            for mission, reason in sorted(materialization_failures.items())
+                        )
+                    )
                 return ReconcileResult(
                     scanned=len(blocked),
                     eligible=0,
@@ -3484,17 +4388,26 @@ def reconcile_board(
                 human_gate_ids.add(task_id)
                 continue
             stall_class, event = classified
-            recovery_task_ids[task_id] = _create_recovery_task(
-                client,
-                rig,
-                detail,
-                event,
-                coordinator_profile,
-                stall_class=stall_class,
-                fixture_recovery=fixture_recovery,
-                recovery_runtime=recovery_runtime,
-                identity=identity,
-            )
+            if stall_class == _STALL_PROGRESS_CHECKPOINT:
+                recovery_task_ids[task_id] = _create_progress_continuation(
+                    client, rig, detail, event
+                )
+            elif stall_class == _STALL_DECOMPOSER_TIMEOUT:
+                recovery_task_ids[task_id] = _recover_decomposer_timeout(
+                    client, rig, detail, event
+                )
+            else:
+                recovery_task_ids[task_id] = _create_recovery_task(
+                    client,
+                    rig,
+                    detail,
+                    event,
+                    coordinator_profile,
+                    stall_class=stall_class,
+                    fixture_recovery=fixture_recovery,
+                    recovery_runtime=recovery_runtime,
+                    identity=identity,
+                )
         except Exception as exc:  # noqa: BLE001 - per-card barrier, reported below
             # One anomalous blocked card must not wedge every other recovery in the
             # pass: the failure is recorded and reported after the dispatch phase.
@@ -3518,6 +4431,8 @@ def reconcile_board(
         and not classification_failures
         and not finalization_failures
         and not reopened
+        and not materialized_missions
+        and not materialization_failures
     ):
         incident = _no_agent_incident(
             activity_reader(
@@ -3560,10 +4475,10 @@ def reconcile_board(
             client,
             rig,
             dispatch_candidates,
-            released_work=bool(finalized_recovery_task_ids),
+            released_work=bool(finalized_recovery_task_ids or materialized_missions),
         )
         if dispatch
-        and (dispatch_candidates or finalized_recovery_task_ids)
+        and (dispatch_candidates or finalized_recovery_task_ids or materialized_missions)
         else 0
     )
     failures: list[str] = []
@@ -3575,6 +4490,14 @@ def reconcile_board(
         # Raised only after dispatch: a rejected plan must not wedge released work.
         failures.append(
             "recovery finalization failed for: " + "; ".join(finalization_failures)
+        )
+    if materialization_failures:
+        failures.append(
+            "materialization failed for: "
+            + "; ".join(
+                f"{mission}: {reason}"
+                for mission, reason in sorted(materialization_failures.items())
+            )
         )
     if failures:
         raise HermesCommandError("; ".join(failures))

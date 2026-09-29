@@ -131,6 +131,23 @@ def test_load_mission_parses_valid_example(valid_rig: Path, tmp_path: Path):
     assert mission.slices[0].proof.changed_files_required is True
 
 
+def test_proof_without_commands_is_rejected(valid_rig: Path, tmp_path: Path):
+    """A proof that declares no command can never be satisfied by a packet.
+
+    A manifest packet must carry at least one proof command anchored in the source contract, so
+    an empty command list leaves the trust set empty and makes the mission unsolvable: refuse it
+    at load time instead of at materialization.
+    """
+    rig = load_rig(valid_rig)
+    text = _BASE.replace(
+        "      commands:\n        - uv run pytest -q\n", "      commands: []\n"
+    )
+    path = _write(tmp_path, text)
+
+    with pytest.raises(SpecError, match="proof.commands must declare at least one command"):
+        load_mission(path, rig)
+
+
 def test_unknown_workflow_is_rejected(valid_rig: Path, tmp_path: Path):
     rig = load_rig(valid_rig)
     path = _write(tmp_path, _BASE.replace("workflow: delivery", "workflow: missing"))

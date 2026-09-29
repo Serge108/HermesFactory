@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import json
 
+from hermes_factory.decomposition import (
+    ExecutionPacketSpec,
+    canonical_source_contract_sha256,
+    is_trusted_proof_command,
+)
 from hermes_factory.errors import SpecError
 from hermes_factory.models import MissionSpec, ProofSpec, RigSpec, SliceSpec
 
@@ -18,6 +23,15 @@ AUDIT_CONTRACT_KEYS = {
 }
 LEGACY_AUDIT_CONTRACT_KEYS = AUDIT_CONTRACT_KEYS - {"required_metadata"}
 _COMPLETION_METADATA_FIELDS = {
+    "decomposition": [
+        "version",
+        "project",
+        "mission",
+        "source_slice",
+        "source_contract_sha256",
+        "packets",
+        "limitations",
+    ],
     "implementation": ["changed_files", "commands", "limitations"],
     "review": ["changed_files", "commands", "limitations"],
     "commit": ["commit", "decision_log", "limitations"],
@@ -51,6 +65,7 @@ Do not perform an unapproved destructive or irreversible external write; record 
 Record the decision as coordinator acceptance; do not represent it as human approval."""
 
 REVIEW_REJECTION_PREFIX = "Factory review rejected:"
+PROGRESS_CHECKPOINT_PREFIX = "Factory progress checkpoint:"
 HUMAN_GATE_MARKER = "<!-- hermes-factory:human-gate -->"
 
 KANBAN_HANDBOOK = """\
@@ -58,7 +73,41 @@ Report results in the Kanban task summary with structured metadata and attach re
 
 
 def _completion_metadata_section(task_class: str, proof: ProofSpec | None) -> str:
-    if task_class in {"implementation", "review"}:
+    if task_class == "decomposition":
+        metadata = {
+            "version": 1,
+            "project": "project-slug",
+            "mission": "mission-id",
+            "source_slice": "architectural-slice-id",
+            "source_contract_sha256": "<64 lowercase hexadecimal characters>",
+            "packets": [
+                {
+                    "id": "bounded-slug",
+                    "title": "Concrete reviewable behavior",
+                    "goal": "One observable outcome",
+                    "depends_on": [],
+                    "acceptance": [
+                        "<the covered source acceptance item, word for word>",
+                        "Observable packet-level criterion",
+                    ],
+                    "source_acceptance_indexes": [0],
+                    "likely_files": ["relative/path.py"],
+                    "symbols": ["module.symbol"],
+                    "first_artifact": "Add a failing focused test for the behavior.",
+                    "proof": {
+                        "commands": ["a declared source proof command, narrowed if needed"],
+                        "artifacts": [],
+                        "changed_files_required": True,
+                    },
+                }
+            ],
+            "limitations": [],
+        }
+        explanation = (
+            "Return these exact root and nested keys as structured run metadata. "
+            "Do not wrap the manifest, rename fields, or return it only as prose."
+        )
+    elif task_class in {"implementation", "review"}:
         metadata = {
             "changed_files": ["path/to/file"],
             "commands": [
@@ -290,6 +339,158 @@ def _handoff_section(rig: RigSpec, mission: MissionSpec, target: str) -> str:
     return f"# Handoff\n{KANBAN_HANDBOOK}\nNext target: {target}."
 
 
+def decomposition_source_contract(
+    rig: RigSpec, mission: MissionSpec, slice_spec: SliceSpec
+) -> dict[str, object]:
+    """Return the canonical Factory-owned source data bound to decomposition."""
+    proof = slice_spec.proof
+    return {
+        "version": 1,
+        "project": {
+            "slug": rig.project.slug,
+            "name": rig.project.name,
+            "cwd": str(rig.project.cwd),
+        },
+        "mission": {
+            "version": mission.version,
+            "id": mission.id,
+            "title": mission.title,
+            "intent": mission.intent,
+            "workflow": mission.workflow,
+            "human_acceptance": mission.human_acceptance,
+            "slice_ids": [item.id for item in mission.slices],
+            "acceptance": list(mission.acceptance),
+        },
+        "source_slice": {
+            "id": slice_spec.id,
+            "title": slice_spec.title,
+            "goal": slice_spec.goal,
+            "depends_on": list(slice_spec.depends_on),
+            "acceptance": list(slice_spec.acceptance),
+            "proof": (
+                {
+                    "commands": list(proof.commands),
+                    "artifacts": list(proof.artifacts),
+                    "changed_files_required": proof.changed_files_required,
+                }
+                if proof
+                else None
+            ),
+        },
+        "source_acceptance": [*mission.acceptance, *slice_spec.acceptance],
+    }
+
+
+def render_decomposition_body(
+    rig: RigSpec, mission: MissionSpec, slice_spec: SliceSpec
+) -> str:
+    workflow = rig.workflows[mission.workflow]
+    seat_name = workflow.decomposition_seat
+    if seat_name is None:
+        raise SpecError("workflow does not define a decomposition seat")
+    if (
+        rig.policies.decomposer_runtime is None
+        or rig.policies.max_packets_per_slice is None
+        or rig.policies.max_packet_acceptance_items is None
+    ):
+        raise SpecError("rig does not define decomposition policy limits")
+    seat = rig.seats[seat_name]
+    source_contract = decomposition_source_contract(rig, mission, slice_spec)
+    source_hash = canonical_source_contract_sha256(source_contract)
+    manifest = {
+        "version": 1,
+        "project": rig.project.slug,
+        "mission": mission.id,
+        "source_slice": slice_spec.id,
+        "source_contract_sha256": source_hash,
+        "packets": [
+            {
+                "id": "bounded-slug",
+                "title": "Concrete reviewable behavior",
+                "goal": "One observable outcome",
+                "depends_on": [],
+                "acceptance": [
+                    "<the covered source acceptance item, word for word>",
+                    "Observable packet-level criterion",
+                ],
+                "source_acceptance_indexes": [0],
+                "likely_files": ["relative/path.py"],
+                "symbols": ["module.symbol"],
+                "first_artifact": "Add a failing focused test for the behavior.",
+                "proof": {
+                    "commands": ["a declared source proof command, narrowed if needed"],
+                    "artifacts": [],
+                    "changed_files_required": True,
+                },
+            }
+        ],
+        "limitations": [],
+    }
+    parts = [
+        _intent_sections(rig, mission, slice_spec),
+        _proof_section(rig, slice_spec),
+        _audit_contract("decomposition", None),
+        _completion_metadata_section("decomposition", None),
+        (
+            "# Immutable source contract\n"
+            "This canonical Factory-owned JSON is read-only. Its SHA-256 binds the result to the "
+            "architecture and acceptance boundaries shown here.\n"
+            f"Source contract SHA-256: {source_hash}\n"
+            f"```json\n{json.dumps(source_contract, indent=2, ensure_ascii=False)}\n```"
+        ),
+        (
+            "# Decomposition output\nReturn exactly one version-1 manifest with this JSON shape:\n"
+            f"```json\n{json.dumps(manifest, indent=2)}\n```\n"
+            "Every source acceptance index must be covered by at least one packet, and a packet's "
+            "`acceptance` list must carry each source acceptance item it declares by index word for "
+            "word. Preserve all "
+            "architecture, goal, dependency, acceptance, and proof boundaries. Each packet must be a "
+            "small vertical reviewable behavior with exact inspected likely files and symbols, one early "
+            "durable first artifact, and a narrow proof command: a packet command must be a declared "
+            "source proof command or that command with additional arguments, never a different base, "
+            "and every declared source proof command must still appear exactly as declared in at least "
+            "one packet - narrowing one packet never removes the slice's own command from the manifest. "
+            "`limitations` is a refusal channel, not "
+            "a note channel: keep it empty for every manifest you can materialize, because any non-empty "
+            "entry stops materialization and returns the decision to the coordinator. Use it only when "
+            "the architectural slice genuinely cannot be decomposed safely, and never silently revise the "
+            "source contract. Scope or design notes belong in the packet text, never in `limitations`."
+        ),
+        (
+            "# Packet limits\n"
+            f"workflow.decomposition_seat: {seat_name}.\n"
+            f"decomposer_runtime: {rig.policies.decomposer_runtime}.\n"
+            f"Builder runtime budget: {rig.policies.max_runtime}.\n"
+            f"Maximum packets for this slice: {rig.policies.max_packets_per_slice}.\n"
+            "Maximum acceptance items per packet: "
+            f"{rig.policies.max_packet_acceptance_items}."
+        ),
+        _scope_section(
+            rig,
+            mission,
+            seat_name,
+            seat.role,
+            runtime=rig.policies.decomposer_runtime,
+        ),
+        (
+            "# Prohibited actions\n"
+            "Do not edit the repository. Do not edit production or test files. Do not delegate. "
+            "Do not create, delete, complete, block, or mutate tasks except completing this assigned "
+            "decomposition task. Do not mutate the task graph or dependencies. Do not assign profiles. "
+            "Do not change architecture. Do not change mission or slice acceptance. Do not ask the "
+            "operator questions. Repository inspection and read-only commands are allowed only to make "
+            "file, symbol, artifact, and proof guidance concrete."
+        ),
+        (
+            "# Completion\nComplete by calling kanban_complete once with a concise summary and the "
+            "entire manifest as structured run metadata. Run metadata preserves nested JSON exactly; "
+            "do not put the authoritative manifest only in prose or an attachment."
+        ),
+        _handoff_section(rig, mission, "trusted Factory validation and graph materialization"),
+    ]
+    return _limit("\n\n".join(parts))
+
+
 def render_implementation_body(
     rig: RigSpec, mission: MissionSpec, slice_spec: SliceSpec
 ) -> str:
@@ -313,6 +514,77 @@ def render_implementation_body(
         _handoff_section(rig, mission, f"review task for slice {slice_spec.id!r} (profile {review_profile!r})"),
     ]
     return _limit("\n\n".join(parts))
+
+
+def render_packet_implementation_body(
+    rig: RigSpec,
+    mission: MissionSpec,
+    source_slice: SliceSpec,
+    packet: ExecutionPacketSpec,
+) -> str:
+    """Render an implementation task from one validated execution packet."""
+    trusted_proof = source_slice.proof
+    if trusted_proof is None:
+        if packet.proof.commands or packet.proof.artifacts or packet.proof.changed_files_required:
+            raise SpecError("packet proof is not authorized by the source slice")
+    else:
+        if any(
+            not is_trusted_proof_command(command, set(trusted_proof.commands))
+            for command in packet.proof.commands
+        ):
+            raise SpecError("packet proof command is not authorized by the source slice")
+        if any(artifact not in trusted_proof.artifacts for artifact in packet.proof.artifacts):
+            raise SpecError("packet proof artifact is not authorized by the source slice")
+        if trusted_proof.changed_files_required and not packet.proof.changed_files_required:
+            raise SpecError("packet proof cannot weaken the source slice changed-files requirement")
+    packet_proof = ProofSpec(
+        commands=packet.proof.commands,
+        artifacts=packet.proof.artifacts,
+        changed_files_required=packet.proof.changed_files_required,
+    )
+    packet_slice = SliceSpec(
+        id=packet.id,
+        title=packet.title,
+        goal=packet.goal,
+        depends_on=packet.depends_on,
+        acceptance=packet.acceptance,
+        proof=packet_proof,
+    )
+    base = render_implementation_body(rig, mission, packet_slice)
+    checkpoint = {
+        "version": 1,
+        "changed_files": ["relative/path.py"],
+        "completed_acceptance_indexes": [0],
+        "remaining": ["Concrete unfinished behavior"],
+        "commands": [{"command": "...", "exit_code": 1}],
+        "next_action": "First exact action for the continuation",
+        "limitations": [],
+    }
+    packet_protocol = (
+        "# Execution packet\n"
+        f"Source architectural slice: {source_slice.id}.\n"
+        f"Likely files:\n{_list_lines(packet.likely_files)}\n"
+        f"Likely symbols:\n{_list_lines(packet.symbols)}\n"
+        f"Declared first artifact: {packet.first_artifact}\n"
+        "Trusted packet proof commands validated against the immutable source slice:\n"
+        f"{_list_lines(packet.proof.commands)}\n\n"
+        "Inspect only the named files and symbols first; expand scope only when evidence requires it. "
+        "Run the narrow baseline or reproduction command before broad analysis. Create the declared "
+        "first durable artifact early, then run the focused check immediately. Complete one strict "
+        "RED, GREEN, REFACTOR cycle. Heartbeat proves liveness, not material progress. Do not spend "
+        "most of the run on a prose plan when exact files, symbols, and the first artifact are already "
+        "provided. Reserve the final 25 percent of the runtime budget for proof and Kanban handoff.\n\n"
+        "If the packet cannot be completed and verified safely inside the remaining budget, stop "
+        "expanding scope, leave the repository syntactically valid where possible, run the narrowest "
+        f"relevant check, and block with the exact prefix `{PROGRESS_CHECKPOINT_PREFIX}` followed by "
+        "this exact JSON schema:\n"
+        f"```json\n{json.dumps(checkpoint, indent=2)}\n```"
+    )
+    handoff_marker = "\n\n# Handoff\n"
+    if handoff_marker not in base:
+        raise SpecError("implementation body is missing its handoff section")
+    before, handoff = base.split(handoff_marker, 1)
+    return _limit(f"{before}\n\n{packet_protocol}{handoff_marker}{handoff}")
 
 
 def render_review_body(

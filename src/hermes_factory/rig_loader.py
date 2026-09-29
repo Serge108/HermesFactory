@@ -28,7 +28,8 @@ _ROOT_KEYS = _ROOT_REQUIRED_KEYS | {"notifications"}
 _PROJECT_KEYS = {"slug", "name", "cwd"}
 _BOARD_KEYS = {"slug", "name"}
 _SEAT_KEYS = {"profile", "role", "skills"}
-_WORKFLOW_KEYS = {"implementation_seat", "review_seat", "acceptance_seat"}
+_WORKFLOW_V1_KEYS = {"implementation_seat", "review_seat", "acceptance_seat"}
+_WORKFLOW_V2_KEYS = _WORKFLOW_V1_KEYS | {"decomposition_seat"}
 _NOTIFICATION_KEYS = {"task_subscriptions"}
 _TASK_SUBSCRIPTION_KEYS = {
     "platform",
@@ -49,6 +50,9 @@ _POLICY_KEYS = {
     "decision_authority",
     "git_commit_policy",
     "fixture_recovery",
+    "decomposer_runtime",
+    "max_packets_per_slice",
+    "max_packet_acceptance_items",
 }
 _POLICY_REQUIRED_KEYS = _POLICY_KEYS - {
     "decision_authority",
@@ -56,6 +60,9 @@ _POLICY_REQUIRED_KEYS = _POLICY_KEYS - {
     "fixture_recovery",
     "coordinator_runtime",
     "no_agent_grace",
+    "decomposer_runtime",
+    "max_packets_per_slice",
+    "max_packet_acceptance_items",
 }
 
 
@@ -191,7 +198,9 @@ def _load_seats(value: Any) -> dict[str, SeatSpec]:
     return seats
 
 
-def _load_workflows(value: Any, seats: dict[str, SeatSpec]) -> dict[str, WorkflowSpec]:
+def _load_workflows(
+    value: Any, seats: dict[str, SeatSpec], version: int
+) -> dict[str, WorkflowSpec]:
     source = _mapping(value, "workflows")
     if not source:
         raise SpecError("workflows must not be empty")
@@ -201,7 +210,8 @@ def _load_workflows(value: Any, seats: dict[str, SeatSpec]) -> dict[str, Workflo
         if name in workflows:
             raise SpecError(f"workflow slug collision after trimming: {name!r}")
         workflow = _mapping(raw_workflow, f"workflow {name!r}")
-        _validate_keys(workflow, _WORKFLOW_KEYS, f"workflow {name!r}")
+        workflow_keys = _WORKFLOW_V2_KEYS if version == 2 else _WORKFLOW_V1_KEYS
+        _validate_keys(workflow, workflow_keys, f"workflow {name!r}")
         loaded = WorkflowSpec(
             implementation_seat=_string(
                 workflow["implementation_seat"],
@@ -214,8 +224,17 @@ def _load_workflows(value: Any, seats: dict[str, SeatSpec]) -> dict[str, Workflo
                 workflow["acceptance_seat"],
                 f"workflow {name!r}.acceptance_seat",
             ),
+            decomposition_seat=(
+                _string(
+                    workflow["decomposition_seat"],
+                    f"workflow {name!r}.decomposition_seat",
+                )
+                if version == 2
+                else None
+            ),
         )
         for seat_name in (
+            *((loaded.decomposition_seat,) if loaded.decomposition_seat is not None else ()),
             loaded.implementation_seat,
             loaded.review_seat,
             loaded.acceptance_seat,
@@ -276,7 +295,7 @@ def load_rig(path: Path) -> RigSpec:
     _validate_keys(data, _ROOT_KEYS, "rig", required=_ROOT_REQUIRED_KEYS)
 
     version = data["version"]
-    if type(version) is not int or version != 1:
+    if type(version) is not int or version not in {1, 2}:
         raise SpecError(f"unsupported version {version!r}")
 
     project = _mapping(data["project"], "project")
@@ -294,11 +313,16 @@ def load_rig(path: Path) -> RigSpec:
     board = _mapping(data["board"], "board")
     _validate_keys(board, _BOARD_KEYS, "board")
     seats = _load_seats(data["seats"])
-    workflows = _load_workflows(data["workflows"], seats)
+    workflows = _load_workflows(data["workflows"], seats, version)
 
     policies = _mapping(data["policies"], "policies")
+    policy_keys = _POLICY_KEYS if version == 2 else _POLICY_KEYS - {
+        "decomposer_runtime",
+        "max_packets_per_slice",
+        "max_packet_acceptance_items",
+    }
     _validate_keys(
-        policies, _POLICY_KEYS, "policies", required=_POLICY_REQUIRED_KEYS
+        policies, policy_keys, "policies", required=_POLICY_REQUIRED_KEYS
     )
     human_acceptance = _boolean(policies["human_acceptance"], "policies.human_acceptance")
     decision_authority_declared = "decision_authority" in policies
@@ -353,6 +377,32 @@ def load_rig(path: Path) -> RigSpec:
             fixture_recovery=_boolean(
                 policies.get("fixture_recovery", False),
                 "policies.fixture_recovery",
+            ),
+            decomposer_runtime=(
+                parse_duration(
+                    policies.get(
+                        "decomposer_runtime",
+                        policies.get("coordinator_runtime", policies["max_runtime"]),
+                    )
+                )
+                if version == 2
+                else None
+            ),
+            max_packets_per_slice=(
+                _positive_integer(
+                    policies.get("max_packets_per_slice", 8),
+                    "policies.max_packets_per_slice",
+                )
+                if version == 2
+                else None
+            ),
+            max_packet_acceptance_items=(
+                _positive_integer(
+                    policies.get("max_packet_acceptance_items", 5),
+                    "policies.max_packet_acceptance_items",
+                )
+                if version == 2
+                else None
             ),
         ),
     )

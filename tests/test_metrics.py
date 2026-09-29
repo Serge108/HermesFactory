@@ -43,6 +43,8 @@ def test_empty_board_metrics_are_zero_or_none():
         max_lead_time_minutes=None,
         open_work_by_seat={},
         oldest_ready_age_seconds=None,
+        packets_per_architectural_slice={},
+        hard_timeout_rate_by_task_class={},
     )
 
 
@@ -204,3 +206,232 @@ def test_open_work_groups_by_assignee_and_ignores_done():
 
     assert metrics.open_work_by_seat == {"builder": 2, "reviewer": 1}
     assert metrics.oldest_ready_age_seconds == 42
+
+
+def test_material_progress_metrics_use_factory_task_identity_and_run_timestamps():
+    tasks = [
+        _task(
+            "d-1",
+            created_at=0,
+            completed_at=600,
+            metadata={"task_class": "decomposition"},
+        )
+        | {"idempotency_key": "factory:demo:mission:core:decomposition"},
+        _task(
+            "i-1",
+            created_at=600,
+            completed_at=1_200,
+            metadata={"task_class": "implementation"},
+        )
+        | {"idempotency_key": "factory:demo:mission:core:packet-a:implementation"},
+        _task(
+            "r-1",
+            created_at=600,
+            completed_at=1_500,
+            metadata={"task_class": "review"},
+        )
+        | {"idempotency_key": "factory:demo:mission:core:packet-a:review"},
+        _task(
+            "i-2",
+            created_at=600,
+            completed_at=1_800,
+            metadata={"task_class": "implementation"},
+        )
+        | {"idempotency_key": "factory:demo:mission:core:packet-b:implementation"},
+        _task(
+            "r-2",
+            created_at=600,
+            completed_at=2_100,
+            metadata={"task_class": "review"},
+        )
+        | {"idempotency_key": "factory:demo:mission:core:packet-b:review"},
+    ]
+    runs = {
+        "d-1": [_run(status="done", outcome="completed", started_at=0, ended_at=600)],
+        "i-1": [_run(status="done", outcome="completed", started_at=610, ended_at=1_200)],
+        "r-1": [_run(status="done", outcome="completed", started_at=1_210, ended_at=1_500)],
+        "i-2": [
+            _run(
+                status="blocked",
+                outcome="blocked",
+                started_at=610,
+                ended_at=900,
+                error='Factory progress checkpoint: {"version": 1}',
+            ),
+            _run(status="done", outcome="completed", started_at=1_510, ended_at=1_800),
+        ],
+        "r-2": [
+            _run(status="timed_out", outcome="timed_out", started_at=1_810, ended_at=2_100)
+        ],
+    }
+
+    metrics = compute_metrics(tasks, runs, {"now": 2_100})
+
+    assert metrics.decomposition_lead_time_minutes == 10.0
+    assert metrics.packets_per_architectural_slice == {"core": 2}
+    assert metrics.builder_first_attempt_completion_rate == 0.5
+    assert metrics.progress_checkpoint_rate == 1.0
+    assert metrics.hard_timeout_rate_by_task_class == {
+        "decomposition": 0.0,
+        "implementation": 0.0,
+        "review": 0.5,
+    }
+    assert metrics.median_packet_lead_time_minutes == 20.0
+
+
+def test_rework_after_review_requires_a_later_builder_attempt():
+    tasks = [
+        _task("i-1", metadata={"task_class": "implementation"})
+        | {"idempotency_key": "factory:demo:mission:core:packet-a:implementation"},
+        _task("r-1", metadata={"task_class": "review"})
+        | {"idempotency_key": "factory:demo:mission:core:packet-a:review"},
+        _task("i-2", metadata={"task_class": "implementation"})
+        | {"idempotency_key": "factory:demo:mission:core:packet-b:implementation"},
+        _task("r-2", metadata={"task_class": "review"})
+        | {"idempotency_key": "factory:demo:mission:core:packet-b:review"},
+    ]
+    runs = {
+        "i-1": [
+            _run(status="done", outcome="completed", started_at=10, ended_at=20),
+            _run(status="done", outcome="completed", started_at=40, ended_at=50),
+        ],
+        "r-1": [_run(status="blocked", outcome="changes_requested", started_at=25, ended_at=30)],
+        "i-2": [_run(status="done", outcome="completed", started_at=10, ended_at=20)],
+        "r-2": [_run(status="done", outcome="completed", started_at=25, ended_at=30)],
+    }
+
+    metrics = compute_metrics(tasks, runs, {"now": 100})
+
+    assert metrics.rework_rate_after_review == 0.5
+
+
+def test_action_latency_is_explicitly_unavailable_without_authoritative_events():
+    task = _task("i-1", metadata={"task_class": "implementation"}) | {
+        "idempotency_key": "factory:demo:mission:core:packet-a:implementation"
+    }
+
+    metrics = compute_metrics(
+        [task],
+        {"i-1": [_run(status="done", outcome="completed", started_at=10, ended_at=20)]},
+        {"now": 100},
+    )
+
+    assert metrics.time_to_first_command_minutes is None
+    assert metrics.time_to_first_file_mutation_minutes is None
+    assert metrics.action_latency_observation == "unavailable"
+
+
+def test_v2_packet_identity_uses_the_compiler_key_format():
+    tasks = [
+        _task("i-1", created_at=600, completed_at=1_200)
+        | {"idempotency_key": "factory:demo:demo-mission:core:packet:p1:implementation"},
+        _task("r-1", created_at=600, completed_at=1_500)
+        | {"idempotency_key": "factory:demo:demo-mission:core:packet:p1:review"},
+        _task("reconcile-1", "ready")
+        | {"idempotency_key": "factory:demo:reconcile:t_ab12cd:gave-up:1790540080"},
+        _task("a-1")
+        | {"idempotency_key": "factory:demo:demo-mission:acceptance"},
+    ]
+    runs = {
+        "i-1": [_run(status="done", outcome="completed", id=1, started_at=610, ended_at=1_200)],
+        "r-1": [_run(status="done", outcome="completed", id=2, started_at=1_210, ended_at=1_500)],
+        "a-1": [_run(status="done", outcome="completed", id=3, started_at=1_510, ended_at=1_600)],
+    }
+
+    metrics = compute_metrics(tasks, runs, {"now": 1_500})
+
+    assert metrics.packets_per_architectural_slice == {"core": 1}
+    assert metrics.builder_first_attempt_completion_rate == 1.0
+    assert metrics.median_packet_lead_time_minutes == 15.0
+    assert metrics.hard_timeout_rate_by_task_class == {
+        "acceptance": 0.0,
+        "implementation": 0.0,
+        "review": 0.0,
+    }
+
+
+def test_progress_checkpoint_rate_counts_unsuccessful_terminal_attempts():
+    task = _task("i-1") | {
+        "idempotency_key": "factory:demo:mission:core:packet-a:implementation"
+    }
+    runs = {
+        "i-1": [
+            _run(
+                status="blocked",
+                outcome="blocked",
+                id=1,
+                started_at=10,
+                ended_at=20,
+                summary='Factory progress checkpoint: {"version": 1}',
+            ),
+            _run(
+                status="timed_out",
+                outcome="timed_out",
+                id=2,
+                started_at=30,
+                ended_at=40,
+                summary="",
+            ),
+        ]
+    }
+
+    metrics = compute_metrics([task], runs, {"now": 100})
+
+    assert metrics.progress_checkpoint_rate == 0.5
+
+
+def test_rework_after_review_is_null_without_a_completed_review_observation():
+    tasks = [
+        _task("i-1")
+        | {"idempotency_key": "factory:demo:mission:core:packet-a:implementation"},
+        _task("r-1", "running")
+        | {"idempotency_key": "factory:demo:mission:core:packet-a:review"},
+    ]
+    runs = {
+        "i-1": [_run(status="done", outcome="completed", id=1, started_at=10, ended_at=20)],
+        "r-1": [_run(status="running", outcome=None, id=2, started_at=25)],
+    }
+
+    metrics = compute_metrics(tasks, runs, {"now": 100})
+
+    assert metrics.rework_rate_after_review is None
+
+
+def test_first_builder_attempt_follows_run_order_not_input_order():
+    task = _task("i-1") | {
+        "idempotency_key": "factory:demo:mission:core:packet-a:implementation"
+    }
+    runs = {
+        "i-1": [
+            _run(status="done", outcome="completed", id=8, started_at=40, ended_at=50),
+            _run(status="timed_out", outcome="timed_out", id=2, started_at=10, ended_at=20),
+        ]
+    }
+
+    metrics = compute_metrics([task], runs, {"now": 100})
+
+    assert metrics.builder_first_attempt_completion_rate == 0.0
+
+
+def test_progress_checkpoint_metric_rejects_a_whitespace_prefixed_lookalike():
+    task = _task("i-1", metadata={"task_class": "implementation"}) | {
+        "idempotency_key": "factory:demo:mission:core:packet-a:implementation"
+    }
+
+    metrics = compute_metrics(
+        [task],
+        {
+            "i-1": [
+                _run(
+                    status="blocked",
+                    outcome="blocked",
+                    started_at=10,
+                    ended_at=20,
+                    error=' Factory progress checkpoint: {"version": 1}',
+                )
+            ]
+        },
+        {"now": 100},
+    )
+
+    assert metrics.progress_checkpoint_rate == 0.0

@@ -73,8 +73,12 @@ def _parse_task_creation(value: Any) -> str:
 
 
 def _task_runtime(rig: RigSpec, task: PlannedTask) -> str:
-    """Coordinator-owned cards get the coordinator budget; slice cards keep the slice one."""
-    if task.key == "acceptance" or task.key.endswith(":commit"):
+    """Select the explicit runtime class carried by the compiled task."""
+    if task.task_class == "decomposition":
+        if rig.policies.decomposer_runtime is None:
+            raise HermesCommandError("decomposition task has no configured runtime")
+        return rig.policies.decomposer_runtime
+    if task.task_class in {"acceptance", "commit"}:
         return rig.policies.coordinator_runtime
     return rig.policies.max_runtime
 

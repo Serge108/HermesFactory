@@ -6,11 +6,12 @@ import sys
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from hermes_factory import __version__
 from hermes_factory.board import apply_mission, ensure_board
 from hermes_factory.compiler import compile_mission
-from hermes_factory.errors import FactoryError
+from hermes_factory.errors import FactoryError, HermesCommandError
 from hermes_factory.health import audit_tasks, build_proof_map, verify_git_commit
 from hermes_factory.hermes_cli import HermesClient
 from hermes_factory.metrics import compute_metrics
@@ -139,11 +140,22 @@ def handle_mission_plan(args: argparse.Namespace, client_factory: ClientFactory)
             "parents": list(task.parents),
             "idempotency_key": task.idempotency_key,
             "initial_status": task.initial_status,
+            "task_class": task.task_class,
         }
         for task in plan.tasks
     ]
     if args.json:
-        print(json.dumps({"board_slug": plan.board_slug, "tasks": tasks}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "board_slug": plan.board_slug,
+                    "phase": plan.phase,
+                    "pending_materialization": plan.pending_materialization,
+                    "tasks": tasks,
+                },
+                indent=2,
+            )
+        )
     else:
         for task in tasks:
             parents = ", ".join(task["parents"]) or "-"
@@ -225,12 +237,54 @@ def handle_status(args: argparse.Namespace, client_factory: ClientFactory) -> in
     return 1 if counts["critical"] or counts["error"] else 0
 
 
+def _hydrate_task_identities(
+    client: HermesClient, board_slug: str, tasks: Any
+) -> Any:
+    """Add the identity fields the installed Kanban list projection omits.
+
+    ``hermes kanban list --json`` carries neither ``idempotency_key`` nor task
+    metadata, so a report built from list rows alone cannot tell a decomposition or
+    packet card from any other card. The key is read back through the client's
+    read-only record path, exactly like the reconciler does. A report is a snapshot
+    that always exits 0, so a record that cannot be read leaves the card
+    unidentified instead of failing the run.
+    """
+    if not isinstance(tasks, list):
+        return tasks
+    hydrated: list = []
+    for task in tasks:
+        if not isinstance(task, dict) or isinstance(task.get("idempotency_key"), str):
+            hydrated.append(task)
+            continue
+        task_id = task.get("id")
+        if not isinstance(task_id, str) or not task_id:
+            hydrated.append(task)
+            continue
+        try:
+            record = client.task_record(board_slug, task_id)
+        except HermesCommandError:
+            hydrated.append(task)
+            continue
+        key = record.get("idempotency_key") if isinstance(record, dict) else None
+        if (
+            not isinstance(record, dict)
+            or record.get("id") != task_id
+            or not isinstance(key, str)
+        ):
+            hydrated.append(task)
+            continue
+        hydrated.append({**task, "idempotency_key": key})
+    return hydrated
+
+
 def handle_report(args: argparse.Namespace, client_factory: ClientFactory) -> int:
     rig = load_rig(args.rig)
     client = client_factory(args.hermes)
     board = ["kanban", "--board", rig.board.slug]
     stats = client.run_json(board + ["stats", "--json"])
-    tasks = client.run_json(board + ["list", "--json"])
+    tasks = _hydrate_task_identities(
+        client, rig.board.slug, client.run_json(board + ["list", "--json"])
+    )
     diagnostics = client.run_json(board + ["diagnostics", "--json"])
 
     runs_by_task: dict[str, list] = {}
@@ -290,6 +344,59 @@ def handle_report(args: argparse.Namespace, client_factory: ClientFactory) -> in
             else "-"
         )
         print(f"median lead time: {lead} minutes")
+        decomposition_lead = (
+            f"{metrics.decomposition_lead_time_minutes} minutes"
+            if metrics.decomposition_lead_time_minutes is not None
+            else "not observed"
+        )
+        packet_lead = (
+            f"{metrics.median_packet_lead_time_minutes} minutes"
+            if metrics.median_packet_lead_time_minutes is not None
+            else "not observed"
+        )
+        packet_counts = ", ".join(
+            f"{slice_id}: {count}"
+            for slice_id, count in (metrics.packets_per_architectural_slice or {}).items()
+        ) or "not observed"
+        first_attempt = (
+            f"{metrics.builder_first_attempt_completion_rate:.2f}"
+            if metrics.builder_first_attempt_completion_rate is not None
+            else "not observed"
+        )
+        checkpoint_rate = (
+            f"{metrics.progress_checkpoint_rate:.2f}"
+            if metrics.progress_checkpoint_rate is not None
+            else "not observed"
+        )
+        timeout_rates = ", ".join(
+            f"{task_class}: {rate:.2f}"
+            for task_class, rate in (metrics.hard_timeout_rate_by_task_class or {}).items()
+        ) or "not observed"
+        review_rework = (
+            f"{metrics.rework_rate_after_review:.2f}"
+            if metrics.rework_rate_after_review is not None
+            else "not observed"
+        )
+        print(f"decomposition lead time: {decomposition_lead}")
+        print(f"packets per architectural slice: {packet_counts}")
+        print(f"builder first-attempt completion rate: {first_attempt}")
+        print(f"progress checkpoint rate: {checkpoint_rate}")
+        print(f"hard timeout rate by task class: {timeout_rates}")
+        print(f"median packet lead time: {packet_lead}")
+        print(f"rework rate after review: {review_rework}")
+        action_status = metrics.action_latency_observation
+        first_command = (
+            f"{metrics.time_to_first_command_minutes} minutes"
+            if metrics.time_to_first_command_minutes is not None
+            else action_status
+        )
+        first_mutation = (
+            f"{metrics.time_to_first_file_mutation_minutes} minutes"
+            if metrics.time_to_first_file_mutation_minutes is not None
+            else action_status
+        )
+        print(f"time to first command: {first_command}")
+        print(f"time to first file mutation: {first_mutation}")
         open_seats = ", ".join(
             f"{seat}: {count}"
             for seat, count in sorted(metrics.open_work_by_seat.items())

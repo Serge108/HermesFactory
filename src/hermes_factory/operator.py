@@ -22,7 +22,7 @@ import sqlite3
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -30,6 +30,8 @@ from typing import Any
 from hermes_factory.errors import FactoryError
 
 OPERATOR_JOB_MARKER = "Hermes Factory operator:"
+
+ENGINE_LOCK_NAME = "engine.operator.lock.json"
 
 DEFAULT_FAILURE_STREAK_THRESHOLD = 3
 DEFAULT_STALE_AFTER_SECONDS = 600
@@ -132,6 +134,7 @@ class LockRecord:
     started_at: int
     incident_ids: tuple[str, ...]
     session_log: Path | None
+    heartbeat_at: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,10 +148,23 @@ class OperatorPlan:
     lock_directory: Path
 
     def lock_path(self) -> Path:
-        return self.lock_directory / f"{self.project}.operator.lock.json"
+        return self.lock_directory / project_lock_name(self.project)
+
+    def engine_lock_path(self) -> Path:
+        """One engine, several rigs: the lock every project's tick consults."""
+        return engine_lock_path(self.lock_directory)
 
     def session_log_path(self, started_at: int) -> Path:
         return self.log_directory / f"{self.project}-operator-{started_at}.log"
+
+
+def project_lock_name(project: str) -> str:
+    return f"{project}.operator.lock.json"
+
+
+def engine_lock_path(lock_directory: Path) -> Path:
+    """The engine-scoped lock sits one directory above the per-project lock."""
+    return lock_directory.parent / ENGINE_LOCK_NAME
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +176,8 @@ class SuperviseResult:
     log_path: Path | None
     command: tuple[str, ...]
     replaced_stale_lock: bool = False
+    engine_lock_path: Path | None = None
+    engine_holder: str | None = None
 
 
 def _optional_text(value: Any, field: str) -> str | None:
@@ -413,18 +431,46 @@ def assess_engine(
     return EngineVerdict(worst, project, observed, reasons, tuple(verdicts))
 
 
-def write_lock(record: LockRecord) -> None:
-    record.path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
+def _lock_payload(record: LockRecord) -> dict[str, Any]:
+    return {
         "project": record.project,
         "started_at": record.started_at,
         "incident_ids": list(record.incident_ids),
         "session_log": None if record.session_log is None else str(record.session_log),
+        "heartbeat_at": record.heartbeat_at,
     }
+
+
+def write_lock(record: LockRecord) -> None:
+    record.path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        record.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        record.path.write_text(
+            json.dumps(_lock_payload(record), indent=2), encoding="utf-8"
+        )
     except OSError as exc:
         raise FactoryError(f"failed to write operator lock {record.path}") from exc
+
+
+def acquire_lock(record: LockRecord) -> bool:
+    """Create a lock exclusively, so exactly one tick can win the race.
+
+    The engine-scoped lock is taken this way: acquisition never waits, so a
+    supervisor that loses the race declines to launch instead of blocking on the
+    winner, and two ticks cannot both decide they hold the engine.
+    """
+    record.path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        handle = os.open(record.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    except OSError as exc:
+        raise FactoryError(f"failed to write operator lock {record.path}") from exc
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(_lock_payload(record), indent=2))
+    except OSError as exc:
+        raise FactoryError(f"failed to write operator lock {record.path}") from exc
+    return True
 
 
 def read_lock(path: Path) -> LockRecord | None:
@@ -447,12 +493,18 @@ def read_lock(path: Path) -> LockRecord | None:
     session_log = payload.get("session_log")
     if session_log is not None and not isinstance(session_log, str):
         raise FactoryError(f"operator lock {path} has a malformed session log")
+    heartbeat_at = payload.get("heartbeat_at")
+    if heartbeat_at is not None and (
+        isinstance(heartbeat_at, bool) or not isinstance(heartbeat_at, int)
+    ):
+        raise FactoryError(f"operator lock {path} has a malformed heartbeat")
     return LockRecord(
         path=path,
         project=_text(payload.get("project"), "operator lock project"),
         started_at=started_at,
         incident_ids=tuple(incident_ids),
         session_log=None if session_log is None else Path(session_log),
+        heartbeat_at=heartbeat_at,
     )
 
 
@@ -466,11 +518,29 @@ def release_lock(path: Path) -> bool:
     return True
 
 
-def _default_log_mtime(path: Path) -> float | None:
+def _same_path(left: Path, right: Path) -> bool:
     try:
-        return path.stat().st_mtime
-    except OSError:
+        return os.path.normcase(str(left.resolve())) == os.path.normcase(str(right.resolve()))
+    except OSError:  # pragma: no cover - resolve is best effort on both paths
+        return os.path.normcase(str(left)) == os.path.normcase(str(right))
+
+
+def terminal_record_path(lock: LockRecord) -> Path | None:
+    """The record the session contract requires before it exits.
+
+    ``templates/operator-session-prompt.md`` has the session write
+    ``<operator root>/records/<stem of its own log>.json``. That file is the one
+    terminal signal the circuit can read, so it ends the session's claim early
+    instead of making the next tick wait out the whole session budget.
+    """
+    if lock.session_log is None:
         return None
+    return lock.path.parent / "records" / f"{lock.session_log.stem}.json"
+
+
+def session_finished(lock: LockRecord) -> bool:
+    path = terminal_record_path(lock)
+    return path is not None and path.is_file()
 
 
 def lock_is_live(
@@ -479,23 +549,52 @@ def lock_is_live(
     now: float,
     quiet_seconds: int,
     max_session_seconds: int,
-    log_mtime: Callable[[Path], float | None] = _default_log_mtime,
+    finished: bool = False,
 ) -> bool:
     """Decide whether a running operator session owns the lock.
 
-    Process liveness is deliberately not probed: on Windows ``os.kill(pid, 0)``
-    neither raises for a dead process nor succeeds for a live one, so it cannot
-    distinguish them. Age plus a writing session log is the portable signal.
+    Two signals are deliberately not trusted.
+
+    Process liveness is not probed: on Windows ``os.kill(pid, 0)`` raises for a live
+    process and returns quietly for a dead one, so it cannot distinguish them.
+
+    The session's own log is not a liveness signal either. ``build_session_argv``
+    passes ``-Q``, so the session's stdout is block-buffered and its log file can stay
+    empty for the whole session: the session recorded as
+    ``mechanoids-simulator-operator-1790714123`` still had a 0-byte log 2579 s in,
+    while it was working. Reading that silence as death released the lock 15 minutes
+    into a session whose budget was two hours, and only the paused watchdog kept a
+    second session from starting over the first. The lock is therefore the session's
+    claim for its whole ``max_session_seconds`` budget.
+
+    ``finished`` is the terminal record, when the session wrote one.
+
+    ``quiet_seconds`` applies to a session that opted into it by writing a heartbeat:
+    the supervisor calls that lock dead once the heartbeat stops, which is how a
+    crashed heartbeat session is recovered in minutes instead of at its budget.
     """
-    age = now - record.started_at
-    if age >= max_session_seconds:
+    if finished:
         return False
-    if record.session_log is None:
-        return age < quiet_seconds
-    last_write = log_mtime(record.session_log)
-    if last_write is None:
-        return age < quiet_seconds
-    return (now - last_write) < quiet_seconds
+    if now - record.started_at >= max_session_seconds:
+        return False
+    if record.heartbeat_at is None:
+        return True
+    return (now - record.heartbeat_at) < quiet_seconds
+
+
+def heartbeat_lock(path: Path, *, session_log: Path, now: float) -> bool:
+    """Refresh the heartbeat of the lock that owns ``session_log``.
+
+    Keyed on the session's own log rather than its project name: a session whose
+    lock was replaced by a newer one must not be able to keep its replacement alive.
+    """
+    record = read_lock(path)
+    if record is None or record.session_log is None:
+        return False
+    if not _same_path(record.session_log, session_log):
+        return False
+    write_lock(replace(record, heartbeat_at=int(now)))
+    return True
 
 
 def build_session_argv(plan: OperatorPlan, *, hermes: str = "hermes") -> tuple[str, ...]:
@@ -547,14 +646,26 @@ def supervise(
     max_session_seconds: int = DEFAULT_MAX_SESSION_SECONDS,
     now: Callable[[], float] = time.time,
     spawn: Callable[[Sequence[str], Path], int] | None = None,
-    log_mtime: Callable[[Path], float | None] | None = None,
     dry_run: bool = False,
+    force: bool = False,
 ) -> SuperviseResult:
-    """Assess one external watchdog loop and start a repair session if it stopped."""
+    """Assess one external watchdog loop and start a repair session if it stopped.
+
+    ``force`` starts the session whatever the verdict says, which is how the engine's
+    owner assigns a task the watchdog did not raise. Everything else, the locks and
+    the spawn, is the identical path, so an assigned session is recorded exactly like
+    a watchdog one.
+
+    Two locks gate a launch. ``<project>.operator.lock.json`` is the project's own
+    idempotency record: while a session holds it, later ticks for that project launch
+    nothing. ``engine.operator.lock.json``, one directory up, is the engine's
+    serialization gate: the operator edits one repository and pauses one loop, so two
+    rigs failing at once must not put two sessions on the same checkout. Neither is
+    waited on, so a tick that loses the race declines to launch and cannot deadlock.
+    """
     if not plan.prompt.is_file():
         raise FactoryError(f"operator session prompt is missing: {plan.prompt}")
     spawn_session = default_spawn if spawn is None else spawn
-    read_log_mtime = _default_log_mtime if log_mtime is None else log_mtime
     observed = now()
     state = client.cron_state(cron_profile)
     verdict = assess_engine(
@@ -566,15 +677,16 @@ def supervise(
         now=observed,
     )
     lock_path = plan.lock_path()
-    existing = read_lock(lock_path)
+    engine_lock_path = plan.engine_lock_path()
     replaced = False
+    existing = read_lock(lock_path)
     if existing is not None:
         if lock_is_live(
             existing,
             now=observed,
             quiet_seconds=quiet_seconds,
             max_session_seconds=max_session_seconds,
-            log_mtime=read_log_mtime,
+            finished=session_finished(existing),
         ):
             return SuperviseResult(
                 verdict,
@@ -583,26 +695,78 @@ def supervise(
                 lock_path,
                 existing.session_log,
                 (),
+                False,
+                engine_lock_path,
+                plan.project,
             )
         replaced = release_lock(lock_path)
-    if not verdict.launches():
-        return SuperviseResult(verdict, False, verdict.verdict, lock_path, None, (), replaced)
+    holder = read_lock(engine_lock_path)
+    if holder is not None:
+        if lock_is_live(
+            holder,
+            now=observed,
+            quiet_seconds=quiet_seconds,
+            max_session_seconds=max_session_seconds,
+            finished=session_finished(holder),
+        ):
+            return SuperviseResult(
+                verdict,
+                False,
+                "engine_session_already_running",
+                lock_path,
+                holder.session_log,
+                (),
+                replaced,
+                engine_lock_path,
+                holder.project,
+            )
+        release_lock(engine_lock_path)
+    if not force and not verdict.launches():
+        return SuperviseResult(
+            verdict, False, verdict.verdict, lock_path, None, (), replaced, engine_lock_path
+        )
     argv = build_session_argv(plan, hermes=hermes)
     if dry_run:
-        return SuperviseResult(verdict, False, "dry_run", lock_path, None, argv, replaced)
+        return SuperviseResult(
+            verdict, False, "dry_run", lock_path, None, argv, replaced, engine_lock_path
+        )
     started_at = int(observed)
     log_path = plan.session_log_path(started_at)
+    incident_ids = _open_incident_ids(verdict)
+    if not acquire_lock(
+        LockRecord(
+            path=engine_lock_path,
+            project=plan.project,
+            started_at=started_at,
+            incident_ids=incident_ids,
+            session_log=log_path,
+        )
+    ):
+        return SuperviseResult(
+            verdict,
+            False,
+            "engine_session_already_running",
+            lock_path,
+            None,
+            (),
+            replaced,
+            engine_lock_path,
+            None,
+        )
     spawn_session(argv, log_path)
     write_lock(
         LockRecord(
             path=lock_path,
             project=plan.project,
             started_at=started_at,
-            incident_ids=_open_incident_ids(verdict),
+            incident_ids=incident_ids,
             session_log=log_path,
         )
     )
-    return SuperviseResult(verdict, True, "launched_operator_session", lock_path, log_path, argv, replaced)
+    reason = "launched_assigned_session" if force else "launched_operator_session"
+    return SuperviseResult(
+        verdict, True, reason, lock_path, log_path, argv, replaced, engine_lock_path
+    )
 
 
 def verdict_payload(verdict: EngineVerdict) -> dict[str, Any]:
@@ -634,6 +798,10 @@ def supervise_payload(result: SuperviseResult) -> dict[str, Any]:
             "launched": result.launched,
             "reason": result.reason,
             "lock": str(result.lock_path),
+            "engine_lock": (
+                None if result.engine_lock_path is None else str(result.engine_lock_path)
+            ),
+            "engine_holder": result.engine_holder,
             "log": None if result.log_path is None else str(result.log_path),
             "command": list(result.command),
             "replaced_stale_lock": result.replaced_stale_lock,

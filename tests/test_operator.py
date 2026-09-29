@@ -412,47 +412,93 @@ def test_session_argv_matches_the_documented_invocation(tmp_path: Path):
     )
 
 
-def test_lock_is_live_inside_the_quiet_window(tmp_path: Path):
+def test_a_silent_session_stays_live_inside_its_own_budget(tmp_path: Path):
+    """``build_session_argv`` passes ``-Q``, so the session's stdout is buffered.
+
+    The log of the mistaken session recorded as
+    ``mechanoids-simulator-operator-1790714123`` was still 0 bytes 2579 s in, while
+    that session was working. Reading that silence as death released the lock
+    15 minutes into a session whose budget was two hours.
+    """
     record = operator.LockRecord(
-        path=tmp_path / "demo.lock.json",
+        path=tmp_path / "demo.operator.lock.json",
         project="demo",
-        started_at=int(NOW) - 60,
+        started_at=int(NOW) - 3600,
         incident_ids=("inc-1",),
         session_log=tmp_path / "session.log",
     )
 
-    assert lock_is_live(
-        record,
-        now=NOW,
-        quiet_seconds=900,
-        max_session_seconds=7200,
-        log_mtime=lambda path: NOW - 30,
+    assert lock_is_live(record, now=NOW, quiet_seconds=900, max_session_seconds=7200)
+
+
+def test_a_zero_byte_session_log_is_not_a_death_signal(tmp_path: Path):
+    log = tmp_path / "session.log"
+    log.write_text("", encoding="utf-8")
+    record = operator.LockRecord(
+        path=tmp_path / "demo.operator.lock.json",
+        project="demo",
+        started_at=int(NOW) - 1800,
+        incident_ids=(),
+        session_log=log,
     )
-    assert not lock_is_live(
-        record,
-        now=NOW,
-        quiet_seconds=900,
-        max_session_seconds=7200,
-        log_mtime=lambda path: NOW - 1000,
+
+    assert lock_is_live(record, now=NOW, quiet_seconds=900, max_session_seconds=7200)
+
+
+def test_a_fresh_heartbeat_keeps_the_lock_live(tmp_path: Path):
+    record = operator.LockRecord(
+        path=tmp_path / "demo.operator.lock.json",
+        project="demo",
+        started_at=int(NOW) - 3600,
+        incident_ids=(),
+        session_log=tmp_path / "session.log",
+        heartbeat_at=int(NOW) - 60,
     )
+
+    assert lock_is_live(record, now=NOW, quiet_seconds=900, max_session_seconds=7200)
+
+
+def test_a_stopped_heartbeat_releases_the_lock_inside_the_budget(tmp_path: Path):
+    """The quiet window is opt-in: a session that heartbeats accepts the risk."""
+    record = operator.LockRecord(
+        path=tmp_path / "demo.operator.lock.json",
+        project="demo",
+        started_at=int(NOW) - 3600,
+        incident_ids=(),
+        session_log=tmp_path / "session.log",
+        heartbeat_at=int(NOW) - 1000,
+    )
+
+    assert not lock_is_live(record, now=NOW, quiet_seconds=900, max_session_seconds=7200)
 
 
 def test_lock_is_not_live_beyond_the_maximum_session_age(tmp_path: Path):
     record = operator.LockRecord(
-        path=tmp_path / "demo.lock.json",
+        path=tmp_path / "demo.operator.lock.json",
         project="demo",
         started_at=int(NOW) - 9000,
         incident_ids=(),
         session_log=tmp_path / "session.log",
+        heartbeat_at=int(NOW) - 1,
     )
 
-    assert not lock_is_live(
-        record,
-        now=NOW,
-        quiet_seconds=900,
-        max_session_seconds=7200,
-        log_mtime=lambda path: NOW - 1,
+    assert not lock_is_live(record, now=NOW, quiet_seconds=900, max_session_seconds=7200)
+
+
+def test_lock_round_trips_the_heartbeat(tmp_path: Path):
+    path = tmp_path / "demo.operator.lock.json"
+    record = operator.LockRecord(
+        path=path,
+        project="demo",
+        started_at=int(NOW),
+        incident_ids=(),
+        session_log=tmp_path / "session.log",
+        heartbeat_at=int(NOW),
     )
+
+    operator.write_lock(record)
+
+    assert read_lock(path) == record
 
 
 def test_lock_round_trips_through_the_lock_file(tmp_path: Path):
@@ -506,7 +552,6 @@ def test_supervise_launches_one_session_and_records_a_live_lock(tmp_path: Path):
         spec,
         now=lambda: NOW,
         spawn=supervisor.spawn,
-        log_mtime=lambda path: NOW,
     )
 
     assert result.launched is True
@@ -530,7 +575,6 @@ def test_supervise_suppresses_a_second_session_while_one_is_live(tmp_path: Path)
         spec,
         now=lambda: NOW,
         spawn=supervisor.spawn,
-        log_mtime=lambda path: NOW,
     )
 
     second = supervise(
@@ -538,7 +582,6 @@ def test_supervise_suppresses_a_second_session_while_one_is_live(tmp_path: Path)
         spec,
         now=lambda: NOW,
         spawn=supervisor.spawn,
-        log_mtime=lambda path: NOW,
     )
 
     assert first.launched is True
@@ -548,6 +591,34 @@ def test_supervise_suppresses_a_second_session_while_one_is_live(tmp_path: Path)
 
 
 def test_supervise_replaces_a_lock_left_by_a_dead_session(tmp_path: Path):
+    supervisor = FakeSupervisor(
+        cron_state([job_payload(failure_streak=4, last_status="failed")])
+    )
+    spec = plan(tmp_path)
+    orphan = operator.LockRecord(
+        path=spec.lock_path(),
+        project="demo",
+        started_at=int(NOW) - 9000,
+        incident_ids=(),
+        session_log=tmp_path / "logs" / "orphan.log",
+    )
+    operator.write_lock(orphan)
+
+    result = supervise(
+        supervisor,
+        spec,
+        now=lambda: NOW,
+        spawn=supervisor.spawn,
+    )
+
+    assert result.launched is True
+    assert result.reason == "launched_operator_session"
+    assert result.replaced_stale_lock is True
+    assert len(supervisor.spawns) == 1
+
+
+def test_supervise_never_stacks_on_a_lock_still_inside_its_budget(tmp_path: Path):
+    """The lock is the session's claim for its whole budget, silence included."""
     supervisor = FakeSupervisor(
         cron_state([job_payload(failure_streak=4, last_status="failed")])
     )
@@ -566,13 +637,165 @@ def test_supervise_replaces_a_lock_left_by_a_dead_session(tmp_path: Path):
         spec,
         now=lambda: NOW,
         spawn=supervisor.spawn,
-        log_mtime=lambda path: NOW - 5000,
+    )
+
+    assert result.launched is False
+    assert result.reason == "operator_session_already_running"
+    assert supervisor.spawns == []
+
+
+def test_supervise_replaces_a_lock_whose_heartbeat_stopped(tmp_path: Path):
+    supervisor = FakeSupervisor(
+        cron_state([job_payload(failure_streak=4, last_status="failed")])
+    )
+    spec = plan(tmp_path)
+    orphan = operator.LockRecord(
+        path=spec.lock_path(),
+        project="demo",
+        started_at=int(NOW) - 3600,
+        incident_ids=(),
+        session_log=tmp_path / "logs" / "orphan.log",
+        heartbeat_at=int(NOW) - 5000,
+    )
+    operator.write_lock(orphan)
+
+    result = supervise(
+        supervisor,
+        spec,
+        now=lambda: NOW,
+        spawn=supervisor.spawn,
     )
 
     assert result.launched is True
-    assert result.reason == "launched_operator_session"
     assert result.replaced_stale_lock is True
+
+
+def test_supervise_releases_a_lock_whose_session_wrote_its_record(tmp_path: Path):
+    """The record is the one terminal signal the session contract requires.
+
+    Without it a finished session keeps the circuit down until its whole budget
+    expires, so the next tick must read the record the session already wrote.
+    """
+    supervisor = FakeSupervisor(
+        cron_state([job_payload(failure_streak=4, last_status="failed")])
+    )
+    spec = plan(tmp_path)
+    session_log = tmp_path / "logs" / "demo-operator-100.log"
+    (tmp_path / "locks").mkdir(parents=True, exist_ok=True)
+    operator.write_lock(
+        operator.LockRecord(
+            path=spec.lock_path(),
+            project="demo",
+            started_at=int(NOW) - 300,
+            incident_ids=(),
+            session_log=session_log,
+        )
+    )
+    records = tmp_path / "locks" / "records"
+    records.mkdir(parents=True, exist_ok=True)
+    (records / "demo-operator-100.json").write_text("{}", encoding="utf-8")
+    lock = operator.read_lock(spec.lock_path())
+    assert lock is not None
+    assert operator.session_finished(lock) is True
+
+    result = supervise(supervisor, spec, now=lambda: NOW, spawn=supervisor.spawn)
+
+    assert result.launched is True
+    assert result.replaced_stale_lock is True
+
+
+def test_a_lock_without_a_terminal_record_still_holds_its_budget(tmp_path: Path):
+    supervisor = FakeSupervisor(
+        cron_state([job_payload(failure_streak=4, last_status="failed")])
+    )
+    spec = plan(tmp_path)
+    operator.write_lock(
+        operator.LockRecord(
+            path=spec.lock_path(),
+            project="demo",
+            started_at=int(NOW) - 300,
+            incident_ids=(),
+            session_log=tmp_path / "logs" / "demo-operator-100.log",
+        )
+    )
+
+    result = supervise(supervisor, spec, now=lambda: NOW, spawn=supervisor.spawn)
+
+    assert result.launched is False
+    assert result.reason == "operator_session_already_running"
+
+
+def test_an_engine_lock_held_by_another_rig_blocks_a_second_session(tmp_path: Path):
+    """One engine, several rigs: a session edits one repository and pauses one loop.
+
+    Two rigs failing at once must not put two sessions on the same checkout, so
+    every project's tick consults one engine-scoped lock before it spawns.
+    """
+    root = tmp_path / "operator"
+    supervisor = FakeSupervisor(
+        cron_state([job_payload(failure_streak=4, last_status="failed")])
+    )
+    first = plan(
+        tmp_path,
+        project="demo",
+        log_directory=root / "demo" / "logs",
+        lock_directory=root / "demo",
+    )
+    second = plan(
+        tmp_path,
+        project="other",
+        log_directory=root / "other" / "logs",
+        lock_directory=root / "other",
+    )
+
+    launched = supervise(supervisor, first, now=lambda: NOW, spawn=supervisor.spawn)
+    blocked = supervise(supervisor, second, now=lambda: NOW, spawn=supervisor.spawn)
+
+    assert launched.launched is True
+    assert blocked.launched is False
+    assert blocked.reason == "engine_session_already_running"
+    assert blocked.engine_holder == "demo"
+    assert blocked.engine_lock_path == root / "engine.operator.lock.json"
     assert len(supervisor.spawns) == 1
+    assert not second.lock_path().exists()
+
+
+def test_the_engine_lock_is_replaced_once_its_session_is_gone(tmp_path: Path):
+    root = tmp_path / "operator"
+    supervisor = FakeSupervisor(
+        cron_state(
+            [
+                job_payload(
+                    "job-2",
+                    "Hermes Factory reconcile: other",
+                    workdir=r"F:\other",
+                    failure_streak=4,
+                    last_status="failed",
+                )
+            ]
+        )
+    )
+    engine_lock = root / "engine.operator.lock.json"
+    operator.write_lock(
+        operator.LockRecord(
+            path=engine_lock,
+            project="demo",
+            started_at=int(NOW) - 9000,
+            incident_ids=(),
+            session_log=root / "demo" / "logs" / "orphan.log",
+        )
+    )
+    second = plan(
+        tmp_path,
+        project="other",
+        log_directory=root / "other" / "logs",
+        lock_directory=root / "other",
+    )
+
+    result = supervise(supervisor, second, now=lambda: NOW, spawn=supervisor.spawn)
+
+    assert result.launched is True
+    assert read_lock(engine_lock).project == "other"
 
 
 @pytest.mark.parametrize(
@@ -593,7 +816,6 @@ def test_supervise_never_launches_unless_the_engine_stopped(tmp_path: Path, stat
         spec,
         now=lambda: NOW,
         spawn=supervisor.spawn,
-        log_mtime=lambda path: NOW,
     )
 
     assert result.launched is False
@@ -612,7 +834,6 @@ def test_supervise_dry_run_never_spawns(tmp_path: Path):
         spec,
         now=lambda: NOW,
         spawn=supervisor.spawn,
-        log_mtime=lambda path: NOW,
         dry_run=True,
     )
 
@@ -634,7 +855,6 @@ def test_supervise_requires_an_existing_prompt_file(tmp_path: Path):
             spec,
             now=lambda: NOW,
             spawn=supervisor.spawn,
-            log_mtime=lambda path: NOW,
         )
 
 
@@ -689,8 +909,149 @@ def test_cli_supervise_dry_run_reports_without_spawning(tmp_path: Path, monkeypa
     assert payload["command"][:4] == ["hermes", "-p", "factory-operator", "chat"]
 
 
-# --- client ----------------------------------------------------------------
+def test_cli_assign_launches_the_session_the_watchdog_would_not_start(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """An owner-assigned task is callable, and is recorded like a watchdog one."""
+    spawned = []
 
+    def fake_spawn(argv, log_path):
+        spawned.append((tuple(argv), log_path))
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("session started", encoding="utf-8")
+        return 4242
+
+    monkeypatch.setattr("hermes_factory.operator.default_spawn", fake_spawn)
+    prompt = tmp_path / "OPERATOR-SESSION-PROMPT.md"
+    prompt.write_text("repair the operator circuit", encoding="utf-8")
+    lock_directory = tmp_path / "operator" / "demo"
+    log_directory = lock_directory / "logs"
+    healthy = FakeSupervisor(
+        cron_state([job_payload(last_status="ok", failure_streak=0)]),
+        cron_directory=tmp_path / "cron",
+    )
+
+    code = main(
+        [
+            "operator",
+            "assign",
+            "--project",
+            "demo",
+            "--prompt",
+            str(prompt),
+            "--repo",
+            str(tmp_path / "HermesFactory"),
+            "--lock-directory",
+            str(lock_directory),
+            "--log-directory",
+            str(log_directory),
+            "--json",
+        ],
+        client_factory=lambda executable: healthy,
+    )
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verdict"] == "healthy"
+    assert payload["launched"] is True
+    assert payload["reason"] == "launched_assigned_session"
+    assert len(spawned) == 1
+    assert read_lock(lock_directory / "demo.operator.lock.json") is not None
+
+    # The next tick must not stack a second session on the assigned one.
+    stopping = FakeSupervisor(
+        cron_state([job_payload(failure_streak=4, last_status="failed")]),
+        cron_directory=tmp_path / "cron",
+    )
+
+    code = main(
+        [
+            "operator",
+            "supervise",
+            "--project",
+            "demo",
+            "--prompt",
+            str(prompt),
+            "--repo",
+            str(tmp_path / "HermesFactory"),
+            "--lock-directory",
+            str(lock_directory),
+            "--log-directory",
+            str(log_directory),
+            "--json",
+        ],
+        client_factory=lambda executable: stopping,
+    )
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verdict"] == "stopped"
+    assert payload["launched"] is False
+    assert payload["reason"] == "operator_session_already_running"
+    assert len(spawned) == 1
+
+
+def test_cli_heartbeat_refreshes_only_the_lock_that_owns_the_session_log(
+    tmp_path: Path, capsys
+):
+    client = FakeSupervisor(cron_state([]), cron_directory=tmp_path / "cron")
+    lock_directory = tmp_path / "operator" / "demo"
+    path = lock_directory / "demo.operator.lock.json"
+    own_log = lock_directory / "logs" / "demo-operator-100.log"
+    operator.write_lock(
+        operator.LockRecord(
+            path=path,
+            project="demo",
+            started_at=100,
+            incident_ids=(),
+            session_log=own_log,
+        )
+    )
+
+    code = main(
+        [
+            "operator",
+            "heartbeat",
+            "--project",
+            "demo",
+            "--log",
+            str(own_log),
+            "--lock-directory",
+            str(lock_directory),
+            "--json",
+        ],
+        client_factory=lambda executable: client,
+    )
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["heartbeat"] is True
+    refreshed = read_lock(path)
+    assert refreshed is not None
+    assert refreshed.heartbeat_at is not None
+    assert refreshed.session_log == own_log
+
+    # A session whose lock was replaced cannot keep its replacement alive.
+    code = main(
+        [
+            "operator",
+            "heartbeat",
+            "--project",
+            "demo",
+            "--log",
+            str(lock_directory / "logs" / "demo-operator-999.log"),
+            "--lock-directory",
+            str(lock_directory),
+            "--json",
+        ],
+        client_factory=lambda executable: client,
+    )
+
+    assert code == 2
+    assert "no operator lock" in capsys.readouterr().err
+
+
+# --- client ----------------------------------------------------------------
 
 def test_client_reads_the_profile_cron_state(tmp_path: Path):
     profile_directory = tmp_path / "profile"
@@ -719,7 +1080,7 @@ def test_client_reads_the_profile_cron_state(tmp_path: Path):
     connection.close()
 
     def fake_run(argv, **kwargs):
-        assert argv == ["hermes", "config", "path"]
+        assert argv == ["hermes", "-p", "default", "config", "path"]
         return CompletedProcess(argv, 0, str(profile_directory / "config.yaml"), "")
 
     state = HermesClient(executable="hermes", runner=fake_run).cron_state("default")

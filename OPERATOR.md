@@ -37,6 +37,13 @@ activity, and a `running` execution keeps the loop alive on its own.
 
 `hermes-factory operator assess` classifies the loop from that evidence alone.
 
+The same command line can be driven from the other direction. `hermes-factory operator assign`
+starts a session whatever the verdict says, for a task the engine's owner names instead of one the
+watchdog raised. It takes the same locks through the same code path, so an assigned session is
+recorded exactly like a watchdog one and the next tick does not stack a second session on it. Its
+record carries `trigger: {"kind": "owner_assigned", "task": "..."}` where a watchdog session carries
+the verdict that raised it.
+
 | Verdict | Condition | Launches a session |
 | --- | --- | --- |
 | `healthy` | every bound job below the streak threshold, last status not `failed`, last run inside the staleness window | no |
@@ -83,17 +90,37 @@ a fresh board, and report the re-run cost.
 ## Artifacts
 
 - lock: `<operator root>/<project>.operator.lock.json`, holding the start time, the incident ids,
-  and the session log path. Process liveness is deliberately not probed: on Windows
+  the session log path, and the heartbeat. Process liveness is deliberately not probed: on Windows
   `os.kill(pid, 0)` raises for a live process and returns quietly for a dead one, so it cannot
-  distinguish them. The lock is live while the session's log keeps being written inside the
-  quiet window and the lock age is inside the maximum session age.
+  distinguish them. The session's own log is not a liveness signal either. `build_session_argv`
+  passes `-Q`, so the session's stdout is block-buffered and its log stays 0 bytes for the whole
+  session: the live session `mechanoids-simulator-operator-1790714123` still had a 0-byte log with an
+  unchanged mtime 2579 seconds in, while it was working. Reading that silence as death released the
+  lock 15 minutes into a session whose budget was two hours. A silent session is therefore trusted
+  for its whole `--max-session-seconds` budget.
+- heartbeat: the quiet window is opt-in. A session that runs
+  `hermes-factory operator heartbeat --project <slug> --log <its own session log>` accepts that a
+  heartbeat which stops is read as a dead session after `--quiet-seconds`, so a crashed session is
+  recovered in minutes instead of at its budget. The refresh is keyed on the session log path, so a
+  session whose lock was replaced cannot keep its replacement alive.
+- terminal record: `records/<stem of the session log>.json` ends the claim as soon as the session
+  writes it, which is the last step the session contract requires. A session that finishes releases
+  the circuit immediately, and only a session that dies without a record holds it to its budget.
+- engine lock: `<operator root>/engine.operator.lock.json`, one directory above the per-project
+  locks, because the operator edits one repository and pauses one loop: two rigs failing at once must
+  not put two sessions on the same checkout. The per-project locks stay the idempotency records of
+  their own project, and the engine lock is the serialization gate. It is created exclusively, so
+  exactly one tick can win.
 - log: `<operator root>/logs/<project>-operator-<started_at>.log`, the session's own output.
 - record: `<operator root>/records/<same stem>.json`, written by the session before it exits.
 
 `hermes-factory operator supervise` is idempotent per lock: while a session owns the lock, later
-ticks report `operator_session_already_running` and launch nothing. A lock whose session log
-stopped changing is released and a fresh session starts, which is how a crashed session is
-recovered without a human.
+ticks report `operator_session_already_running` and launch nothing. A tick whose own project has no
+live lock still launches nothing while another project's session owns the engine lock, and reports
+`engine_session_already_running` with the holder's project. Neither lock is ever waited on, so a tick
+that loses the race declines instead of blocking. A lock is released when the session writes its
+record, when its heartbeat has stopped for `--quiet-seconds`, or when it is past
+`--max-session-seconds`, which is how a finished or crashed session is recovered without a human.
 
 ## Why this is not a rig policy
 
@@ -112,11 +139,25 @@ hermes-factory operator supervise --project <slug> --prompt <file> --repo <path>
     [--budget <n>] [--log-directory <path>] [--lock-directory <path>]
     [--threshold <n>] [--stale-after <seconds>] [--quiet-seconds <seconds>]
     [--max-session-seconds <seconds>] [--dry-run] [--json]
+hermes-factory operator assign --project <slug> --prompt <file> --repo <path>
+    [--job <job-id>]... [--profile <cron-profile>] [--operator-profile <profile>]
+    [--budget <n>] [--log-directory <path>] [--lock-directory <path>]
+    [--threshold <n>] [--stale-after <seconds>] [--quiet-seconds <seconds>]
+    [--max-session-seconds <seconds>] [--dry-run] [--json]
+hermes-factory operator heartbeat --project <slug> --log <session log>
+    [--profile <cron-profile>] [--lock-directory <path>] [--json]
 ```
 
-Both commands exit zero for every verdict, including `stopped`: a watchdog that fails when it
-finds a failure would raise a cron incident for itself on every tick. They exit non-zero only
-when the evidence itself is unreadable, which is a real fault worth an incident.
+`assign` is `supervise` with the verdict ignored: it starts the session the engine's owner named,
+reports `launched_assigned_session`, and writes the same locks, so the next watchdog tick finds the
+session and launches nothing. It still reads the cron evidence, so an unreadable evidence source is
+reported rather than skipped, and `--dry-run` prints the command without spawning or locking.
+`heartbeat` refreshes the lock that owns the named session log and exits non-zero when no lock owns
+it, which means that session no longer owns the circuit.
+
+Both `assess` and `supervise` exit zero for every verdict, including `stopped`: a watchdog that
+fails when it finds a failure would raise a cron incident for itself on every tick. They exit
+non-zero only when the evidence itself is unreadable, which is a real fault worth an incident.
 
 `supervise` never mutates a board and never resumes a job. Resuming is the session's own step,
 after it has a verified fix, which is what keeps "who restarted the loop" answerable.

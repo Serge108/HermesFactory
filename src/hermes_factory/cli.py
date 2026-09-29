@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -25,6 +26,9 @@ from hermes_factory.operator import (
     DEFAULT_STALE_AFTER_SECONDS,
     OperatorPlan,
     assess_engine,
+    engine_lock_path,
+    heartbeat_lock,
+    project_lock_name,
     supervise,
     supervise_payload,
     verdict_payload,
@@ -91,28 +95,53 @@ def build_parser() -> argparse.ArgumentParser:
     assess = operator_subparsers.add_parser("assess")
     _add_operator_arguments(assess)
     assess.set_defaults(handler_key="operator-assess")
-    operator_supervise = operator_subparsers.add_parser("supervise")
-    _add_operator_arguments(operator_supervise)
-    operator_supervise.add_argument("--prompt", type=Path, required=True)
-    operator_supervise.add_argument("--repo", type=Path, required=True)
-    operator_supervise.add_argument("--operator-profile", default="factory-operator")
-    operator_supervise.add_argument(
+    for name, key in (("supervise", "operator-supervise"), ("assign", "operator-assign")):
+        session_parser = operator_subparsers.add_parser(
+            name,
+            help=(
+                "assess the loop and start a repair session if it stopped"
+                if name == "supervise"
+                else "start a repair session the owner assigned, whatever the verdict"
+            ),
+        )
+        _add_operator_arguments(session_parser)
+        _add_session_arguments(session_parser)
+        session_parser.set_defaults(handler_key=key)
+    operator_heartbeat = operator_subparsers.add_parser(
+        "heartbeat",
+        help="refresh the lock heartbeat that opts a session into the quiet window",
+    )
+    operator_heartbeat.add_argument("--project", required=True)
+    operator_heartbeat.add_argument(
+        "--log", type=Path, required=True, help="this session's own operator log file"
+    )
+    operator_heartbeat.add_argument("--profile", default="default")
+    operator_heartbeat.add_argument("--lock-directory", type=Path)
+    operator_heartbeat.add_argument("--json", action="store_true")
+    operator_heartbeat.add_argument("--hermes", default="hermes")
+    operator_heartbeat.set_defaults(handler_key="operator-heartbeat")
+    return parser
+
+
+def _add_session_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--prompt", type=Path, required=True)
+    parser.add_argument("--repo", type=Path, required=True)
+    parser.add_argument("--operator-profile", default="factory-operator")
+    parser.add_argument(
         "--budget",
         type=int,
         default=DEFAULT_SESSION_BUDGET,
         help="session wall-clock budget in seconds (hermes chat --run-budget)",
     )
-    operator_supervise.add_argument("--log-directory", type=Path)
-    operator_supervise.add_argument("--lock-directory", type=Path)
-    operator_supervise.add_argument(
+    parser.add_argument("--log-directory", type=Path)
+    parser.add_argument("--lock-directory", type=Path)
+    parser.add_argument(
         "--quiet-seconds", type=int, default=DEFAULT_LOCK_QUIET_SECONDS
     )
-    operator_supervise.add_argument(
+    parser.add_argument(
         "--max-session-seconds", type=int, default=DEFAULT_MAX_SESSION_SECONDS
     )
-    operator_supervise.add_argument("--dry-run", action="store_true")
-    operator_supervise.set_defaults(handler_key="operator-supervise")
-    return parser
+    parser.add_argument("--dry-run", action="store_true")
 
 
 def _add_operator_arguments(parser: argparse.ArgumentParser) -> None:
@@ -543,8 +572,27 @@ def handle_operator_assess(args: argparse.Namespace, client_factory: ClientFacto
 def handle_operator_supervise(
     args: argparse.Namespace, client_factory: ClientFactory
 ) -> int:
+    return _run_operator_session(args, client_factory, force=False)
+
+
+def handle_operator_assign(
+    args: argparse.Namespace, client_factory: ClientFactory
+) -> int:
+    """Start the session the engine's owner assigned, whatever the verdict says."""
+    return _run_operator_session(args, client_factory, force=True)
+
+
+def _operator_root(client: HermesClient, args: argparse.Namespace) -> Path:
+    if args.lock_directory is not None:
+        return args.lock_directory
+    return client.cron_directory(args.profile).parent / "operator" / args.project
+
+
+def _run_operator_session(
+    args: argparse.Namespace, client_factory: ClientFactory, *, force: bool
+) -> int:
     client = client_factory(args.hermes)
-    operator_root = client.cron_directory(args.profile).parent / "operator" / args.project
+    operator_root = _operator_root(client, args)
     plan = OperatorPlan(
         project=args.project,
         profile=args.operator_profile,
@@ -552,7 +600,7 @@ def handle_operator_supervise(
         repo=args.repo,
         budget=args.budget,
         log_directory=args.log_directory or operator_root / "logs",
-        lock_directory=args.lock_directory or operator_root,
+        lock_directory=operator_root,
     )
     result = supervise(
         client,
@@ -565,16 +613,56 @@ def handle_operator_supervise(
         quiet_seconds=args.quiet_seconds,
         max_session_seconds=args.max_session_seconds,
         dry_run=args.dry_run,
+        force=force,
     )
     if args.json:
         print(json.dumps(supervise_payload(result), indent=2))
     else:
         print(f"{result.verdict.verdict}: {result.reason}")
+        if result.engine_holder:
+            print(f"engine lock held by: {result.engine_holder}")
         if result.command:
             print("command: " + " ".join(result.command))
         if result.log_path is not None:
             print(f"log: {result.log_path}")
         print(f"lock: {result.lock_path}")
+    return 0
+
+
+def handle_operator_heartbeat(
+    args: argparse.Namespace, client_factory: ClientFactory
+) -> int:
+    """Refresh the heartbeat of the lock whose session log is the one named.
+
+    A session that heartbeats opts into the quiet window: the supervisor reads a
+    stopped heartbeat as a dead session, so the circuit recovers in minutes instead
+    of waiting out the whole session budget. The engine lock of the same session is
+    refreshed with it, so both expire together.
+    """
+    client = client_factory(args.hermes)
+    lock_directory = _operator_root(client, args)
+    observed = time.time()
+    lock = lock_directory / project_lock_name(args.project)
+    if not heartbeat_lock(lock, session_log=args.log, now=observed):
+        raise FactoryError(
+            f"no operator lock for {args.project} owns {args.log}: "
+            "this session no longer owns the circuit"
+        )
+    engine = engine_lock_path(lock_directory)
+    payload = {
+        "heartbeat": True,
+        "project": args.project,
+        "lock": str(lock),
+        "engine_lock": str(engine),
+        "engine_heartbeat": heartbeat_lock(
+            engine, session_log=args.log, now=observed
+        ),
+        "heartbeat_at": int(observed),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"heartbeat {int(observed)} for {args.project} ({lock})")
     return 0
 
 
@@ -590,6 +678,8 @@ HANDLERS: dict[str, Callable[[argparse.Namespace, ClientFactory], int]] = {
     "stall-taxonomy": handle_stall_taxonomy,
     "operator-assess": handle_operator_assess,
     "operator-supervise": handle_operator_supervise,
+    "operator-assign": handle_operator_assign,
+    "operator-heartbeat": handle_operator_heartbeat,
 }
 
 

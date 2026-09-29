@@ -453,7 +453,7 @@ def test_run_wraps_os_error():
 @pytest.mark.parametrize(
     ("profile", "expected_argv"),
     [
-        ("default", ["hermes", "config", "path"]),
+        ("default", ["hermes", "-p", "default", "config", "path"]),
         ("Builder Profile", ["hermes", "-p", "Builder Profile", "config", "path"]),
     ],
 )
@@ -514,3 +514,49 @@ def test_profile_exists_propagates_os_error_as_hermes_command_error():
         HermesClient(runner=fake_run).profile_exists("builder")
 
     assert isinstance(exc_info.value.__cause__, OSError)
+
+
+@pytest.mark.parametrize("profile", ["default", "factory-operator"])
+def test_cron_directory_always_names_the_profile_it_was_asked_for(profile, tmp_path: Path):
+    """``hermes config path`` without ``-p`` resolves the ambient ``HERMES_HOME``.
+
+    A session launched with ``-p <other profile>`` inherits that profile's
+    ``HERMES_HOME``, so the caller's named profile and the profile actually read
+    are different. The named profile must always be passed explicitly.
+    """
+    calls = []
+    (tmp_path / "cron").mkdir()
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return CompletedProcess(argv, 0, str(tmp_path / "config.yaml"), "")
+
+    directory = HermesClient(runner=fake_run).cron_directory(profile)
+
+    assert calls == [["hermes", "-p", profile, "config", "path"]]
+    assert directory == tmp_path / "cron"
+
+
+def test_cron_directory_ignores_an_inherited_hermes_home(tmp_path: Path, monkeypatch):
+    """Verified installed-CLI behaviour: ``-p default`` outranks ``HERMES_HOME``.
+
+    Measured with the deployed Hermes:
+
+        HERMES_HOME=<factory-operator> hermes config path        -> ...\\profiles\\factory-operator\\config.yaml
+        HERMES_HOME=<factory-operator> hermes -p default config path -> ...\\AppData\\Local\\hermes\\config.yaml
+    """
+    named = tmp_path / "profiles" / "default"
+    inherited = tmp_path / "profiles" / "factory-operator"
+    for directory in (named, inherited):
+        (directory / "cron").mkdir(parents=True)
+        (directory / "config.yaml").write_text("key: value\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(inherited))
+
+    def fake_run(argv, **kwargs):
+        profile = argv[argv.index("-p") + 1] if "-p" in argv else "factory-operator"
+        root = named if profile == "default" else inherited
+        return CompletedProcess(argv, 0, str(root / "config.yaml"), "")
+
+    directory = HermesClient(runner=fake_run).cron_directory("default")
+
+    assert directory == named / "cron"

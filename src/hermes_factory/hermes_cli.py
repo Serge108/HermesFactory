@@ -245,14 +245,20 @@ class HermesClient:
             result["latest_incident_terminal"] = latest_incident_terminal
         return result
 
+    def _config_path_args(self, profile: str) -> list[str]:
+        """Name the profile explicitly, whatever the ambient environment says.
+
+        ``hermes config path`` without ``-p`` resolves ``HERMES_HOME``, so a session
+        launched with ``-p <other profile>`` inherits that profile and reads its cron
+        directory: the supervisor then sees no watchdog job for its own project and
+        reports ``unregistered`` instead of the job list. ``-p default`` was measured
+        to outrank ``HERMES_HOME`` on the installed CLI, so every profile is named.
+        """
+        return ["-p", profile, "config", "path"]
+
     def cron_directory(self, profile: str = "default") -> Path:
         """Resolve the profile's cron directory from its own configuration path."""
-        args = (
-            ["config", "path"]
-            if profile == "default"
-            else ["-p", profile, "config", "path"]
-        )
-        output = self.run(args).strip()
+        output = self.run(self._config_path_args(profile)).strip()
         if not output:
             raise HermesCommandError("Hermes returned no profile configuration path")
         directory = Path(output).parent / "cron"
@@ -323,11 +329,7 @@ class HermesClient:
         )
 
     def profile_exists(self, profile: str) -> bool:
-        args = (
-            ["config", "path"]
-            if profile == "default"
-            else ["-p", profile, "config", "path"]
-        )
+        args = self._config_path_args(profile)
         try:
             self.run(args)
         except HermesCommandError as exc:

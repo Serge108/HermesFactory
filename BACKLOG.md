@@ -134,9 +134,10 @@ from cron evidence and starts a bounded repair session. Recorded limits, not que
 - The trigger only sees jobs declared in the profile's cron. A fault inside a
   Kanban-dispatched worker that never fails the cron job stays task-level and belongs to the
   in-rig watchdog, so the two circuits can both be silent while a specific worker is broken.
-- Nothing reads an operator session's record back. A session that dies before writing
-  `<operator root>/records/<stem>.json` leaves only its log, and the lock is released by the
-  quiet window, not by a terminal record.
+- The circuit reads an operator session's record only as a terminal signal, never as a result: it
+  ends that session's lock, and whether the session fixed anything is a human question. A session
+  that dies before writing `<operator root>/records/<stem>.json` leaves only its log on the record
+  side, and its lock is released by the session budget or by a stopped heartbeat.
 - `hermes cron incidents` and `hermes cron runs` expose no `--json`, so the module reads
   `executions.db` directly. A schema change in that table makes the trigger read as an unreadable
   evidence source: it exits non-zero and raises a cron incident, but no dedicated class explains it.
@@ -144,7 +145,11 @@ from cron evidence and starts a bounded repair session. Recorded limits, not que
   profile are distinguished by `enabled`/`state`, but a scheduler that ticks while the gateway
   heartbeat is stale is not detected here; `hermes cron status` owns that signal.
 - An operator session that starts but cannot work (provider down, budget exhausted at once) holds
-  the lock for `--quiet-seconds` while the loop stays paused. The next tick after the quiet window
-  starts a fresh session, so the cost is bounded but the loop stays down for that window.
+  the lock for `--max-session-seconds` (two hours by default) while the loop stays paused, unless it
+  heartbeats. The quiet window is opt-in because a session's own log is buffered and silent, and a
+  silent lock must not be read as a dead one; the cost is therefore bounded by the session budget.
+- The engine lock is a record, not a handle: it is released by the owning session's terminal record,
+  its stopped heartbeat, or the session budget, but a session that dies without any of those leaves a
+  second rig waiting for that lock to age out before its own session can start.
 - The `unregistered` verdict is only made loud by the observer script, not by the Factory, so a
   supervisor launched without its observer reports `unregistered` and exits zero.

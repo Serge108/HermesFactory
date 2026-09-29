@@ -14,7 +14,19 @@ An external supervisor read the profile's cron evidence, not the board, and foun
 watchdog loop for one project has stopped: a binding job carries a failure streak at or above
 the configured threshold, or an enabled job has not run inside the staleness window. Every
 other case (healthy, degraded, paused, unregistered) is reported without starting a session,
-so your presence means the engine is failing repeatedly, not once.
+so a watchdog session means the engine is failing repeatedly, not once.
+
+That is one of two ways a session exists. The other is assigned: the engine's owner starts it by
+hand for a defect the watchdog cannot see, with the loop possibly perfectly healthy. The command is
+the same one the supervisor runs, with the verdict ignored:
+
+```text
+hermes-factory operator assign --project <slug> --prompt <this file> --repo <repository>
+```
+
+An assigned session takes the same locks through the same code path, so the next watchdog tick finds
+it and launches nothing. Nothing about your authority changes; what changes is the `trigger` in your
+record, which carries `{"kind": "owner_assigned", "task": "..."}` instead of a watchdog verdict.
 
 Read these before you change anything:
 
@@ -71,6 +83,11 @@ your last output line.
 The record must carry:
 
 - `outcome`: exactly one of `fixed`, `diagnosed`, `decision_required`;
+- `trigger`: why this session exists. A watchdog session writes
+  `{"kind": "watchdog", "verdict": ..., "reason": ..., "detail": ..., "lock_file": ...,
+  "session_log": ...}`; an assigned session writes `{"kind": "owner_assigned", "task": "<the task
+  the owner named>"}`. An assigned session is not evidence that the loop stopped, so report what you
+  measured and say which of the owner's items you closed;
 - `project` and the cron `job_ids` you paused and resumed;
 - `engine_revision_before` and `engine_revision_after` (`git rev-parse HEAD` each time);
 - `incident_ids` from the cron incidents that triggered the session;
@@ -82,6 +99,22 @@ The record must carry:
 - `verification`: the exact suite command, its tree, and its pass/fail counts;
 - `board_action`: `none`, `resumed`, or `replaced` with the new board slug;
 - `decision_question` and `decision_options`: filled only for `decision_required`.
+
+## Staying live
+
+The lock you took is your claim on the circuit: the supervisor trusts it for your whole
+`--run-budget` even though your log may stay empty (the session runs with `-Q`, so its stdout is
+buffered), and it ends the claim as soon as you write your record. If you want the circuit to
+recover you sooner after a crash, refresh your heartbeat between steps:
+
+```text
+hermes-factory operator heartbeat --project <slug> --log <this session's log file>
+```
+
+The log file is the `session_log` in your lock file. A heartbeat that stops is read as a dead
+session after the quiet window, and a fresh session may then start over you: heartbeat only if you
+will keep heartbeating. Running no heartbeat is safe, and costs at most the rest of your budget
+before a crashed session is replaced.
 
 ## Outcomes
 

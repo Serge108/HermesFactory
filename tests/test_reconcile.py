@@ -118,6 +118,7 @@ def _factory_detail(
     gave_up: bool = False,
     status: str = "todo",
     changed_files_required: bool = False,
+    key: str | None = None,
 ) -> dict[str, object]:
     events: list[dict[str, object]] = [
         {
@@ -146,7 +147,7 @@ def _factory_detail(
             "assignee": assignee,
             "created_by": created_by,
             "idempotency_key": (
-                f"factory:demo:demo-mission:{slice_id}:{task_class}"
+                key if key is not None else f"factory:demo:demo-mission:{slice_id}:{task_class}"
             ),
             "workspace_kind": "dir",
             "workspace_path": "F:/Project With Space",
@@ -4652,6 +4653,78 @@ def test_reconcile_prefers_timeout_evidence_over_rejection_marker(valid_rig: Pat
         "factory:demo:reconcile:old-review:gave-up:102"
     )
     assert "Reason code: worker_timeout" in _flag_value(create, "--body")
+
+
+def test_reconcile_reads_a_materialized_packet_key_for_worker_timeout(valid_rig: Path):
+    """A packet implementation card must be recoverable, not reported as bad provenance.
+
+    The decomposer materializes packet cards with a seven-segment key
+    ``factory:<project>:<mission>:<slice>:packet:<packet>:<class>``. That is the shape a live
+    builder timeout actually carries, so a reader that only accepts the five-segment slice form
+    makes worker-timeout recovery unreachable on a real board.
+    """
+    detail = _factory_detail(
+        "packet-impl",
+        "implementation",
+        "config-recovery",
+        "builder",
+        gave_up=True,
+        key="factory:demo:demo-mission:config-recovery:packet:missing-keys:implementation",
+    )
+    client = FakeReconcileClient(
+        [
+            [
+                {
+                    "id": "packet-impl",
+                    "title": "Implement Add a missing-keys reporter",
+                    "status": "blocked",
+                    "assignee": "builder",
+                    "created_by": "hermes-factory",
+                }
+            ],
+            detail,
+            {"id": "recovery-4", "status": "ready", "title": "Decompose blocked task"},
+            [],
+        ]
+    )
+
+    result = reconcile_board(client, load_rig(valid_rig))
+
+    assert result.recovery_task_ids == {"packet-impl": "recovery-4"}
+    create = client.json_calls[2]
+    body = _flag_value(create, "--body")
+    assert "Reason code: worker_timeout" in body
+    assert '"source_slice":"config-recovery"' in body
+
+
+def test_reconcile_still_refuses_a_packet_key_with_an_unknown_class(valid_rig: Path):
+    """The wider grammar must not become a wildcard: only real Factory shapes are read."""
+    detail = _factory_detail(
+        "packet-impl",
+        "implementation",
+        "config-recovery",
+        "builder",
+        gave_up=True,
+        key="factory:demo:demo-mission:config-recovery:packet:missing-keys:deployment",
+    )
+    client = FakeReconcileClient(
+        [
+            [
+                {
+                    "id": "packet-impl",
+                    "title": "Implement Add a missing-keys reporter",
+                    "status": "blocked",
+                    "assignee": "builder",
+                    "created_by": "hermes-factory",
+                }
+            ],
+            detail,
+            [],
+        ]
+    )
+
+    with pytest.raises(HermesCommandError, match="invalid audit contract|invalid provenance"):
+        reconcile_board(client, load_rig(valid_rig))
 
 
 def _rejected_review_recovery_details() -> list[dict[str, object]]:

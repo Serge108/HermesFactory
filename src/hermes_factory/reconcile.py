@@ -1931,9 +1931,22 @@ def _factory_identity(
     elif task.get("created_by") != "hermes-factory":
         raise HermesCommandError(f"{prefix} task {task_id} has invalid provenance")
     parts = key.split(":")
-    if len(parts) != 5 or parts[0] != "factory" or parts[1] != rig.project.slug:
+    # Three key shapes are trusted, because the compiler and the decomposer materializer
+    # both write Factory cards and this reader has to read what they wrote: the
+    # five-segment slice unit ``factory:<project>:<mission>:<slice>:<class>``, the legacy
+    # six-segment packet form ``factory:<project>:<mission>:<slice>:<unit>:<class>``, and
+    # the seven-segment materialized packet
+    # ``factory:<project>:<mission>:<slice>:packet:<packet>:<class>``. A live builder
+    # timeout carries the packet shape, so a slice-only reader makes worker-timeout
+    # recovery unreachable on a real board.
+    if (
+        len(parts) not in {5, 6, 7}
+        or parts[0] != "factory"
+        or parts[1] != rig.project.slug
+        or (len(parts) == 7 and (parts[4] != "packet" or not parts[5]))
+    ):
         raise HermesCommandError(f"{prefix} task {task_id} has invalid provenance")
-    identity = FactoryTaskIdentity(parts[1], parts[2], parts[3], parts[4])
+    identity = FactoryTaskIdentity(parts[1], parts[2], parts[3], parts[-1])
     contract = parse_audit_contract(task.get("body"))
     if contract.get("task_class") != identity.task_class:
         raise HermesCommandError(f"{prefix} task {task_id} has invalid audit contract")

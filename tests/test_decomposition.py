@@ -1,5 +1,7 @@
 from dataclasses import FrozenInstanceError
 
+import json
+
 import pytest
 
 from hermes_factory.decomposition import (
@@ -521,3 +523,95 @@ def test_packet_ids_use_the_bounded_factory_slug_grammar(packet_id):
 
     with pytest.raises(SpecError, match="id is not a valid slug"):
         parse(data)
+
+
+MAX_PACKETS = 8
+MAX_PACKET_ACCEPTANCE_ITEMS = 5
+# Measured on the installed CLI (2026-09-29, disposable board `probe-contracts`): payloads up to
+# this many bytes round-trip verbatim through `hermes kanban complete --metadata <json>` and
+# `hermes kanban runs <id> --json`; 40000 bytes is refused by the OS command-line limit, not by
+# Hermes. The maximal manifest a rig allows encodes to 4095 bytes, so this leaves ample room.
+COMPLETION_METADATA_ROUND_TRIP_BYTES = 30000
+
+
+def _maximal_source_contract(criteria: int) -> dict:
+    acceptance = [f"outcome {index}" for index in range(criteria)]
+    return {
+        "project": {"slug": "demo", "name": "Demo", "cwd": "F:/Demo"},
+        "mission": {
+            "id": "mission-one",
+            "title": "Mission One",
+            "intent": "Deliver every outcome.",
+            "workflow": "delivery",
+            "acceptance": [],
+        },
+        "source_slice": {
+            "id": "architecture",
+            "acceptance": acceptance,
+            "proof": {
+                "commands": ["uv run pytest tests/test_feature.py -q"],
+                "artifacts": [],
+                "changed_files_required": True,
+            },
+        },
+        "source_acceptance": acceptance,
+    }
+
+
+def test_maximal_manifest_fits_the_recorded_completion_metadata_budget():
+    """The decomposer ships its manifest as run metadata, so it must fit that budget.
+
+    The worst case a rig allows is `max_packets_per_slice` packets of
+    `max_packet_acceptance_items` acceptance items each. This test parses that maximal manifest
+    (proving the limits accept it) and asserts its canonical encoding stays inside the byte budget
+    measured on the installed CLI, so a Hermes upgrade that lowers the budget fails here instead of
+    silently truncating a live decomposition.
+    """
+    criteria = MAX_PACKETS * MAX_PACKET_ACCEPTANCE_ITEMS
+    source_contract = _maximal_source_contract(criteria)
+    source_hash = canonical_source_contract_sha256(source_contract)
+
+    packets = []
+    for packet_index in range(MAX_PACKETS):
+        first = packet_index * MAX_PACKET_ACCEPTANCE_ITEMS
+        indexes = list(range(first, first + MAX_PACKET_ACCEPTANCE_ITEMS))
+        packets.append(
+            {
+                "id": f"packet-{packet_index}",
+                "title": f"Packet {packet_index}",
+                "goal": "Deliver exactly the acceptance items this packet claims.",
+                "depends_on": [] if packet_index == 0 else [f"packet-{packet_index - 1}"],
+                "acceptance": [f"outcome {index}" for index in indexes],
+                "source_acceptance_indexes": indexes,
+                "likely_files": [f"src/package/module_{packet_index}.py"],
+                "symbols": [f"package.module_{packet_index}.run"],
+                "first_artifact": "Add the focused failing test.",
+                "proof": {
+                    "commands": ["uv run pytest tests/test_feature.py -q"],
+                    "artifacts": [],
+                    "changed_files_required": True,
+                },
+            }
+        )
+
+    data = {
+        "version": 1,
+        "project": "demo",
+        "mission": "mission-one",
+        "source_slice": "architecture",
+        "source_contract_sha256": source_hash,
+        "packets": packets,
+        "limitations": [],
+    }
+
+    parse(
+        data,
+        expected_source_contract_sha256=source_hash,
+        source_contract=source_contract,
+    )
+
+    encoded = json.dumps(
+        data, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+
+    assert len(encoded) < COMPLETION_METADATA_ROUND_TRIP_BYTES

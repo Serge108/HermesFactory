@@ -19,6 +19,10 @@ dist/
 *.db-shm
 *.db-wal
 
+# Working plans stay local: they record operator-side detail (boards, seats, live
+# evidence paths) that does not belong in the published repository.
+.hermes/plans/
+
 # Editors and OS
 .vscode/
 .idea/

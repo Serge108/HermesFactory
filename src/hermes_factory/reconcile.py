@@ -1705,8 +1705,8 @@ def _mission_from_decomposition_contract(
             changed_files_required=proof_data["changed_files_required"],
         ),
     )
-    siblings = tuple(
-        SliceSpec(
+    siblings = {
+        sibling: SliceSpec(
             id=sibling,
             title=f"slice {sibling}",
             goal=f"slice {sibling}",
@@ -1716,6 +1716,12 @@ def _mission_from_decomposition_contract(
         )
         for sibling in slice_ids
         if sibling != slice_id
+    }
+    # Keep the mission's own slice order: a rendered decomposition body repeats the slice
+    # id list, so rebuilding with the target first re-renders a different contract hash
+    # and the authority check would reject a card Factory itself wrote.
+    slices = tuple(
+        target if item == slice_id else siblings[item] for item in slice_ids
     )
     return MissionSpec(
         version=version,
@@ -1725,7 +1731,7 @@ def _mission_from_decomposition_contract(
         workflow=workflow,
         human_acceptance=human_acceptance,
         acceptance=tuple(acceptance),
-        slices=(target, *siblings),
+        slices=slices,
     )
 
 

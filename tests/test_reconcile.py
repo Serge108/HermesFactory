@@ -12,6 +12,9 @@ from hermes_factory.mission_loader import load_mission
 from hermes_factory.reconcile import (
     RecoveryPlan,
     RecoveryRewire,
+    _authoritative_decomposition_card,
+    _decomposition_source_contract,
+    _mission_from_decomposition_contract,
     _recovery_validation_marker,
     reconcile_board,
 )
@@ -1219,6 +1222,86 @@ def test_first_decomposer_timeout_creates_one_decomposer_replacement(
         == "decomposition"
     )
     assert ["kanban", "--board", "demo-rig", "show", "decomp-retry-1", "--json"] in client.json_calls
+
+
+_MULTI_SLICE_RECONCILE_MISSION = """\
+version: 1
+id: demo-multi
+title: Demo multi-slice mission
+intent: Preserve the mission intent.
+workflow: delivery
+acceptance:
+- mission acceptance
+slices:
+- id: first
+  title: First slice
+  goal: Preserve the first slice intent.
+  depends_on: []
+  acceptance:
+  - first slice acceptance
+  proof:
+    commands:
+    - uv run pytest
+    artifacts: []
+    changed_files_required: true
+- id: middle
+  title: Middle slice
+  goal: Preserve the middle slice intent.
+  depends_on: [first]
+  acceptance:
+  - middle slice acceptance
+  proof:
+    commands:
+    - uv run pytest
+    artifacts: []
+    changed_files_required: true
+- id: last
+  title: Last slice
+  goal: Preserve the last slice intent.
+  depends_on: [middle]
+  acceptance:
+  - last slice acceptance
+  proof:
+    commands:
+    - uv run pytest
+    artifacts: []
+    changed_files_required: true
+"""
+
+
+@pytest.mark.parametrize("slice_id", ["first", "middle", "last"])
+def test_authoritative_decomposition_card_accepts_every_slice_position(
+    valid_rig: Path, slice_id: str
+):
+    """A Factory-authored decomposition card stays authoritative at any slice position.
+
+    A rendered decomposition body repeats the mission's slice-id list, so a rebuild that
+    reorders that list renders a different contract hash and the authority check then
+    rejects a card Factory itself wrote: the timed-out decomposition of any slice that is
+    not first becomes unrecoverable and the blocked card wedges the board.
+    """
+    rig = _load_v2_reconcile_rig(valid_rig)
+    path = valid_rig.parent / "multi-mission.yaml"
+    path.write_text(_MULTI_SLICE_RECONCILE_MISSION, encoding="utf-8")
+    mission = load_mission(path, rig)
+    key = f"factory:{rig.project.slug}:{mission.id}:{slice_id}:decomposition"
+    planned = next(
+        task
+        for task in compile_decomposition_phase(rig, mission).tasks
+        if task.idempotency_key == key
+    )
+    contract = _decomposition_source_contract(planned.body, "decomposition card")
+
+    rebuilt = _mission_from_decomposition_contract(
+        rig, mission.id, slice_id, contract, "decomposition card"
+    )
+
+    assert [
+        item.id for item in rebuilt.slices
+    ] == [item.id for item in mission.slices]
+    assert _authoritative_decomposition_card(
+        rig, key, planned.body, "decomposition task decomp-1"
+    ).body == planned.body
 
 
 def test_second_decomposer_timeout_records_terminal_limitation_without_builders(

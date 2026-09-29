@@ -4782,6 +4782,7 @@ def test_fixture_recovery_units_distinguish_two_packets_of_one_slice(
         "payload": {"trigger_outcome": "timed_out"},
     }
     titles = []
+    keys = []
     for task_id in ("packet-one-impl", "packet-two-impl"):
         detail = _factory_detail(
             task_id,
@@ -4809,10 +4810,56 @@ def test_fixture_recovery_units_distinguish_two_packets_of_one_slice(
             stall_class=reconcile_module._STALL_WORKER_TIMEOUT,
         )
         titles.append(package["implementation"]["title"])
+        keys.append(package["implementation"]["idempotency_key"])
 
+    # The key is what collides, so pin the key rather than the title it is rendered into.
+    assert keys[0] != keys[1]
+    assert all(key.startswith("factory:demo:demo-mission:config-recovery-recovery-200-") for key in keys)
     assert titles[0] != titles[1]
-    assert "packet-one-impl" in titles[0]
-    assert "packet-two-impl" in titles[1]
+
+
+def test_fixture_recovery_refuses_a_unit_that_outgrows_the_key_slug(
+    valid_rig: Path,
+) -> None:
+    """The composed unit has to stay inside the slug length the key reader enforces.
+
+    A long slice id would otherwise produce replacement cards whose own key can never be
+    read back, which wedges the recovery instead of reporting it.
+    """
+    rig = load_rig(valid_rig)
+    event = {
+        "kind": "gave_up",
+        "created_at": 1790636356,
+        "payload": {"trigger_outcome": "timed_out"},
+    }
+    long_slice = "s" * 40
+    detail = _factory_detail(
+        "packet-one-impl",
+        "implementation",
+        long_slice,
+        "builder",
+        parents=["decomposition"],
+        children=["packet-one-review"],
+        gave_up=True,
+        key=f"factory:demo:demo-mission:{long_slice}:implementation",
+    )
+    review = _factory_detail(
+        "packet-one-review",
+        "review",
+        long_slice,
+        "reviewer",
+        parents=["packet-one-impl"],
+        key=f"factory:demo:demo-mission:{long_slice}:review",
+    )
+
+    with pytest.raises(HermesCommandError, match="is not a valid slug"):
+        reconcile_module._fixture_recovery_package(
+            FakeReconcileClient([review]),
+            rig,
+            detail,
+            event,
+            stall_class=reconcile_module._STALL_WORKER_TIMEOUT,
+        )
 
 
 def _rejected_review_recovery_details() -> list[dict[str, object]]:

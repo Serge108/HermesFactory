@@ -715,8 +715,15 @@ def _fixture_recovery_package(
     # one slice can time out inside the same second, and a slice+second unit would hand
     # both recoveries the same replacement key, so the second idempotent create would
     # return the first recovery's cards and then fail its own provenance revalidation.
-    source_token = str(task_id).replace("_", "-")
+    # The token is a digest rather than the task id itself, so the composed unit stays
+    # inside the slug length the key reader enforces; the checkpoint derivation next door
+    # validates the same way.
+    source_token = hashlib.sha256(str(task_id).encode("utf-8")).hexdigest()[:8]
     slice_id = f"{source_identity.slice_id}-recovery-{event_time}-{source_token}"
+    if not _is_key_slug(slice_id):
+        raise HermesCommandError(
+            f"recovery unit {slice_id!r} for task {task_id} is not a valid slug"
+        )
     key_prefix = f"factory:{policy['project']}:{policy['mission']}:{slice_id}"
     common = {
         "board": rig.board.slug,
@@ -1953,8 +1960,10 @@ def _factory_identity(
         # Every remaining segment has to be a slug. The six-segment branch is otherwise
         # unconstrained, and the reconciler's own recovery keys
         # (``factory:<board>:reconcile:<task>:<outcome>:<epoch>``) parse as six segments
-        # with a task id that is not a slug, so a card carrying one would read as Factory
-        # work with mission ``reconcile``.
+        # with a Hermes-generated task id, which is not a slug, so a card carrying such a
+        # key would read as Factory work with mission ``reconcile``. A hand-written key
+        # can still spell that shape with a hyphen instead of an underscore; this guard
+        # only excludes what Hermes itself writes.
         or not all(_is_key_slug(part) for part in (*parts[1:4], parts[-2], parts[-1]))
     ):
         raise HermesCommandError(f"{prefix} task {task_id} has invalid provenance")

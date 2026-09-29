@@ -571,8 +571,10 @@ def test_maximal_manifest_fits_the_recorded_completion_metadata_budget():
     probe has to be re-run. And the measurement went through `hermes kanban complete --metadata`,
     while a live decomposer completes through the MCP `kanban_complete` tool with the envelope keys
     the materializer strips, so the two payloads are not byte-identical. The assertion still bites
-    in the direction it can: the maximal manifest is 4095 bytes, so shrinking the recorded budget
-    below that, or letting the manifest grow past it, fails here.
+    in the direction it can: the maximal manifest this test builds is 4095 bytes, so shrinking the
+    recorded budget below that, or letting the manifest grow past it, fails here. Maximal here means
+    packet and acceptance counts, which are the only unbounded parts a rig allows; the free-form
+    manifest strings are short literals in this test.
     """
     criteria = MAX_PACKETS * MAX_PACKET_ACCEPTANCE_ITEMS
     source_contract = _maximal_source_contract(criteria)

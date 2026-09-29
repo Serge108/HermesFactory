@@ -411,20 +411,32 @@ def _materialize_group(
         )
 
     plan = compile_materialized_execution_phase(rig, mission, manifests)
-    planned_keys = {task.idempotency_key for task in plan.tasks}
+    planned_by_key = {task.idempotency_key: task for task in plan.tasks}
+    planned_keys = set(planned_by_key)
     existing_by_key = {
         record.get("idempotency_key"): record
         for record in board_records
         if record.get("idempotency_key") in planned_keys
         and record.get("status") != "archived"
     }
-    if existing_by_key and set(existing_by_key) != planned_keys:
-        collisions = sorted(str(record.get("id")) for record in existing_by_key.values())
-        raise HermesCommandError(
-            "partial task set already uses planned execution idempotency keys: "
-            + ", ".join(collisions)
-        )
     if existing_by_key:
+        # A card that carries a planned key but not the planned body is not this plan's
+        # work, so nothing is created around it. A card that matches its planned body is
+        # this plan's work: an apply interrupted before it finished leaves a strict subset
+        # of those cards, and Hermes' create is idempotent on the idempotency key, so
+        # re-applying the plan reuses them and creates only the missing cards instead of
+        # wedging every later pass on a partial set.
+        drifted = sorted(
+            str(record.get("id"))
+            for key, record in existing_by_key.items()
+            if record.get("body") != planned_by_key[key].body
+        )
+        if drifted:
+            raise HermesCommandError(
+                "partial task set already uses planned execution idempotency keys: "
+                + ", ".join(drifted)
+            )
+    if existing_by_key and set(existing_by_key) == planned_keys:
         task_ids = {
             task.key: _string(existing_by_key[task.idempotency_key].get("id"), "task.id")
             for task in plan.tasks

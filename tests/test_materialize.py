@@ -610,6 +610,51 @@ def test_manifest_rejects_a_malformed_runtime_artifacts_envelope(
     assert not any(call[3] == "create" for call in client.json_calls)
 
 
+def test_interrupted_apply_resumes_the_missing_execution_cards(
+    valid_rig: Path, tmp_path: Path
+):
+    """A pass killed mid-apply leaves a subset of its own cards, not a wedge.
+
+    Hermes' create is idempotent on the idempotency key, so the next pass must reuse the
+    cards the interrupted pass already created and create only the missing ones. Refusing
+    the whole mission instead would freeze it forever, because nothing else ever creates
+    the remaining cards.
+    """
+    rig, mission = _rig_and_mission(valid_rig, tmp_path)
+    tasks, details = _decomposition_board(rig, mission, ("done", "done"))
+    first = MaterializeClient([dict(task) for task in tasks], dict(details))
+    materialize_completed_decompositions(first, rig)
+    created = [
+        task
+        for task in first.tasks
+        if ":packet:" in str(task.get("idempotency_key") or "")
+    ]
+    assert len(created) > 2
+    partial = created[:2]
+
+    resumed_tasks = [dict(task) for task in tasks] + [
+        dict(first.records[task["id"]]) for task in partial
+    ]
+    resumed_details = dict(details)
+    for task in partial:
+        resumed_details[task["id"]] = first.details[task["id"]]
+    second = MaterializeClient(resumed_tasks, resumed_details)
+
+    result = materialize_completed_decompositions(second, rig)
+
+    assert result.rejected == {}
+    assert mission.id in result.materialized
+    # Hermes' create is idempotent on the key, so the resume re-issues it for every planned
+    # task and must end with exactly one card per key: the seeded cards keep their ids.
+    planned_keys = {key for key in first.ids_by_key if ":packet:" in key}
+    assert {key for key in second.ids_by_key if ":packet:" in key} == planned_keys
+    for task in partial:
+        key = task["idempotency_key"]
+        assert second.ids_by_key[key] == first.ids_by_key[key]
+    issued = [task.get("idempotency_key") for task in second.tasks if task.get("idempotency_key")]
+    assert len(issued) == len(set(issued))
+
+
 def test_active_execution_key_collision_is_rejected_before_any_create(
     valid_rig: Path, tmp_path: Path
 ):

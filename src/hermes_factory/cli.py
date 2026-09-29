@@ -17,6 +17,18 @@ from hermes_factory.hermes_cli import HermesClient
 from hermes_factory.metrics import compute_metrics
 from hermes_factory.mission_loader import load_mission
 from hermes_factory.models import RigSpec
+from hermes_factory.operator import (
+    DEFAULT_FAILURE_STREAK_THRESHOLD,
+    DEFAULT_LOCK_QUIET_SECONDS,
+    DEFAULT_MAX_SESSION_SECONDS,
+    DEFAULT_SESSION_BUDGET,
+    DEFAULT_STALE_AFTER_SECONDS,
+    OperatorPlan,
+    assess_engine,
+    supervise,
+    supervise_payload,
+    verdict_payload,
+)
 from hermes_factory.reconcile import reconcile_board
 from hermes_factory.rig_loader import load_rig
 from hermes_factory.stall_taxonomy import stall_taxonomy
@@ -72,7 +84,47 @@ def build_parser() -> argparse.ArgumentParser:
     taxonomy = subparsers.add_parser("stall-taxonomy")
     taxonomy.add_argument("--json", action="store_true")
     taxonomy.set_defaults(handler_key="stall-taxonomy")
+    operator_parser = subparsers.add_parser("operator")
+    operator_subparsers = operator_parser.add_subparsers(
+        dest="operator_command", required=True
+    )
+    assess = operator_subparsers.add_parser("assess")
+    _add_operator_arguments(assess)
+    assess.set_defaults(handler_key="operator-assess")
+    operator_supervise = operator_subparsers.add_parser("supervise")
+    _add_operator_arguments(operator_supervise)
+    operator_supervise.add_argument("--prompt", type=Path, required=True)
+    operator_supervise.add_argument("--repo", type=Path, required=True)
+    operator_supervise.add_argument("--operator-profile", default="factory-operator")
+    operator_supervise.add_argument(
+        "--budget",
+        type=int,
+        default=DEFAULT_SESSION_BUDGET,
+        help="session wall-clock budget in seconds (hermes chat --run-budget)",
+    )
+    operator_supervise.add_argument("--log-directory", type=Path)
+    operator_supervise.add_argument("--lock-directory", type=Path)
+    operator_supervise.add_argument(
+        "--quiet-seconds", type=int, default=DEFAULT_LOCK_QUIET_SECONDS
+    )
+    operator_supervise.add_argument(
+        "--max-session-seconds", type=int, default=DEFAULT_MAX_SESSION_SECONDS
+    )
+    operator_supervise.add_argument("--dry-run", action="store_true")
+    operator_supervise.set_defaults(handler_key="operator-supervise")
     return parser
+
+
+def _add_operator_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--job", action="append", default=[])
+    parser.add_argument("--threshold", type=int, default=DEFAULT_FAILURE_STREAK_THRESHOLD)
+    parser.add_argument(
+        "--stale-after", type=int, default=DEFAULT_STALE_AFTER_SECONDS
+    )
+    parser.add_argument("--profile", default="default")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--hermes", default="hermes")
 
 
 def validate_rig_profiles(rig: RigSpec, client: HermesClient) -> tuple[str, ...]:
@@ -461,6 +513,71 @@ def handle_stall_taxonomy(
     return 0
 
 
+def handle_operator_assess(args: argparse.Namespace, client_factory: ClientFactory) -> int:
+    client = client_factory(args.hermes)
+    state = client.cron_state(args.profile)
+    verdict = assess_engine(
+        state,
+        args.project,
+        job_ids=tuple(args.job),
+        threshold=args.threshold,
+        stale_after=args.stale_after,
+    )
+    if args.json:
+        print(json.dumps(verdict_payload(verdict), indent=2))
+    else:
+        print(f"{verdict.verdict}: {verdict.project} ({', '.join(verdict.reasons)})")
+        for item in verdict.jobs:
+            incidents = (
+                f" incidents={','.join(item.open_incident_ids)}"
+                if item.open_incident_ids
+                else ""
+            )
+            print(
+                f"  {item.job_id} {item.name}: streak={item.failure_streak} "
+                f"last_status={item.last_status or '-'} {item.reason}{incidents}"
+            )
+    return 0
+
+
+def handle_operator_supervise(
+    args: argparse.Namespace, client_factory: ClientFactory
+) -> int:
+    client = client_factory(args.hermes)
+    operator_root = client.cron_directory(args.profile).parent / "operator" / args.project
+    plan = OperatorPlan(
+        project=args.project,
+        profile=args.operator_profile,
+        prompt=args.prompt,
+        repo=args.repo,
+        budget=args.budget,
+        log_directory=args.log_directory or operator_root / "logs",
+        lock_directory=args.lock_directory or operator_root,
+    )
+    result = supervise(
+        client,
+        plan,
+        hermes=args.hermes,
+        cron_profile=args.profile,
+        job_ids=tuple(args.job),
+        threshold=args.threshold,
+        stale_after=args.stale_after,
+        quiet_seconds=args.quiet_seconds,
+        max_session_seconds=args.max_session_seconds,
+        dry_run=args.dry_run,
+    )
+    if args.json:
+        print(json.dumps(supervise_payload(result), indent=2))
+    else:
+        print(f"{result.verdict.verdict}: {result.reason}")
+        if result.command:
+            print("command: " + " ".join(result.command))
+        if result.log_path is not None:
+            print(f"log: {result.log_path}")
+        print(f"lock: {result.lock_path}")
+    return 0
+
+
 HANDLERS: dict[str, Callable[[argparse.Namespace, ClientFactory], int]] = {
     "version": handle_version,
     "validate": handle_validate,
@@ -471,6 +588,8 @@ HANDLERS: dict[str, Callable[[argparse.Namespace, ClientFactory], int]] = {
     "report": handle_report,
     "reconcile": handle_reconcile,
     "stall-taxonomy": handle_stall_taxonomy,
+    "operator-assess": handle_operator_assess,
+    "operator-supervise": handle_operator_supervise,
 }
 
 

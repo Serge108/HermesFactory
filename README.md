@@ -44,6 +44,9 @@ uv run hermes-factory status --rig .hermes/rig.yaml
 uv run hermes-factory report --rig .hermes/rig.yaml
 uv run hermes-factory stall-taxonomy --json
 uv run hermes-factory reconcile --rig .hermes/rig.yaml --dispatch --json
+uv run hermes-factory operator assess --project <project-slug>
+uv run hermes-factory operator supervise --project <project-slug> \
+  --prompt templates/operator-session-prompt.md --repo . --json
 hermes kanban --board <board-slug> dispatch --dry-run --json
 hermes kanban --board <board-slug> watch
 hermes dashboard --no-open

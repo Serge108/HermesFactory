@@ -9,6 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from hermes_factory.errors import HermesCommandError
+from hermes_factory.operator import (
+    CronJob,
+    CronState,
+    parse_cron_executions,
+    parse_cron_incidents,
+    parse_cron_jobs,
+)
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -172,6 +179,83 @@ class HermesClient:
         if latest_incident_terminal is not None:
             result["latest_incident_terminal"] = latest_incident_terminal
         return result
+
+    def cron_directory(self, profile: str = "default") -> Path:
+        """Resolve the profile's cron directory from its own configuration path."""
+        args = (
+            ["config", "path"]
+            if profile == "default"
+            else ["-p", profile, "config", "path"]
+        )
+        output = self.run(args).strip()
+        if not output:
+            raise HermesCommandError("Hermes returned no profile configuration path")
+        directory = Path(output).parent / "cron"
+        if not directory.is_dir():
+            raise HermesCommandError(f"Hermes profile {profile} has no cron directory")
+        return directory
+
+    def _cron_incident_rows(self, database_path: Path) -> tuple[dict[str, Any], ...]:
+        if not database_path.exists():
+            return ()
+        try:
+            uri = database_path.resolve().as_uri() + "?mode=ro"
+            with sqlite3.connect(uri, uri=True) as connection:
+                connection.row_factory = sqlite3.Row
+                rows = connection.execute(
+                    "select id, job_id, state, failure_type, first_seen_at, last_seen_at, "
+                    "error, output_file from cron_incidents order by last_seen_at desc"
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return ()
+            raise HermesCommandError("failed to read Hermes cron incidents") from exc
+        except (OSError, sqlite3.Error) as exc:
+            raise HermesCommandError("failed to read Hermes cron incidents") from exc
+        return tuple(dict(row) for row in rows)
+
+    def _cron_execution_rows(self, database_path: Path) -> tuple[dict[str, Any], ...]:
+        if not database_path.exists():
+            return ()
+        try:
+            uri = database_path.resolve().as_uri() + "?mode=ro"
+            with sqlite3.connect(uri, uri=True) as connection:
+                connection.row_factory = sqlite3.Row
+                rows = connection.execute(
+                    "select id, job_id, status, started_at, finished_at from executions "
+                    "order by rowid desc limit 200"
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return ()
+            raise HermesCommandError("failed to read Hermes cron executions") from exc
+        except (OSError, sqlite3.Error) as exc:
+            raise HermesCommandError("failed to read Hermes cron executions") from exc
+        return tuple(dict(row) for row in rows)
+
+    def cron_state(self, profile: str = "default") -> CronState:
+        """Read the durable cron evidence that survives a broken Factory engine."""
+        directory = self.cron_directory(profile)
+        jobs_path = directory / "jobs.json"
+        jobs: tuple[CronJob, ...] = ()
+        if jobs_path.exists():
+            try:
+                payload = json.loads(jobs_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise HermesCommandError(
+                    f"Hermes cron job list {jobs_path} is unreadable"
+                ) from exc
+            jobs = parse_cron_jobs(payload)
+        return CronState(
+            jobs=jobs,
+            incidents=parse_cron_incidents(
+                self._cron_incident_rows(directory / "executions.db")
+            ),
+            executions=parse_cron_executions(
+                self._cron_execution_rows(directory / "executions.db")
+            ),
+            cron_directory=directory,
+        )
 
     def profile_exists(self, profile: str) -> bool:
         args = (

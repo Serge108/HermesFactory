@@ -2,6 +2,8 @@ from pathlib import Path
 from subprocess import CompletedProcess, TimeoutExpired
 
 import shutil
+import sys
+import threading
 
 import pytest
 
@@ -394,6 +396,48 @@ def test_run_wraps_timeout_without_echoing_arguments():
 
     assert secret not in str(exc_info.value)
     assert isinstance(exc_info.value.__cause__, TimeoutExpired)
+
+
+_PIPE_HOLDER_SCRIPT = """\
+import subprocess, sys, time
+
+subprocess.Popen([sys.executable, "-c", "import time; time.sleep({sleep})"])
+print("holder started", flush=True)
+time.sleep({sleep})
+"""
+
+
+def test_run_bounds_its_deadline_when_a_child_keeps_the_output_pipes_open(tmp_path: Path):
+    """Every Hermes command is a launcher for a longer-lived runtime process.
+
+    ``subprocess.run`` enforces its timeout by joining the pipe reader threads and
+    then calls ``communicate()`` a second time with no deadline at all, so a
+    descendant that inherits stdout and outlives the child turns the timeout into
+    an unbounded hang. The client's deadline must hold regardless.
+    """
+    script = tmp_path / "pipe_holder.py"
+    script.write_text(_PIPE_HOLDER_SCRIPT.format(sleep=45), encoding="utf-8")
+    client = HermesClient(executable=sys.executable, timeout_seconds=5)
+    outcome: dict[str, object] = {}
+    finished = threading.Event()
+
+    def call() -> None:
+        try:
+            outcome["result"] = client.run([str(script)])
+        except BaseException as exc:  # noqa: BLE001 - reported through the event
+            outcome["error"] = exc
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=call, daemon=True)
+    thread.start()
+
+    assert finished.wait(25), (
+        "HermesClient.run never returned: its timeout did not bound the call "
+        "while a descendant held the output pipes open"
+    )
+    assert isinstance(outcome.get("error"), HermesCommandError)
+    assert "timed out after 5 seconds" in str(outcome["error"])
 
 
 def test_run_wraps_os_error():

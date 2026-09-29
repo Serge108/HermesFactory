@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import locale
 import sqlite3
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, IO
 
 from hermes_factory.errors import HermesCommandError
 from hermes_factory.operator import (
@@ -20,11 +23,73 @@ from hermes_factory.operator import (
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
+def _read_sink(sink: IO[bytes] | None, *, text: bool, encoding: str | None) -> Any:
+    if sink is None:
+        return None
+    sink.seek(0)
+    payload = sink.read()
+    if not text:
+        return payload
+    return payload.decode(encoding or locale.getpreferredencoding(False))
+
+
+def bounded_run(
+    argv: Sequence[str],
+    *,
+    cwd: str | None = None,
+    text: bool = False,
+    encoding: str | None = None,
+    capture_output: bool = False,
+    timeout: float | None = None,
+    shell: bool = False,
+    check: bool = False,
+) -> subprocess.CompletedProcess[Any]:
+    """Run a command under a deadline that its own descendants cannot extend.
+
+    ``subprocess.run`` cannot enforce that deadline for a Hermes command. Every
+    Hermes command is a launcher for a longer-lived runtime process, so a
+    descendant inherits the output pipes and may outlive the child. On Windows
+    ``subprocess.run`` waits by joining the pipe reader threads, and after a
+    timeout it calls ``communicate()`` a second time with no deadline at all, so
+    such a descendant turns the deadline into an unbounded hang. Capturing into
+    temporary files instead of pipes makes the deadline a property of the child
+    process rather than of end-of-file on a pipe, and a killed child leaves no
+    reader behind. The standard input is not inherited either: an unattended
+    command must never block on a terminal it does not have.
+    """
+    argv = list(argv)
+    with contextlib.ExitStack() as stack:
+        if capture_output:
+            out_sink: IO[bytes] | None = stack.enter_context(tempfile.TemporaryFile("w+b"))
+            err_sink: IO[bytes] | None = stack.enter_context(tempfile.TemporaryFile("w+b"))
+        else:
+            out_sink = err_sink = None
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=out_sink,
+            stderr=err_sink,
+            shell=shell,
+        )
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise
+        stdout = _read_sink(out_sink, text=text, encoding=encoding)
+        stderr = _read_sink(err_sink, text=text, encoding=encoding)
+        if check and process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, argv, stdout, stderr)
+        return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+
 class HermesClient:
     def __init__(
         self,
         executable: str = "hermes",
-        runner: Runner = subprocess.run,
+        runner: Runner = bounded_run,
         timeout_seconds: int = 30,
     ) -> None:
         self.executable = executable
